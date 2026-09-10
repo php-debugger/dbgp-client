@@ -95,16 +95,19 @@ func TestParseVariablesFromRealXML(t *testing.T) {
 		name      string
 		wantType  string
 		wantValue string
+		wantLevel int
 	}{
-		{"$count", "string", `"Hello, World!"`},
-		{"$name", "string", `"World"`},
-		{"$sum", "int", "15"},
-		{"$numbers", "array", "array[5]"},
-		{"$user", "array", "array[3]"},
-		{"$obj", "object", `App\Service\MyService`},
-		{"$emptyArray", "array", "array[]"},
-		{"$nullVal", "null", "null"},
-		{"$boolVal", "bool", "true"},
+		{"$count", "string", `"Hello, World!"`, 0},
+		{"$name", "string", `"World"`, 0},
+		{"$sum", "int", "15", 0},
+		{"$numbers", "array", "array[5]", 0},
+		{"$numbers[0]", "int", "1", 1},
+		{"$user", "array", "array[3]", 0},
+		{"$obj", "object", `App\Service\MyService`, 0},
+		{"$obj->id", "int", "42", 1},
+		{"$emptyArray", "array", "array[]", 0},
+		{"$nullVal", "null", "null", 0},
+		{"$boolVal", "bool", "true", 0},
 	}
 
 	for _, tt := range tests {
@@ -118,6 +121,9 @@ func TestParseVariablesFromRealXML(t *testing.T) {
 			}
 			if v.Value != tt.wantValue {
 				t.Errorf("value = %q, want %q", v.Value, tt.wantValue)
+			}
+			if v.Level != tt.wantLevel {
+				t.Errorf("level = %d, want %d", v.Level, tt.wantLevel)
 			}
 		})
 	}

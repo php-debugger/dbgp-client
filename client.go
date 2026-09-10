@@ -23,6 +23,7 @@ type Client struct {
 	writer   io.Writer
 
 	mu        sync.Mutex
+	writeMu   sync.Mutex
 	transID   int
 	responses map[int]chan *Response
 
@@ -73,9 +74,11 @@ func (c *Client) WaitForConnection(timeout time.Duration) error {
 		return fmt.Errorf("accept connection: %w", err)
 	}
 
+	c.mu.Lock()
 	c.conn = conn
 	c.reader = bufio.NewReader(conn)
 	c.writer = conn
+	c.mu.Unlock()
 
 	// Read init packet
 	initData, err := c.readPacket()
@@ -83,10 +86,13 @@ func (c *Client) WaitForConnection(timeout time.Duration) error {
 		return fmt.Errorf("read init packet: %w", err)
 	}
 
-	c.init, err = ParseInit(initData)
+	initPacket, err := ParseInit(initData)
 	if err != nil {
 		return fmt.Errorf("parse init packet: %w", err)
 	}
+	c.mu.Lock()
+	c.init = initPacket
+	c.mu.Unlock()
 
 	// Start response reader
 	go c.readLoop()
@@ -96,11 +102,15 @@ func (c *Client) WaitForConnection(timeout time.Duration) error {
 
 // Init returns the initialization packet from PHP
 func (c *Client) Init() *InitPacket {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	return c.init
 }
 
 // OnBreakpoint sets the callback for breakpoint hits
 func (c *Client) OnBreakpoint(fn func(file string, line int, stack []StackFrame, vars []Variable)) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	c.onBreakpoint = fn
 }
 
@@ -164,7 +174,10 @@ func (c *Client) readLoop() {
 		}
 
 		// Check if this is a breakpoint hit (async response)
-		if resp.Status == StatusBreak && c.onBreakpoint != nil {
+		c.mu.Lock()
+		onBreakpoint := c.onBreakpoint
+		c.mu.Unlock()
+		if resp.Status == StatusBreak && onBreakpoint != nil {
 			go c.handleBreakpoint(resp)
 		}
 
@@ -189,8 +202,11 @@ func (c *Client) handleBreakpoint(resp *Response) {
 	// Get local variables
 	vars, _ := c.GetContext(0, 0)
 
-	if c.onBreakpoint != nil {
-		c.onBreakpoint(file, line, stack, vars)
+	c.mu.Lock()
+	onBreakpoint := c.onBreakpoint
+	c.mu.Unlock()
+	if onBreakpoint != nil {
+		onBreakpoint(file, line, stack, vars)
 	}
 }
 
@@ -239,7 +255,9 @@ func (c *Client) sendCommand(cmd string) (*Response, error) {
 
 	// Send command
 	packet := fmt.Sprintf("%d\x00%s\x00", len(cmd), cmd)
+	c.writeMu.Lock()
 	_, err := c.writer.Write([]byte(packet))
+	c.writeMu.Unlock()
 	if err != nil {
 		c.mu.Lock()
 		delete(c.responses, transID)
@@ -432,11 +450,19 @@ func (c *Client) FeatureSet(name, value string) error {
 // Close closes the connection
 func (c *Client) Close() error {
 	var closeErr error
-	if c.conn != nil {
-		closeErr = errors.Join(closeErr, c.conn.Close())
+	c.mu.Lock()
+	conn := c.conn
+	listener := c.listener
+	c.conn = nil
+	c.reader = nil
+	c.writer = nil
+	c.mu.Unlock()
+
+	if conn != nil {
+		closeErr = errors.Join(closeErr, conn.Close())
 	}
-	if c.listener != nil {
-		closeErr = errors.Join(closeErr, c.listener.Close())
+	if listener != nil {
+		closeErr = errors.Join(closeErr, listener.Close())
 	}
 	return closeErr
 }

@@ -39,10 +39,6 @@ func ParseVariables(xmlData string) []Variable {
 func ParseVariablesFromProperties(properties []Property) []Variable {
 	var vars []Variable
 	for _, p := range properties {
-		// Only include top-level variables (no brackets or arrows in name)
-		if containsAny(p.FullName, "[", "->") {
-			continue
-		}
 		vars = append(vars, Variable{
 			Name:  p.FullName,
 			Type:  p.Type,
@@ -169,14 +165,4 @@ func FormatVariable(v Variable) string {
 	indent := strings.Repeat("  ", v.Level)
 	width := 30 - (v.Level * 2)
 	return fmt.Sprintf("%s%-*s %-8s = %s", indent, width, v.Name, v.Type, v.Value)
-}
-
-// containsAny checks if s contains any of the substrings
-func containsAny(s string, subs ...string) bool {
-	for _, sub := range subs {
-		if bytes.Contains([]byte(s), []byte(sub)) {
-			return true
-		}
-	}
-	return false
 }

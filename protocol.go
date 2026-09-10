@@ -193,7 +193,7 @@ func ParseResponse(data []byte) (*Response, error) {
 // ParseMessage extracts breakpoint hit info from response
 func (r *Response) ParseMessage() (file string, line int) {
 	if r.Message != nil {
-		file = strings.TrimPrefix(r.Message.Filename, "file://")
+		file = FormatFileURI(r.Message.Filename)
 		line = r.Message.Lineno
 	}
 	return
@@ -248,7 +248,21 @@ func FormatStack(frames []StackFrame) []string {
 
 // FormatFileURI converts file:// URI to path
 func FormatFileURI(uri string) string {
-	return strings.TrimPrefix(uri, "file://")
+	u, err := url.Parse(uri)
+	if err != nil || u.Scheme != "file" {
+		return strings.TrimPrefix(uri, "file://")
+	}
+
+	path, err := url.PathUnescape(u.Path)
+	if err != nil {
+		path = u.Path
+	}
+
+	if len(path) >= 3 && path[0] == '/' && path[2] == ':' {
+		path = path[1:]
+	}
+
+	return filepath.FromSlash(path)
 }
 
 // MakeFileURI converts path to file:// URI
