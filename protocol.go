@@ -230,13 +230,13 @@ func MakeFileURI(path string) string {
 
 // ParseBreakpointSpec parses "file.php:42" or "file.php:42,55,60"
 func ParseBreakpointSpec(spec string) (file string, lines []int, err error) {
-	parts := strings.Split(spec, ":")
-	if len(parts) != 2 {
+	sep := strings.LastIndex(spec, ":")
+	if sep <= 0 || sep == len(spec)-1 {
 		return "", nil, fmt.Errorf("invalid breakpoint spec: %s (expected file:line)", spec)
 	}
 
-	file = parts[0]
-	lineStrs := strings.Split(parts[1], ",")
+	file = spec[:sep]
+	lineStrs := strings.Split(spec[sep+1:], ",")
 	lines = make([]int, 0, len(lineStrs))
 
 	for _, ls := range lineStrs {

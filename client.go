@@ -199,16 +199,24 @@ func (c *Client) sendCommand(cmd string) (*Response, error) {
 	transID := c.nextTransID()
 
 	// Ensure transaction ID is in command
-	if !strings.Contains(cmd, "-i") {
-		cmd = fmt.Sprintf("%s -i %d", cmd, transID)
-	} else {
-		// Extract transaction ID from command
-		parts := strings.Split(cmd, "-i ")
-		if len(parts) > 1 {
-			idStr := strings.Fields(parts[1])[0]
-			id, _ := strconv.Atoi(idStr)
+	fields := strings.Fields(cmd)
+	hasTransID := false
+	for i := 0; i < len(fields); i++ {
+		if fields[i] == "-i" {
+			if i+1 >= len(fields) {
+				return nil, fmt.Errorf("invalid command: missing transaction id after -i")
+			}
+			id, err := strconv.Atoi(fields[i+1])
+			if err != nil {
+				return nil, fmt.Errorf("invalid transaction id %q: %w", fields[i+1], err)
+			}
 			transID = id
+			hasTransID = true
+			break
 		}
+	}
+	if !hasTransID {
+		cmd = fmt.Sprintf("%s -i %d", cmd, transID)
 	}
 
 	// Create response channel
