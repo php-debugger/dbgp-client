@@ -275,6 +275,10 @@ func FormatFileURI(uri string) string {
 // MakeFileURI converts path to file:// URI
 func MakeFileURI(path string) string {
 	if strings.HasPrefix(path, "file://") {
+		u, err := url.Parse(path)
+		if err == nil {
+			return u.String()
+		}
 		return path
 	}
 
@@ -287,7 +291,7 @@ func MakeFileURI(path string) string {
 		host := parts[0]
 		sharePath := ""
 		if len(parts) == 2 {
-			sharePath = "/" + filepath.ToSlash(parts[1])
+			sharePath = "/" + strings.ReplaceAll(parts[1], `\`, `/`)
 		}
 		return (&url.URL{Scheme: "file", Host: host, Path: sharePath}).String()
 	}
