@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"encoding/base64"
 	"encoding/xml"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -142,7 +143,18 @@ func (c *Client) readLoop() {
 	for {
 		data, err := c.readPacket()
 		if err != nil {
-			// Connection closed
+			c.mu.Lock()
+			for id, ch := range c.responses {
+				ch <- &Response{
+					Transaction: id,
+					Error: &Error{
+						Code:    -1,
+						Message: "connection closed",
+					},
+				}
+				delete(c.responses, id)
+			}
+			c.mu.Unlock()
 			return
 		}
 
@@ -393,6 +405,9 @@ func (c *Client) Status() (string, error) {
 
 // FeatureGet gets a feature value
 func (c *Client) FeatureGet(name string) (string, error) {
+	if strings.ContainsAny(name, " \t\r\n") {
+		return "", fmt.Errorf("feature name must not contain whitespace")
+	}
 	cmd := fmt.Sprintf("feature_get -n %s", name)
 	resp, err := c.sendCommand(cmd)
 	if err != nil {
@@ -403,6 +418,12 @@ func (c *Client) FeatureGet(name string) (string, error) {
 
 // FeatureSet sets a feature value
 func (c *Client) FeatureSet(name, value string) error {
+	if strings.ContainsAny(name, " \t\r\n") {
+		return fmt.Errorf("feature name must not contain whitespace")
+	}
+	if strings.ContainsAny(value, " \t\r\n") {
+		return fmt.Errorf("feature value must not contain whitespace")
+	}
 	cmd := fmt.Sprintf("feature_set -n %s -v %s", name, value)
 	_, err := c.sendCommand(cmd)
 	return err
@@ -410,11 +431,12 @@ func (c *Client) FeatureSet(name, value string) error {
 
 // Close closes the connection
 func (c *Client) Close() error {
+	var closeErr error
 	if c.conn != nil {
-		c.conn.Close()
+		closeErr = errors.Join(closeErr, c.conn.Close())
 	}
 	if c.listener != nil {
-		c.listener.Close()
+		closeErr = errors.Join(closeErr, c.listener.Close())
 	}
-	return nil
+	return closeErr
 }

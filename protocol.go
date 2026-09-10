@@ -6,30 +6,61 @@ import (
 	"encoding/xml"
 	"fmt"
 	"io"
+	"net/url"
+	"path/filepath"
 	"strconv"
 	"strings"
 )
 
-// charsetReader handles non-UTF-8 XML encodings by treating them as UTF-8
-func charsetReader(charset string, input io.Reader) (io.Reader, error) {
-	// Treat all encodings as UTF-8 (DBGp typically uses ASCII-safe content anyway)
-	if strings.EqualFold(charset, "iso-8859-1") ||
-		strings.EqualFold(charset, "windows-1252") ||
-		strings.EqualFold(charset, "utf-8") ||
-		strings.EqualFold(charset, "us-ascii") {
+// charsetReader handles non-UTF-8 XML encodings
+func charsetReader(encoding string, input io.Reader) (io.Reader, error) {
+	switch strings.ToLower(encoding) {
+	case "utf-8", "us-ascii":
 		return input, nil
+	case "iso-8859-1", "latin1":
+		return decodeSingleByte(input, nil)
+	case "windows-1252":
+		return decodeSingleByte(input, windows1252Overrides)
+	default:
+		return nil, fmt.Errorf("unsupported charset: %s", encoding)
 	}
-	return nil, fmt.Errorf("unsupported charset: %s", charset)
+}
+
+func decodeSingleByte(input io.Reader, overrides map[byte]rune) (io.Reader, error) {
+	data, err := io.ReadAll(input)
+	if err != nil {
+		return nil, err
+	}
+
+	runes := make([]rune, len(data))
+	for i, b := range data {
+		if overrides != nil {
+			if mapped, ok := overrides[b]; ok {
+				runes[i] = mapped
+				continue
+			}
+		}
+		runes[i] = rune(b)
+	}
+
+	return strings.NewReader(string(runes)), nil
+}
+
+var windows1252Overrides = map[byte]rune{
+	0x80: '€', 0x82: '‚', 0x83: 'ƒ', 0x84: '„', 0x85: '…', 0x86: '†', 0x87: '‡', 0x88: 'ˆ',
+	0x89: '‰', 0x8A: 'Š', 0x8B: '‹', 0x8C: 'Œ', 0x8E: 'Ž', 0x91: '‘', 0x92: '’', 0x93: '“',
+	0x94: '”', 0x95: '•', 0x96: '–', 0x97: '—', 0x98: '˜', 0x99: '™', 0x9A: 'š', 0x9B: '›',
+	0x9C: 'œ', 0x9E: 'ž', 0x9F: 'Ÿ',
 }
 
 // Status values
 const (
-	StatusStarting  = "starting"
-	StatusStopping  = "stopping"
-	StatusStopped   = "stopped"
-	StatusRunning   = "running"
-	StatusBreak     = "break"
-	StatusDetached  = "detached"
+	StatusStarting = "starting"
+	StatusStopping = "stopping"
+	StatusStopped  = "stopped"
+	StatusRunning  = "running"
+	StatusBreak    = "break"
+	StatusDetached = "detached"
 )
 
 // Breakpoint types
@@ -100,41 +131,41 @@ type Message struct {
 
 // BreakpointInfo contains breakpoint details
 type BreakpointInfo struct {
-	ID          int    `xml:"id,attr"`
-	Type        string `xml:"type,attr"`
-	Filename    string `xml:"filename,attr"`
-	Lineno      int    `xml:"lineno,attr"`
-	State       string `xml:"state,attr"`
-	Exception   string `xml:"exception,attr,omitempty"`
-	Expression  string `xml:"expression,attr,omitempty"`
-	HitCount    int    `xml:"hit_count,attr,omitempty"`
-	HitValue    int    `xml:"hit_value,attr,omitempty"`
-	Temporary   int    `xml:"temporary,attr,omitempty"`
+	ID         int    `xml:"id,attr"`
+	Type       string `xml:"type,attr"`
+	Filename   string `xml:"filename,attr"`
+	Lineno     int    `xml:"lineno,attr"`
+	State      string `xml:"state,attr"`
+	Exception  string `xml:"exception,attr,omitempty"`
+	Expression string `xml:"expression,attr,omitempty"`
+	HitCount   int    `xml:"hit_count,attr,omitempty"`
+	HitValue   int    `xml:"hit_value,attr,omitempty"`
+	Temporary  int    `xml:"temporary,attr,omitempty"`
 }
 
 // Property represents a variable
 type Property struct {
-	Name            string      `xml:"name,attr"`
-	FullName        string      `xml:"fullname,attr"`
-	Type            string      `xml:"type,attr"`
-	ClassName       string      `xml:"classname,attr,omitempty"`
-	Facet           string      `xml:"facet,attr,omitempty"`
-	Size            int         `xml:"size,attr,omitempty"`
-	Children        int         `xml:"children,attr,omitempty"`
-	NumChildren     int         `xml:"numchildren,attr,omitempty"`
-	Encoding        string      `xml:"encoding,attr,omitempty"`
-	Value           string      `xml:",chardata"`
-	ChildProperties []Property  `xml:"property,omitempty"`
+	Name            string     `xml:"name,attr"`
+	FullName        string     `xml:"fullname,attr"`
+	Type            string     `xml:"type,attr"`
+	ClassName       string     `xml:"classname,attr,omitempty"`
+	Facet           string     `xml:"facet,attr,omitempty"`
+	Size            int        `xml:"size,attr,omitempty"`
+	Children        int        `xml:"children,attr,omitempty"`
+	NumChildren     int        `xml:"numchildren,attr,omitempty"`
+	Encoding        string     `xml:"encoding,attr,omitempty"`
+	Value           string     `xml:",chardata"`
+	ChildProperties []Property `xml:"property,omitempty"`
 }
 
 // StackFrame represents a call stack entry
 type StackFrame struct {
-	Level     int    `xml:"level,attr"`
-	Type      string `xml:"type,attr"`
-	Filename  string `xml:"filename,attr"`
-	Lineno    int    `xml:"lineno,attr"`
-	Where     string `xml:"where,attr"`
-	Cmmd      string `xml:"cmmd,attr,omitempty"`
+	Level    int    `xml:"level,attr"`
+	Type     string `xml:"type,attr"`
+	Filename string `xml:"filename,attr"`
+	Lineno   int    `xml:"lineno,attr"`
+	Where    string `xml:"where,attr"`
+	Cmmd     string `xml:"cmmd,attr,omitempty"`
 }
 
 // ParseInit parses the init packet from PHP
@@ -225,7 +256,13 @@ func MakeFileURI(path string) string {
 	if strings.HasPrefix(path, "file://") {
 		return path
 	}
-	return "file://" + path
+
+	slashed := filepath.ToSlash(path)
+	if strings.HasPrefix(slashed, "/") {
+		return (&url.URL{Scheme: "file", Path: slashed}).String()
+	}
+
+	return (&url.URL{Scheme: "file", Path: "/" + slashed}).String()
 }
 
 // ParseBreakpointSpec parses "file.php:42" or "file.php:42,55,60"
@@ -236,7 +273,14 @@ func ParseBreakpointSpec(spec string) (file string, lines []int, err error) {
 	}
 
 	file = spec[:sep]
-	lineStrs := strings.Split(spec[sep+1:], ",")
+	linePart := spec[sep+1:]
+	for _, r := range linePart {
+		if (r < '0' || r > '9') && r != ',' {
+			return "", nil, fmt.Errorf("invalid breakpoint spec: %s (expected file:line)", spec)
+		}
+	}
+
+	lineStrs := strings.Split(linePart, ",")
 	lines = make([]int, 0, len(lineStrs))
 
 	for _, ls := range lineStrs {
