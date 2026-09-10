@@ -2,7 +2,9 @@ package dbgp
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/base64"
+	"encoding/xml"
 	"fmt"
 	"io"
 	"net"
@@ -58,8 +60,11 @@ func (c *Client) Port() int {
 func (c *Client) WaitForConnection(timeout time.Duration) error {
 	// Set accept deadline if timeout specified
 	if timeout > 0 {
-		tcpListener := c.listener.(*net.TCPListener)
-		tcpListener.SetDeadline(time.Now().Add(timeout))
+		if deadlineListener, ok := c.listener.(interface{ SetDeadline(time.Time) error }); ok {
+			if err := deadlineListener.SetDeadline(time.Now().Add(timeout)); err != nil {
+				return fmt.Errorf("set accept deadline: %w", err)
+			}
+		}
 	}
 
 	conn, err := c.listener.Accept()
@@ -71,9 +76,6 @@ func (c *Client) WaitForConnection(timeout time.Duration) error {
 	c.reader = bufio.NewReader(conn)
 	c.writer = conn
 
-	// Start response reader
-	go c.readLoop()
-
 	// Read init packet
 	initData, err := c.readPacket()
 	if err != nil {
@@ -84,6 +86,9 @@ func (c *Client) WaitForConnection(timeout time.Duration) error {
 	if err != nil {
 		return fmt.Errorf("parse init packet: %w", err)
 	}
+
+	// Start response reader
+	go c.readLoop()
 
 	return nil
 }
@@ -274,11 +279,16 @@ func (c *Client) ListBreakpoints() ([]BreakpointInfo, error) {
 		return nil, err
 	}
 
-	// Parse breakpoints from response
-	var breakpoints []BreakpointInfo
-	// TODO: Parse from resp.Raw
-	_ = resp
-	return breakpoints, nil
+	var parsed struct {
+		Breakpoints []BreakpointInfo `xml:"breakpoint"`
+	}
+	decoder := xml.NewDecoder(bytes.NewReader([]byte("<response>" + resp.Raw + "</response>")))
+	decoder.CharsetReader = charsetReader
+	if err := decoder.Decode(&parsed); err != nil {
+		return nil, fmt.Errorf("parse breakpoint list: %w", err)
+	}
+
+	return parsed.Breakpoints, nil
 }
 
 // Run starts or continues execution
@@ -333,7 +343,7 @@ func (c *Client) GetContext(depth int, context int) ([]Variable, error) {
 	if err != nil {
 		return nil, err
 	}
-	return ParseVariables(resp.Raw), nil
+	return ParseVariablesFromProperties(resp.Properties), nil
 }
 
 // Eval evaluates an expression

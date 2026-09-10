@@ -18,7 +18,7 @@ func TestFormatSimpleValue(t *testing.T) {
 		{"bool", "1", "", "true"},
 		{"bool", "0", "", "false"},
 		{"null", "", "", "null"},
-		{"array", "", "App\\Foo", "App\\Foo[]"},
+		{"array", "", "App\\Foo", "array[]"},
 		{"array", "", "", "array[]"},
 		{"object", "", "App\\Service", "App\\Service{}"},
 	}
@@ -82,7 +82,6 @@ func TestParseVariablesFromRealXML(t *testing.T) {
 
 	vars := ParseVariables(string(data))
 
-	// Find specific variables
 	findVar := func(name string) *Variable {
 		for i := range vars {
 			if vars[i].Name == name {
@@ -119,6 +118,54 @@ func TestParseVariablesFromRealXML(t *testing.T) {
 			}
 			if v.Value != tt.wantValue {
 				t.Errorf("value = %q, want %q", v.Value, tt.wantValue)
+			}
+		})
+	}
+}
+
+func TestParseAllVariablesFromRealXML(t *testing.T) {
+	data, err := os.ReadFile("testdata/context_get_complex.xml")
+	if err != nil {
+		t.Fatalf("read test file: %v", err)
+	}
+
+	vars := ParseAllVariables(string(data))
+
+	findVar := func(name string) *Variable {
+		for i := range vars {
+			if vars[i].Name == name {
+				return &vars[i]
+			}
+		}
+		return nil
+	}
+
+	tests := []struct {
+		name      string
+		wantType  string
+		wantValue string
+		wantLevel int
+	}{
+		{"$obj", "object", `App\Service\MyService`, 0},
+		{"$obj->cache", "object", `App\Cache`, 1},
+		{"$obj->cache->items", "array", "array[3]", 2},
+		{"$obj->cache->items[0]", "string", `"item1"`, 3},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			v := findVar(tt.name)
+			if v == nil {
+				t.Fatalf("variable %s not found", tt.name)
+			}
+			if v.Type != tt.wantType {
+				t.Errorf("type = %q, want %q", v.Type, tt.wantType)
+			}
+			if v.Value != tt.wantValue {
+				t.Errorf("value = %q, want %q", v.Value, tt.wantValue)
+			}
+			if v.Level != tt.wantLevel {
+				t.Errorf("level = %d, want %d", v.Level, tt.wantLevel)
 			}
 		})
 	}

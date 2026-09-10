@@ -52,7 +52,7 @@ type InitPacket struct {
 	Parent        string   `xml:"parent,attr"`
 	Language      string   `xml:"language,attr"`
 	Protocol      string   `xml:"protocol_version,attr"`
-	FileURI       string   `xml:"fileuri"`
+	FileURI       string   `xml:"fileuri,attr"`
 	EngineVersion string   `xml:"engine>version"`
 }
 
@@ -80,7 +80,7 @@ type Response struct {
 	Error *Error `xml:"error,omitempty"`
 
 	// Message for breakpoint hit
-	Message *Message `xml:"xdebug\\:message,omitempty"`
+	Message *Message `xml:"https://xdebug.org/dbgp/xdebug message,omitempty"`
 
 	// Raw for debugging
 	Raw string `xml:",innerxml"`
@@ -174,8 +174,12 @@ func formatValue(p Property) string {
 	}
 
 	if p.Type == "array" || p.Type == "object" {
-		if p.Children > 0 {
-			return fmt.Sprintf("%s(%d)", p.Type, p.Children)
+		count := p.NumChildren
+		if count == 0 {
+			count = p.Children
+		}
+		if count > 0 {
+			return fmt.Sprintf("%s(%d)", p.Type, count)
 		}
 		return p.Type + "(0)"
 	}

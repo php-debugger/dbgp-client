@@ -32,8 +32,13 @@ func ParseVariables(xmlData string) []Variable {
 		return nil
 	}
 
+	return ParseVariablesFromProperties(resp.Properties)
+}
+
+// ParseVariablesFromProperties extracts top-level variables and their immediate children from parsed properties
+func ParseVariablesFromProperties(properties []Property) []Variable {
 	var vars []Variable
-	for _, p := range resp.Properties {
+	for _, p := range properties {
 		// Only include top-level variables (no brackets or arrows in name)
 		if containsAny(p.FullName, "[", "->") {
 			continue
@@ -67,20 +72,21 @@ func ParseAllVariables(xmlData string) []Variable {
 		return nil
 	}
 
-	return flattenProperties(resp.Properties)
+	return flattenProperties(resp.Properties, 0)
 }
 
 // flattenProperties recursively flattens nested properties
-func flattenProperties(props []Property) []Variable {
+func flattenProperties(props []Property, level int) []Variable {
 	var vars []Variable
 	for _, p := range props {
 		vars = append(vars, Variable{
 			Name:  p.FullName,
 			Type:  p.Type,
 			Value: formatPropertyValue(p),
+			Level: level,
 		})
 		if len(p.ChildProperties) > 0 {
-			vars = append(vars, flattenProperties(p.ChildProperties)...)
+			vars = append(vars, flattenProperties(p.ChildProperties, level+1)...)
 		}
 	}
 	return vars
@@ -141,9 +147,6 @@ func formatSimpleValue(typ, content, classname string) string {
 	case "int", "float":
 		return content
 	case "array":
-		if classname != "" {
-			return classname + "[]"
-		}
 		return "array[]"
 	case "object":
 		if classname != "" {
