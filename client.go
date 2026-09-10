@@ -220,7 +220,11 @@ func (c *Client) nextTransID() int {
 
 // sendCommand sends a command and waits for response
 func (c *Client) sendCommand(cmd string) (*Response, error) {
-	if c.conn == nil {
+	c.mu.Lock()
+	conn := c.conn
+	writer := c.writer
+	c.mu.Unlock()
+	if conn == nil || writer == nil {
 		return nil, fmt.Errorf("not connected")
 	}
 
@@ -256,7 +260,7 @@ func (c *Client) sendCommand(cmd string) (*Response, error) {
 	// Send command
 	packet := fmt.Sprintf("%d\x00%s\x00", len(cmd), cmd)
 	c.writeMu.Lock()
-	_, err := c.writer.Write([]byte(packet))
+	_, err := writer.Write([]byte(packet))
 	c.writeMu.Unlock()
 	if err != nil {
 		c.mu.Lock()
@@ -409,7 +413,7 @@ func (c *Client) GetSource(file string, begin, end int) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	return resp.Raw, nil
+	return decodeResponseValue(resp)
 }
 
 // Status returns current debugger status
@@ -431,7 +435,7 @@ func (c *Client) FeatureGet(name string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	return resp.Raw, nil
+	return decodeResponseValue(resp)
 }
 
 // FeatureSet sets a feature value
@@ -465,4 +469,19 @@ func (c *Client) Close() error {
 		closeErr = errors.Join(closeErr, listener.Close())
 	}
 	return closeErr
+}
+
+func decodeResponseValue(resp *Response) (string, error) {
+	value := strings.TrimSpace(resp.Value)
+	if value == "" {
+		value = strings.TrimSpace(resp.Raw)
+	}
+	if resp.Encoding == "base64" && value != "" {
+		decoded, err := base64.StdEncoding.DecodeString(value)
+		if err != nil {
+			return "", fmt.Errorf("decode base64 response: %w", err)
+		}
+		return string(decoded), nil
+	}
+	return value, nil
 }

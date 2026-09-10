@@ -164,5 +164,8 @@ func formatSimpleValue(typ, content, classname string) string {
 func FormatVariable(v Variable) string {
 	indent := strings.Repeat("  ", v.Level)
 	width := 30 - (v.Level * 2)
+	if width < 8 {
+		width = 8
+	}
 	return fmt.Sprintf("%s%-*s %-8s = %s", indent, width, v.Name, v.Type, v.Value)
 }

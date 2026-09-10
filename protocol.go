@@ -96,6 +96,7 @@ type Response struct {
 	Reason       string   `xml:"reason,attr,omitempty"`
 	Success      string   `xml:"success,attr,omitempty"`
 	BreakpointID int      `xml:"id,attr,omitempty"`
+	Encoding     string   `xml:"encoding,attr,omitempty"`
 
 	// For breakpoint_set
 	Breakpoint *BreakpointInfo `xml:"breakpoint,omitempty"`
@@ -115,6 +116,8 @@ type Response struct {
 
 	// Raw for debugging
 	Raw string `xml:",innerxml"`
+	// Value contains raw response chardata when present
+	Value string `xml:",chardata"`
 }
 
 // Error represents a DBGp error
@@ -262,6 +265,10 @@ func FormatFileURI(uri string) string {
 		path = path[1:]
 	}
 
+	if u.Host != "" {
+		return "//" + u.Host + filepath.FromSlash(path)
+	}
+
 	return filepath.FromSlash(path)
 }
 
@@ -269,6 +276,20 @@ func FormatFileURI(uri string) string {
 func MakeFileURI(path string) string {
 	if strings.HasPrefix(path, "file://") {
 		return path
+	}
+
+	if strings.HasPrefix(path, `\\`) || strings.HasPrefix(path, "//") {
+		trimmed := strings.TrimLeft(path, `/\`)
+		parts := strings.SplitN(trimmed, `\`, 2)
+		if len(parts) == 1 {
+			parts = strings.SplitN(trimmed, "/", 2)
+		}
+		host := parts[0]
+		sharePath := ""
+		if len(parts) == 2 {
+			sharePath = "/" + filepath.ToSlash(parts[1])
+		}
+		return (&url.URL{Scheme: "file", Host: host, Path: sharePath}).String()
 	}
 
 	slashed := filepath.ToSlash(path)
