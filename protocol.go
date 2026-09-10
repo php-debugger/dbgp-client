@@ -292,7 +292,8 @@ func MakeFileURI(path string) string {
 		return (&url.URL{Scheme: "file", Host: host, Path: sharePath}).String()
 	}
 
-	slashed := filepath.ToSlash(path)
+	slashed := strings.ReplaceAll(path, `\`, `/`)
+	slashed = filepath.ToSlash(slashed)
 	if strings.HasPrefix(slashed, "/") {
 		return (&url.URL{Scheme: "file", Path: slashed}).String()
 	}

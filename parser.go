@@ -91,8 +91,7 @@ func flattenProperties(props []Property, level int) []Variable {
 // formatPropertyValue formats a property value for display
 func formatPropertyValue(p Property) string {
 	// Handle types with children (check Children attr, ChildProperties, or raw XML in Value)
-	hasChildren := p.Children > 0 || len(p.ChildProperties) > 0 ||
-		(len(p.Value) > 0 && p.Value[0] == '<')
+	hasChildren := p.Children > 0 || len(p.ChildProperties) > 0
 
 	if hasChildren {
 		count := p.NumChildren

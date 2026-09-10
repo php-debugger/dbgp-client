@@ -24,6 +24,7 @@ type Client struct {
 
 	mu        sync.Mutex
 	writeMu   sync.Mutex
+	breakMu   sync.Mutex
 	transID   int
 	responses map[int]chan *Response
 
@@ -83,11 +84,23 @@ func (c *Client) WaitForConnection(timeout time.Duration) error {
 	// Read init packet
 	initData, err := c.readPacket()
 	if err != nil {
+		_ = conn.Close()
+		c.mu.Lock()
+		c.conn = nil
+		c.reader = nil
+		c.writer = nil
+		c.mu.Unlock()
 		return fmt.Errorf("read init packet: %w", err)
 	}
 
 	initPacket, err := ParseInit(initData)
 	if err != nil {
+		_ = conn.Close()
+		c.mu.Lock()
+		c.conn = nil
+		c.reader = nil
+		c.writer = nil
+		c.mu.Unlock()
 		return fmt.Errorf("parse init packet: %w", err)
 	}
 	c.mu.Lock()
@@ -194,6 +207,9 @@ func (c *Client) readLoop() {
 
 // handleBreakpoint handles async breakpoint notifications
 func (c *Client) handleBreakpoint(resp *Response) {
+	c.breakMu.Lock()
+	defer c.breakMu.Unlock()
+
 	file, line := resp.ParseMessage()
 
 	// Get stack

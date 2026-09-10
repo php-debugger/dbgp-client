@@ -62,6 +62,11 @@ func TestFormatPropertyValue(t *testing.T) {
 			prop: Property{Type: "object", ClassName: "App\\Service", Children: 2},
 			want: "App\\Service",
 		},
+		{
+			name: "string starting with angle bracket",
+			prop: Property{Type: "string", Value: "<html>"},
+			want: `"<html>"`,
+		},
 	}
 
 	for _, tt := range tests {
