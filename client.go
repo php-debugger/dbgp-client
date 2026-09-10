@@ -13,6 +13,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode"
 )
 
 // Client manages the DBGp connection
@@ -67,6 +68,8 @@ func (c *Client) WaitForConnection(timeout time.Duration) error {
 			if err := deadlineListener.SetDeadline(time.Now().Add(timeout)); err != nil {
 				return fmt.Errorf("set accept deadline: %w", err)
 			}
+		} else {
+			return fmt.Errorf("listener does not support deadlines")
 		}
 	}
 
@@ -166,18 +169,25 @@ func (c *Client) readLoop() {
 	for {
 		data, err := c.readPacket()
 		if err != nil {
+			pending := make([]chan *Response, 0)
 			c.mu.Lock()
-			for id, ch := range c.responses {
-				ch <- &Response{
-					Transaction: id,
+			for _, ch := range c.responses {
+				pending = append(pending, ch)
+			}
+			c.responses = make(map[int]chan *Response)
+			c.mu.Unlock()
+
+			for _, ch := range pending {
+				select {
+				case ch <- &Response{
 					Error: &Error{
 						Code:    -1,
 						Message: "connection closed",
 					},
+				}:
+				default:
 				}
-				delete(c.responses, id)
 			}
-			c.mu.Unlock()
 			return
 		}
 
@@ -493,7 +503,13 @@ func decodeResponseValue(resp *Response) (string, error) {
 		value = strings.TrimSpace(resp.Raw)
 	}
 	if resp.Encoding == "base64" && value != "" {
-		decoded, err := base64.StdEncoding.DecodeString(value)
+		cleaned := strings.Map(func(r rune) rune {
+			if unicode.IsSpace(r) {
+				return -1
+			}
+			return r
+		}, value)
+		decoded, err := base64.StdEncoding.DecodeString(cleaned)
 		if err != nil {
 			return "", fmt.Errorf("decode base64 response: %w", err)
 		}
