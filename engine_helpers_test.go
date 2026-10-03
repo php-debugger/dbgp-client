@@ -30,6 +30,8 @@ const (
 	lineAddReturn = 25 // return $sum;
 	lineCallAdd   = 36 // $x = add(2, 3);
 	lineLoopBody  = 39 // $y = $i * 2;
+	lineWarning   = 42 // $missing = $undefinedVariable;
+	lineThrow     = 44 // throw new RuntimeException("boom");
 )
 
 // knownBug skips a test that documents a known defect, unless DBGP_KNOWN_BUGS=1.
@@ -73,28 +75,46 @@ func debuggeePath(t *testing.T) string {
 	return path
 }
 
-// startDebuggee runs the debuggee script with Xdebug connecting to port.
-// The process is killed and reaped at test cleanup.
-func startDebuggee(t *testing.T, port int) *bytes.Buffer {
+// debuggee is a running PHP process for the debuggee script.
+type debuggee struct {
+	out    bytes.Buffer // stdout and stderr; read only after exited
+	exited chan struct{}
+}
+
+// startDebuggee runs the debuggee script with the engine connecting to port.
+// extraIni adds -d settings, e.g. "xdebug.idekey=agent". The process is
+// killed and reaped at test cleanup.
+func startDebuggee(t *testing.T, port int, extraIni ...string) *debuggee {
 	t.Helper()
-	var out bytes.Buffer
-	cmd := exec.Command("php",
+	args := []string{
 		"-dxdebug.mode=debug",
 		"-dxdebug.start_with_request=yes",
 		"-dxdebug.client_host=127.0.0.1",
 		fmt.Sprintf("-dxdebug.client_port=%d", port),
 		"-dxdebug.log_level=0",
-		debuggeePath(t))
-	cmd.Stdout = &out
-	cmd.Stderr = &out
+		// Warnings reach the IDE as notifications; printing them too would put
+		// local paths into the recorded stdout stream.
+		"-ddisplay_errors=0",
+	}
+	for _, ini := range extraIni {
+		args = append(args, "-d"+ini)
+	}
+	d := &debuggee{exited: make(chan struct{})}
+	cmd := exec.Command("php", append(args, debuggeePath(t))...)
+	cmd.Stdout = &d.out
+	cmd.Stderr = &d.out
 	if err := cmd.Start(); err != nil {
 		t.Fatalf("start php: %v", err)
 	}
+	go func() {
+		_ = cmd.Wait()
+		close(d.exited)
+	}()
 	t.Cleanup(func() {
 		_ = cmd.Process.Kill()
-		_ = cmd.Wait()
+		<-d.exited
 	})
-	return &out
+	return d
 }
 
 // rawSession is a minimal, spec-conformant DBGp IDE side.

@@ -1,174 +1,242 @@
 package dbgp
 
 import (
-	"fmt"
+	"context"
 	"strings"
 	"testing"
 	"time"
 )
 
-// Tests in this file drive Client against a real PHP with PHP Debugger or
+// Tests in this file drive a Server against a real PHP with PHP Debugger or
 // Xdebug and are skipped when neither is installed (or with -short).
 
-// startEngineSession returns a client connected to the debuggee, stopped at
-// the start of the script.
-func startEngineSession(t *testing.T) *Client {
+// stepWait is how long a test lets a continuation run before failing.
+const stepWait = 10 * time.Second
+
+// startEngineSession starts a server and the debuggee and returns the
+// session, stopped at the start of the script.
+func startEngineSession(t *testing.T, cfg Config) (*Server, *Session) {
 	t.Helper()
 	requireDebugEngine(t)
-	c := newTestClient(t)
-	startDebuggee(t, c.Port())
-	if err := c.WaitForConnection(10 * time.Second); err != nil {
-		t.Fatal(err)
+	srv := newTestServer(t, cfg)
+	startDebuggee(t, srv.Port())
+	return srv, waitSession(t, srv)
+}
+
+// mustContinue continues sess and fails the test unless it stops.
+func mustContinue(t *testing.T, sess *Session, command string) State {
+	t.Helper()
+	st, err := sess.Continue(context.Background(), command, stepWait)
+	if err != nil {
+		t.Fatalf("Continue(%s): %v", command, err)
 	}
-	return c
+	if st.Status == StatusRunning {
+		t.Fatalf("Continue(%s): still running after %v", command, stepWait)
+	}
+	return st
 }
 
 func TestEngineSession(t *testing.T) {
-	c := startEngineSession(t)
+	_, sess := startEngineSession(t, Config{Features: map[string]string{"max_children": "10"}})
 	script := debuggeePath(t)
 
-	init := c.Init()
+	init := sess.Init()
 	if init.Language != "PHP" || init.Protocol != "1.0" || init.FileURI != MakeFileURI(script) {
 		t.Fatalf("init = %+v", init)
 	}
-	if st, err := c.Status(); err != nil || st != StatusStarting {
-		t.Fatalf("Status = %q, %v; want starting", st, err)
+	if err := sess.SetupError(); err != nil {
+		t.Fatalf("SetupError: %v", err)
 	}
-	if err := c.FeatureSet("max_children", "10"); err != nil {
-		t.Fatal(err)
+	if st := sess.State(); st.Status != StatusStarting {
+		t.Fatalf("State = %+v, want starting", st)
 	}
-	if v, err := c.FeatureGet("max_children"); err != nil || v != "10" {
+	if v, err := sess.FeatureGet("max_children"); err != nil || v != "10" {
 		t.Fatalf("FeatureGet(max_children) = %q, %v", v, err)
 	}
 
-	id, err := c.SetBreakpoint(script, lineAddBody)
+	id, err := sess.SetBreakpoint(script, lineAddBody)
 	if err != nil || id == 0 {
 		t.Fatalf("SetBreakpoint = %d, %v", id, err)
 	}
-	bps, err := c.ListBreakpoints()
+	bps, err := sess.ListBreakpoints()
 	if err != nil || len(bps) != 1 || bps[0].ID != id || bps[0].Lineno != lineAddBody {
 		t.Fatalf("ListBreakpoints = %+v, %v", bps, err)
 	}
 
-	if err := c.Run(); err != nil {
-		t.Fatal(err)
+	st := mustContinue(t, sess, ContinueRun)
+	if st.Status != StatusBreak || st.File != script || st.Line != lineAddBody {
+		t.Fatalf("after run: %+v, want break at %s:%d", st, script, lineAddBody)
 	}
-	if st, err := c.Status(); err != nil || st != StatusBreak {
-		t.Fatalf("Status after run = %q, %v; want break", st, err)
-	}
-	stack, err := c.GetStack()
-	if err != nil || len(stack) != 2 || stack[0].Where != "add" || stack[0].Lineno != lineAddBody || stack[1].Lineno != lineCallAdd {
+	stack, err := sess.GetStack()
+	if err != nil || len(stack) != 2 || stack[0].Where != "add" || stack[1].Lineno != lineCallAdd {
 		t.Fatalf("GetStack = %+v, %v", stack, err)
 	}
-	if got := FormatFileURI(stack[0].Filename); got != script {
-		t.Errorf("frame file = %q, want %q", got, script)
-	}
-	vars, err := c.GetContext(0, 0)
+	vars, err := sess.GetContext(0, 0)
 	if err != nil || len(vars) != 3 || vars[0].Name != "$a" || vars[0].Value != "2" || vars[1].Value != "3" {
 		t.Fatalf("GetContext = %+v, %v", vars, err)
 	}
-	src, err := c.GetSource(script, lineAddBody, lineAddReturn)
+	if v, err := sess.Eval("$a + $b"); err != nil || v != "5" {
+		t.Errorf("Eval = %q, %v; want 5", v, err)
+	}
+	src, err := sess.GetSource(script, lineAddBody, lineAddReturn)
 	if err != nil || !strings.Contains(src, "$sum = $a + $b;") || !strings.Contains(src, "return $sum;") {
 		t.Fatalf("GetSource = %q, %v", src, err)
 	}
 
-	if err := c.StepOver(); err != nil {
-		t.Fatal(err)
+	if st := mustContinue(t, sess, ContinueStepOver); st.Line != lineAddReturn {
+		t.Errorf("after step_over: %+v, want line %d", st, lineAddReturn)
 	}
-	if stack, _ := c.GetStack(); len(stack) == 0 || stack[0].Lineno != lineAddReturn {
-		t.Errorf("after step_over: stack = %+v, want line %d", stack, lineAddReturn)
+	if st := mustContinue(t, sess, ContinueStepOut); st.Line != lineCallAdd+1 {
+		t.Errorf("after step_out: %+v, want line %d", st, lineCallAdd+1)
 	}
-	if err := c.StepOut(); err != nil {
-		t.Fatal(err)
-	}
-	if stack, _ := c.GetStack(); len(stack) != 1 || stack[0].Where != "{main}" {
-		t.Errorf("after step_out: stack = %+v, want {main}", stack)
-	}
-	if err := c.StepInto(); err != nil {
-		t.Fatal(err)
-	}
+	mustContinue(t, sess, ContinueStepInto)
 
-	if err := c.RemoveBreakpoint(id); err != nil {
+	if err := sess.RemoveBreakpoint(id); err != nil {
 		t.Fatal(err)
 	}
-	if err := c.RemoveBreakpoint(id); err == nil || !strings.Contains(err.Error(), "205") {
+	if err := sess.RemoveBreakpoint(id); err == nil || !strings.Contains(err.Error(), "205") {
 		t.Errorf("second RemoveBreakpoint err = %v, want error 205", err)
 	}
-	if err := c.Run(); err != nil {
-		t.Fatal(err)
+	if st := mustContinue(t, sess, ContinueRun); st.Status != StatusStopping {
+		t.Errorf("at end: %+v, want stopping", st)
 	}
-	if st, err := c.Status(); err != nil || st != StatusStopping {
-		t.Errorf("Status at end = %q, %v; want stopping", st, err)
-	}
-	if err := c.Stop(); err != nil {
+	if err := sess.Stop(); err != nil {
 		t.Errorf("Stop: %v", err)
+	}
+	select {
+	case <-sess.Done():
+	case <-time.After(5 * time.Second):
+		t.Fatal("session not closed after stop")
+	}
+	if st := sess.State(); !st.Closed {
+		t.Errorf("State after stop = %+v, want closed", st)
 	}
 }
 
-func TestEngineBreakpointCallback(t *testing.T) {
-	c := startEngineSession(t)
-	hits := make(chan string, 1)
-	c.OnBreakpoint(func(file string, line int, stack []StackFrame, vars []Variable) {
-		hits <- fmt.Sprintf("%s:%d %d %d", file, line, len(stack), len(vars))
-	})
-	if _, err := c.SetBreakpoint(debuggeePath(t), lineAddBody); err != nil {
+// Breakpoints added to the server before PHP starts apply to its session.
+func TestEnginePendingBreakpoint(t *testing.T) {
+	requireDebugEngine(t)
+	srv := newTestServer(t, Config{})
+	if _, err := srv.AddBreakpoint(Breakpoint{File: debuggeePath(t), Line: lineAddBody}); err != nil {
 		t.Fatal(err)
 	}
-	if err := c.Run(); err != nil {
-		t.Fatal(err)
+	startDebuggee(t, srv.Port())
+	sess := waitSession(t, srv)
+	if st := mustContinue(t, sess, ContinueRun); st.Status != StatusBreak || st.Line != lineAddBody {
+		t.Errorf("after run: %+v, want break at line %d", st, lineAddBody)
 	}
-	select {
-	case got := <-hits:
-		if want := fmt.Sprintf("%s:%d 2 3", debuggeePath(t), lineAddBody); got != want {
-			t.Errorf("hit = %q, want %q", got, want)
+}
+
+func TestEngineOutputAndNotifications(t *testing.T) {
+	_, sess := startEngineSession(t, Config{})
+	if st := mustContinue(t, sess, ContinueRun); st.Status != StatusStopping {
+		t.Fatalf("after run: %+v, want stopping", st)
+	}
+	if out, _, _ := sess.Output(0); out != "x=5\ndone\n" {
+		t.Errorf("Output = %q, want %q", out, "x=5\ndone\n")
+	}
+	notes, _ := sess.Notifications(0)
+	var warning *Message
+	for _, n := range notes {
+		if n.Name == "error" {
+			warning = n.Message
 		}
-	case <-time.After(5 * time.Second):
-		t.Fatal("OnBreakpoint not called")
+	}
+	if warning == nil || warning.Type != "Warning" || warning.Lineno != lineWarning ||
+		warning.Filename != debuggeePath(t) || !strings.Contains(warning.Text, "$undefinedVariable") {
+		t.Errorf("warning notification = %+v; notifications = %+v", warning, notes)
+	}
+}
+
+func TestEngineExceptionBreakpoint(t *testing.T) {
+	srv, sess := startEngineSession(t, Config{})
+	if _, err := srv.AddBreakpoint(Breakpoint{Type: BreakpointException, Exception: "RuntimeException"}); err != nil {
+		t.Fatal(err)
+	}
+	st := mustContinue(t, sess, ContinueRun)
+	if st.Status != StatusBreak || st.Line != lineThrow || st.Exception != "RuntimeException" || st.Message != "boom" {
+		t.Errorf("after run: %+v, want RuntimeException boom at line %d", st, lineThrow)
 	}
 }
 
 func TestEngineConditionalBreakpoint(t *testing.T) {
-	c := startEngineSession(t)
-	if _, err := c.SetConditionalBreakpoint(debuggeePath(t), lineLoopBody, "$i == 3"); err != nil {
+	srv, sess := startEngineSession(t, Config{})
+	if _, err := srv.AddBreakpoint(Breakpoint{Type: BreakpointConditional, File: debuggeePath(t), Line: lineLoopBody, Condition: "$i == 3"}); err != nil {
 		t.Fatal(err)
 	}
-	if err := c.Run(); err != nil {
-		t.Fatal(err)
+	if st := mustContinue(t, sess, ContinueRun); st.Line != lineLoopBody {
+		t.Fatalf("after run: %+v, want line %d", st, lineLoopBody)
 	}
-	vars, err := c.GetContext(0, 0)
-	if err != nil {
-		t.Fatal(err)
-	}
-	for _, v := range vars {
-		if v.Name == "$i" && v.Value != "3" {
-			t.Errorf("$i = %s, want 3", v.Value)
-		}
-	}
-}
-
-func TestEngineEval(t *testing.T) {
-	c := startEngineSession(t)
-	if _, err := c.SetBreakpoint(debuggeePath(t), lineAddBody); err != nil {
-		t.Fatal(err)
-	}
-	if err := c.Run(); err != nil {
-		t.Fatal(err)
-	}
-	if v, err := c.Eval("$a + $b"); err != nil || v != "5" {
-		t.Errorf("Eval = %q, %v; want 5", v, err)
+	if v, err := sess.Eval("$i"); err != nil || v != "3" {
+		t.Errorf("$i = %q, %v; want 3", v, err)
 	}
 }
 
 func TestEngineReportsVersion(t *testing.T) {
-	c := startEngineSession(t)
-	if c.Init().EngineVersion == "" {
-		t.Error("EngineVersion is empty")
+	_, sess := startEngineSession(t, Config{})
+	if e := sess.Init().Engine; e.Name == "" || e.Version == "" {
+		t.Errorf("Engine = %+v, want name and version", e)
 	}
 }
 
 func TestEngineDetach(t *testing.T) {
-	c := startEngineSession(t)
-	if err := c.Detach(); err != nil {
+	_, sess := startEngineSession(t, Config{})
+	if err := sess.Detach(); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// Two scripts debugged at once get independent sessions.
+func TestEngineConcurrentSessions(t *testing.T) {
+	requireDebugEngine(t)
+	srv := newTestServer(t, Config{})
+	if _, err := srv.AddBreakpoint(Breakpoint{File: debuggeePath(t), Line: lineAddBody}); err != nil {
+		t.Fatal(err)
+	}
+	startDebuggee(t, srv.Port())
+	startDebuggee(t, srv.Port())
+	first, second := waitSession(t, srv), waitSession(t, srv)
+	if first.ID() == second.ID() {
+		t.Fatalf("both sessions have id %d", first.ID())
+	}
+
+	if st := mustContinue(t, first, ContinueRun); st.Line != lineAddBody {
+		t.Fatalf("first: %+v", st)
+	}
+	if st := second.State(); st.Status != StatusStarting {
+		t.Errorf("second moved when first was continued: %+v", st)
+	}
+	if st := mustContinue(t, second, ContinueRun); st.Line != lineAddBody {
+		t.Fatalf("second: %+v", st)
+	}
+	if st := mustContinue(t, first, ContinueRun); st.Status != StatusStopping {
+		t.Errorf("first at end: %+v", st)
+	}
+	if got := len(srv.Sessions()); got != 2 {
+		t.Errorf("Sessions() has %d sessions, want 2", got)
+	}
+}
+
+// Sessions for another IDE key are detached and their script runs on.
+func TestEngineIDEKeyFilter(t *testing.T) {
+	requireDebugEngine(t)
+	srv := newTestServer(t, Config{IDEKey: "agent"})
+
+	other := startDebuggee(t, srv.Port(), "xdebug.idekey=someone-else")
+	select {
+	case <-other.exited:
+	case <-time.After(stepWait):
+		t.Fatal("script for another IDE key did not run to completion")
+	}
+	if !strings.Contains(other.out.String(), "done") {
+		t.Errorf("script output = %q, want it to have run", other.out.String())
+	}
+	if got := len(srv.Sessions()); got != 0 {
+		t.Errorf("Sessions() has %d sessions, want 0", got)
+	}
+
+	startDebuggee(t, srv.Port(), "xdebug.idekey=agent")
+	if sess := waitSession(t, srv); sess.Init().IDEKey != "agent" {
+		t.Errorf("idekey = %q", sess.Init().IDEKey)
 	}
 }

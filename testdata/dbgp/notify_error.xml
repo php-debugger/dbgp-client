@@ -1,0 +1,2 @@
+<?xml version="1.0" encoding="iso-8859-1"?>
+<notify xmlns="urn:debugger_protocol_v1" xmlns:xdebug="https://xdebug.org/dbgp/xdebug" name="error"><xdebug:message filename="file:///app/basic.php" lineno="42" type="Warning"><![CDATA[Undefined variable $undefinedVariable]]></xdebug:message></notify>

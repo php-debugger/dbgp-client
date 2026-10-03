@@ -3,6 +3,27 @@ CLI DBGP client
 
 Code imported from `cli/dbgp` in https://github.com/php-debugger/php-debugger/pull/12 (authored by @Haehnchen).
 
+## Usage
+
+A `Server` listens for [PHP Debugger](https://php-debugger.dev) or Xdebug connections. Each PHP request or script run becomes a `Session`, which waits at the start of the script until it is continued.
+
+```go
+srv, err := dbgp.Listen(dbgp.Config{Addr: "127.0.0.1:9003"})
+// Server breakpoints apply to every session, including ones that connect later.
+srv.AddBreakpoint(dbgp.Breakpoint{File: "/app/index.php", Line: 12})
+
+sess, err := srv.WaitForSession(ctx)
+// Continue waits up to the given time; if the script is still running then,
+// the state says so and Wait can be called later.
+st, err := sess.Continue(ctx, dbgp.ContinueRun, 30*time.Second)
+if st.Status == dbgp.StatusBreak {
+	stack, _ := sess.GetStack()
+	vars, _ := sess.GetContext(0, 0)
+}
+out, next, _ := sess.Output(0)      // program output, read incrementally
+notes, _ := sess.Notifications(0)   // PHP warnings and other notifications
+```
+
 ## Testing
 
 ```sh
