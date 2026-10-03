@@ -2,6 +2,7 @@ package dbgp
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
 	"time"
@@ -238,5 +239,81 @@ func TestEngineIDEKeyFilter(t *testing.T) {
 	startDebuggee(t, srv.Port(), "xdebug.idekey=agent")
 	if sess := waitSession(t, srv); sess.Init().IDEKey != "agent" {
 		t.Errorf("idekey = %q", sess.Init().IDEKey)
+	}
+}
+
+func TestEngineInspection(t *testing.T) {
+	_, sess := startEngineSession(t, Config{Features: map[string]string{"max_children": "10", "max_data": "16"}})
+	if _, err := sess.SetBreakpoint(debuggeePath(t), lineAddBody); err != nil {
+		t.Fatal(err)
+	}
+	mustContinue(t, sess, ContinueRun)
+	main := PropertyOptions{Depth: 1}
+
+	if d, err := sess.StackDepth(); err != nil || d != 2 {
+		t.Errorf("StackDepth = %d, %v; want 2", d, err)
+	}
+	if f, err := sess.GetStackFrame(1); err != nil || f.Where != "{main}" || f.Lineno != lineCallAdd {
+		t.Errorf("GetStackFrame(1) = %+v, %v", f, err)
+	}
+	names, err := sess.ContextNames(0)
+	if err != nil || len(names) < 2 || names[0].Name != "Locals" || names[1].Name != "Superglobals" {
+		t.Errorf("ContextNames = %+v, %v", names, err)
+	}
+	if types, err := sess.TypeMap(); err != nil || len(types) == 0 {
+		t.Errorf("TypeMap = %+v, %v", types, err)
+	}
+
+	// Paging through an array of 40 with max_children 10.
+	var all []string
+	for page := 0; ; page++ {
+		opts := main
+		opts.Page = page
+		p, err := sess.GetProperty("$numbers", opts)
+		if err != nil {
+			t.Fatalf("GetProperty($numbers, page %d): %v", page, err)
+		}
+		for _, c := range p.ChildProperties {
+			v, _ := c.DecodedValue()
+			all = append(all, v)
+		}
+		if page+1 >= p.Pages() {
+			break
+		}
+	}
+	if len(all) != 40 || all[0] != "1" || all[39] != "40" {
+		t.Errorf("paged $numbers = %v", all)
+	}
+
+	// Names that need quoting.
+	p, err := sess.GetProperty(`$user["name"]`, main)
+	if v, _ := p.DecodedValue(); err != nil || v != "Alice" {
+		t.Errorf(`$user["name"] = %+v, %v`, p, err)
+	}
+
+	// Long values: truncated to max_data by property_get, whole by property_value.
+	p, err = sess.GetProperty("$long", main)
+	if err != nil || !p.Truncated() || p.Size != 200 {
+		t.Errorf("$long = %+v, %v; want truncated", p, err)
+	}
+	if v, err := sess.GetPropertyValue("$long", main); err != nil || len(v) != 200 {
+		t.Errorf("GetPropertyValue($long) = %d bytes, %v; want 200", len(v), err)
+	}
+
+	// property_set evaluates its value as PHP.
+	if err := sess.SetProperty("$b", "7 * 2", PropertyOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	if v, err := sess.Eval("$b"); err != nil || v != "14" {
+		t.Errorf("$b after SetProperty = %q, %v; want 14", v, err)
+	}
+
+	if p, err := sess.EvalProperty("['k' => $a]", 0); err != nil || len(p.ChildProperties) != 1 || p.ChildProperties[0].Name != "k" {
+		t.Errorf("EvalProperty = %+v, %v", p, err)
+	}
+
+	var engineErr *EngineError
+	if _, err := sess.GetProperty("$nope", PropertyOptions{}); !errors.As(err, &engineErr) || engineErr.Code != 300 {
+		t.Errorf("GetProperty($nope) err = %v, want engine error 300", err)
 	}
 }
