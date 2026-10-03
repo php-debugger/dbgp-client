@@ -1,0 +1,2 @@
+<?xml version="1.0" encoding="iso-8859-1"?>
+<response xmlns="urn:debugger_protocol_v1" xmlns:xdebug="https://xdebug.org/dbgp/xdebug" command="no_such_command" transaction_id="1"><error code="4"><message><![CDATA[unimplemented command]]></message></error></response>

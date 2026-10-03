@@ -1,0 +1,2 @@
+<?xml version="1.0" encoding="iso-8859-1"?>
+<response xmlns="urn:debugger_protocol_v1" xmlns:xdebug="https://xdebug.org/dbgp/xdebug" command="stack_get" transaction_id="20"><stack where="add" level="0" type="file" filename="file:///app/basic.php" lineno="24"></stack><stack where="{main}" level="1" type="file" filename="file:///app/basic.php" lineno="36"></stack></response>

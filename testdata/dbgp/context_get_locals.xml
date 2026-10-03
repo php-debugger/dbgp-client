@@ -1,0 +1,2 @@
+<?xml version="1.0" encoding="iso-8859-1"?>
+<response xmlns="urn:debugger_protocol_v1" xmlns:xdebug="https://xdebug.org/dbgp/xdebug" command="context_get" transaction_id="23" context="0"><property name="$a" fullname="$a" type="int"><![CDATA[2]]></property><property name="$b" fullname="$b" type="int"><![CDATA[3]]></property><property name="$sum" fullname="$sum" type="uninitialized"></property></response>
