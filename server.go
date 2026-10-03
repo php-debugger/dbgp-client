@@ -46,6 +46,9 @@ type Config struct {
 	// InitTimeout bounds how long a new connection may take to send its
 	// init packet. Default: 10s.
 	InitTimeout time.Duration
+	// PathMap maps local directories to the engine's, for PHP running in a
+	// container or on a remote server. Sessions take and return local paths.
+	PathMap []PathMapping
 }
 
 // Breakpoint is a breakpoint the server applies to every session, including
@@ -53,7 +56,7 @@ type Config struct {
 type Breakpoint struct {
 	ID        int    // assigned by AddBreakpoint
 	Type      string // line (default), conditional, call, return or exception
-	File      string // line and conditional: local path
+	File      string // line and conditional: local path (see Config.PathMap)
 	Line      int    // line and conditional
 	Condition string // conditional: PHP expression
 	Function  string // call and return
@@ -70,6 +73,7 @@ func (bp Breakpoint) typeName() string {
 // Server accepts engine connections and manages their sessions.
 type Server struct {
 	cfg      Config
+	paths    PathMap
 	listener net.Listener
 	done     chan struct{} // closed when the accept loop exits
 
@@ -92,12 +96,17 @@ func Listen(cfg Config) (*Server, error) {
 	if cfg.InitTimeout <= 0 {
 		cfg.InitTimeout = 10 * time.Second
 	}
+	paths, err := newPathMap(cfg.PathMap)
+	if err != nil {
+		return nil, err
+	}
 	listener, err := net.Listen("tcp", cfg.Addr)
 	if err != nil {
 		return nil, fmt.Errorf("listen on %s: %w", cfg.Addr, err)
 	}
 	s := &Server{
 		cfg:        cfg,
+		paths:      paths,
 		listener:   listener,
 		done:       make(chan struct{}),
 		handshakes: map[net.Conn]struct{}{},

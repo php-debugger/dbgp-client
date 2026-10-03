@@ -306,7 +306,7 @@ func TestResponseDecoding(t *testing.T) {
 		if want := []string{"line", "conditional", "call", "exception"}; !reflect.DeepEqual(types, want) {
 			t.Fatalf("types = %v, want %v", types, want)
 		}
-		if bps[0].ID != 42420001 || bps[0].Filename != fixtureScriptURI || bps[0].Lineno != 24 || bps[0].State != "enabled" {
+		if bps[0].ID != 42420001 || bps[0].Filename != "/app/basic.php" || bps[0].Lineno != 24 || bps[0].State != "enabled" {
 			t.Errorf("line breakpoint = %+v", bps[0])
 		}
 		if bps[2].State != "disabled" {
@@ -319,8 +319,8 @@ func TestResponseDecoding(t *testing.T) {
 			t.Fatal(err)
 		}
 		want := []StackFrame{
-			{Level: 0, Type: "file", Filename: fixtureScriptURI, Lineno: 24, Where: "add"},
-			{Level: 1, Type: "file", Filename: fixtureScriptURI, Lineno: 36, Where: "{main}"},
+			{Level: 0, Type: "file", Filename: "/app/basic.php", Lineno: 24, Where: "add"},
+			{Level: 1, Type: "file", Filename: "/app/basic.php", Lineno: 36, Where: "{main}"},
 		}
 		if !reflect.DeepEqual(stack, want) {
 			t.Errorf("stack = %+v, want %+v", stack, want)
