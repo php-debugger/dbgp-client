@@ -326,6 +326,9 @@ type StackFrame struct {
 	Lineno   int    `xml:"lineno,attr"`
 	Where    string `xml:"where,attr"`
 	Cmmd     string `xml:"cmmd,attr,omitempty"`
+	// Facet is "mapped" when the engine translated Filename with its own
+	// path maps, or "skipped" for code its maps mark as skipped.
+	Facet string `xml:"https://xdebug.org/dbgp/xdebug facet,attr,omitempty"`
 }
 
 // ParseInit parses the init packet from PHP

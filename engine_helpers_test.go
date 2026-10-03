@@ -86,6 +86,12 @@ type debuggee struct {
 // killed and reaped at test cleanup.
 func startDebuggee(t *testing.T, port int, extraIni ...string) *debuggee {
 	t.Helper()
+	return startDebuggeeScript(t, port, debuggeePath(t), extraIni...)
+}
+
+// startDebuggeeScript is startDebuggee for another copy of the script.
+func startDebuggeeScript(t *testing.T, port int, script string, extraIni ...string) *debuggee {
+	t.Helper()
 	args := []string{
 		"-dxdebug.mode=debug",
 		"-dxdebug.start_with_request=yes",
@@ -100,7 +106,7 @@ func startDebuggee(t *testing.T, port int, extraIni ...string) *debuggee {
 		args = append(args, "-d"+ini)
 	}
 	d := &debuggee{exited: make(chan struct{})}
-	cmd := exec.Command("php", append(args, debuggeePath(t))...)
+	cmd := exec.Command("php", append(args, script)...)
 	cmd.Stdout = &d.out
 	cmd.Stderr = &d.out
 	if err := cmd.Start(); err != nil {

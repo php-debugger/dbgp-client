@@ -188,7 +188,7 @@ func (s *Server) handshake(conn net.Conn) {
 	s.mu.Unlock()
 
 	sess := newSession(id, s, conn, reader, init)
-	sess.setup(s.cfg)
+	sess.setup(s.cfg, s.paths)
 	// Failed breakpoints are retried, and reported, by the first Continue.
 	_ = sess.syncBreakpoints()
 
@@ -207,10 +207,12 @@ func (s *Server) handshake(conn net.Conn) {
 // setup enables notifications and output capture, then applies cfg.Features.
 // Only commands every engine implements are sent here: Xdebug and PHP
 // Debugger resume the script after an unimplemented command.
-func (sess *Session) setup(cfg Config) {
+func (sess *Session) setup(cfg Config, paths PathMap) {
 	// Optional: older engines may not support these.
 	_ = sess.FeatureSet("notify_ok", "1")
 	_ = sess.FeatureSet("resolved_breakpoints", "1")
+	// Before cfg.Features, which may lower max_data below the probe's reply.
+	sess.detectEngineMapping(paths)
 
 	names := make([]string, 0, len(cfg.Features))
 	for name := range cfg.Features {

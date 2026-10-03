@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -86,6 +87,74 @@ type Session struct {
 	notes      []Notification
 	notesBase  int // index of notes[0] among all notifications
 	setupErr   error
+	warnings   []string
+	engineMap  EngineMapping
+}
+
+// EngineMapping describes the engine's own path mapping: map files in
+// .xdebug directories on the server, enabled by the path_mapping setting.
+// With it, the engine takes and returns local paths itself, except for the
+// source command.
+type EngineMapping struct {
+	Detected     bool   // false if the engine could not be asked
+	Enabled      bool   // the engine's path_mapping setting is on
+	RemoteScript string // the entry script's path on the server
+}
+
+// engineMappingProbe asks for the path_mapping settings (xdebug.* and
+// php_debugger.* are separate entries with one value) and the entry
+// script's server path. It only reads.
+const engineMappingProbe = `json_encode([ini_get('xdebug.path_mapping'), ini_get('php_debugger.path_mapping'), get_included_files()[0] ?? ''])`
+
+func (s *Session) detectEngineMapping(paths PathMap) {
+	p, err := s.EvalProperty(engineMappingProbe, 0)
+	if err != nil || p == nil || p.Truncated() {
+		return
+	}
+	encoded, err := p.DecodedValue()
+	if err != nil {
+		return
+	}
+	// ini_get returns false for settings an engine does not have.
+	var probe [3]any
+	if json.Unmarshal([]byte(encoded), &probe) != nil {
+		return
+	}
+	remote, _ := probe[2].(string)
+	m := EngineMapping{Detected: true, Enabled: iniEnabled(probe[0]) || iniEnabled(probe[1]), RemoteScript: remote}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.engineMap = m
+	if m.Enabled && len(paths) > 0 {
+		s.warnings = append(s.warnings, "the engine maps paths itself (path_mapping is on) and Config.PathMap is also set: "+
+			"paths both could translate are mapped by the client, so the engine's line-range rules do not apply to them")
+	}
+}
+
+// iniEnabled reports whether an ini_get value means a boolean setting is on.
+func iniEnabled(v any) bool {
+	s, _ := v.(string)
+	switch strings.ToLower(s) {
+	case "1", "on", "yes", "true":
+		return true
+	}
+	return false
+}
+
+// EngineMapping reports whether the engine maps paths itself.
+func (s *Session) EngineMapping() EngineMapping {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.engineMap
+}
+
+// SetupWarnings reports problems found while setting up the session that
+// do not stop it from working, such as path mapping configured twice.
+func (s *Session) SetupWarnings() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]string(nil), s.warnings...)
 }
 
 // pendingCommand is a command waiting for its response.

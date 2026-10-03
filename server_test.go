@@ -2,6 +2,7 @@ package dbgp
 
 import (
 	"context"
+	"encoding/base64"
 	"errors"
 	"io"
 	"strconv"
@@ -96,6 +97,7 @@ func TestServerInitTimeout(t *testing.T) {
 }
 
 func TestServerSessionSetup(t *testing.T) {
+	probeCommand := "eval -- " + base64.StdEncoding.EncodeToString([]byte(engineMappingProbe))
 	tests := []struct {
 		name string
 		cfg  Config
@@ -104,11 +106,13 @@ func TestServerSessionSetup(t *testing.T) {
 		{"defaults", Config{}, []string{
 			"feature_set -n notify_ok -v 1",
 			"feature_set -n resolved_breakpoints -v 1",
+			probeCommand,
 			"stdout -c 1",
 		}},
 		{"features and redirect", Config{Stdout: StdoutRedirect, Features: map[string]string{"max_depth": "2", "max_children": "50"}}, []string{
 			"feature_set -n notify_ok -v 1",
 			"feature_set -n resolved_breakpoints -v 1",
+			probeCommand,
 			"feature_set -n max_children -v 50",
 			"feature_set -n max_depth -v 2",
 			"stdout -c 2",
@@ -116,6 +120,7 @@ func TestServerSessionSetup(t *testing.T) {
 		{"output disabled", Config{Stdout: StdoutDisabled}, []string{
 			"feature_set -n notify_ok -v 1",
 			"feature_set -n resolved_breakpoints -v 1",
+			probeCommand,
 		}},
 	}
 	for _, tt := range tests {
@@ -125,7 +130,7 @@ func TestServerSessionSetup(t *testing.T) {
 			sess := waitSession(t, srv)
 			var got []string
 			for _, cmd := range e.Received() {
-				got = append(got, strings.TrimSuffix(cmd.Raw, " -i "+cmd.Args["i"]))
+				got = append(got, strings.Replace(cmd.Raw, " -i "+cmd.Args["i"], "", 1))
 			}
 			if strings.Join(got, "\n") != strings.Join(tt.want, "\n") {
 				t.Errorf("setup commands =\n%s\nwant\n%s", strings.Join(got, "\n"), strings.Join(tt.want, "\n"))
