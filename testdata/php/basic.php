@@ -39,3 +39,8 @@ for ($i = 0; $i < 5; $i++) {
     $y = $i * 2;
 }
 echo "done\n";
+$missing = $undefinedVariable; // warning: reported as an "error" notification
+try {
+    throw new RuntimeException("boom");
+} catch (RuntimeException $e) {
+}

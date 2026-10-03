@@ -2,6 +2,7 @@ package dbgp
 
 import (
 	"bufio"
+	"context"
 	"encoding/base64"
 	"fmt"
 	"net"
@@ -145,28 +146,39 @@ func parseFakeCommand(raw string) fakeCommand {
 // cEscapes are the C escapes stripcslashes understands (octal/hex omitted).
 var cEscapes = map[byte]byte{'n': '\n', 't': '\t', 'r': '\r', 'a': '\a', 'v': '\v', 'b': '\b', 'f': '\f'}
 
-// startFakeEngine connects a fake engine to client c, sends the init packet
-// and waits for c.WaitForConnection to return.
-func startFakeEngine(t *testing.T, c *Client, handlers map[string]fakeHandler) *fakeEngine {
+// startFakeSession connects a fake engine to a new server and returns the
+// session once the server has set it up. Setup commands (feature_set,
+// stdout) are cleared from the engine's record.
+func startFakeSession(t *testing.T, handlers map[string]fakeHandler) (*Session, *fakeEngine) {
 	t.Helper()
-	return startFakeEngineWithInit(t, c, fixture(t, "init"), handlers)
+	srv := newTestServer(t, Config{})
+	e := dialFakeEngine(t, srv, fixture(t, "init"), handlers)
+	sess := waitSession(t, srv)
+	e.ClearReceived()
+	return sess, e
 }
 
-func startFakeEngineWithInit(t *testing.T, c *Client, init string, handlers map[string]fakeHandler) *fakeEngine {
+// dialFakeEngine connects a fake engine to srv and sends its init packet.
+func dialFakeEngine(t *testing.T, srv *Server, init string, handlers map[string]fakeHandler) *fakeEngine {
 	t.Helper()
-	waitErr := make(chan error, 1)
-	go func() { waitErr <- c.WaitForConnection(5 * time.Second) }()
-
-	conn := dialClient(t, c)
+	conn := dialServer(t, srv)
 	e := &fakeEngine{t: t, conn: conn, handlers: handlers, done: make(chan struct{})}
 	t.Cleanup(e.Close)
-
 	e.Send(init)
-	if err := <-waitErr; err != nil {
-		t.Fatalf("WaitForConnection: %v", err)
-	}
 	go e.serve()
 	return e
+}
+
+// waitSession waits up to 5s for the next session on srv.
+func waitSession(t *testing.T, srv *Server) *Session {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	sess, err := srv.WaitForSession(ctx)
+	if err != nil {
+		t.Fatalf("WaitForSession: %v", err)
+	}
+	return sess
 }
 
 // serve reads NUL-terminated commands as they arrive, recording each one,
@@ -234,6 +246,13 @@ func (e *fakeEngine) Handle(name string, h fakeHandler) {
 	e.handlers[name] = h
 }
 
+// ClearReceived forgets the commands received so far.
+func (e *fakeEngine) ClearReceived() {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.received = nil
+}
+
 // Received returns the commands received so far.
 func (e *fakeEngine) Received() []fakeCommand {
 	e.mu.Lock()
@@ -269,26 +288,29 @@ func (e *fakeEngine) WaitClosed(timeout time.Duration) bool {
 	}
 }
 
-// dialClient opens a raw connection to the client, closed at cleanup.
-func dialClient(t *testing.T, c *Client) net.Conn {
+// dialServer opens a raw connection to srv, closed at cleanup.
+func dialServer(t *testing.T, srv *Server) net.Conn {
 	t.Helper()
-	conn, err := net.Dial("tcp", c.Addr())
+	conn, err := net.Dial("tcp", srv.Addr())
 	if err != nil {
-		t.Fatalf("dial client: %v", err)
+		t.Fatalf("dial server: %v", err)
 	}
 	t.Cleanup(func() { _ = conn.Close() })
 	return conn
 }
 
-// newTestClient returns a client listening on a free local port.
-func newTestClient(t *testing.T) *Client {
+// newTestServer starts a server on a free local port, closed at cleanup.
+func newTestServer(t *testing.T, cfg Config) *Server {
 	t.Helper()
-	c, err := NewClient(0)
+	if cfg.Addr == "" {
+		cfg.Addr = "127.0.0.1:0"
+	}
+	srv, err := Listen(cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = c.Close() })
-	return c
+	t.Cleanup(func() { _ = srv.Close() })
+	return srv
 }
 
 // standardHandlers answers every command the client issues with the
@@ -306,6 +328,7 @@ func standardHandlers() map[string]fakeHandler {
 		"step_over":         reply("step_over"),
 		"step_out":          reply("step_out"),
 		"stop":              reply("stop"),
+		"stdout":            reply("stdout"),
 		"detach":            reply("detach"),
 		"stack_get":         reply("stack_get"),
 		"context_get":       reply("context_get_locals"),

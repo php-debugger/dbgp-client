@@ -124,6 +124,7 @@ func TestCaptureFixtures(t *testing.T) {
 	// its expression from freed memory, so the reply differs on every run.
 	cmd("breakpoint_remove", "breakpoint_remove", "-d "+attr(lineBP, "id"))
 	cmd("", "breakpoint_remove", "-d "+attr(condBP, "id"))
+	cmd("run_break_exception", "run", "")
 	cmd("run_stopping", "run", "")
 	cmd("stop", "stop", "")
 

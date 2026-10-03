@@ -140,10 +140,33 @@ type Error struct {
 	Message string `xml:"message"`
 }
 
-// Message contains breakpoint hit information
+// Message is the xdebug:message element: where execution stopped, or the
+// PHP error an "error" notification reports. Exception, Type, Code and Text
+// are set for exceptions and errors.
 type Message struct {
-	Filename string `xml:"filename,attr"`
-	Lineno   int    `xml:"lineno,attr"`
+	Filename  string `xml:"filename,attr"`
+	Lineno    int    `xml:"lineno,attr"`
+	Exception string `xml:"exception,attr,omitempty"`
+	Type      string `xml:"type,attr,omitempty"`
+	Code      string `xml:"code,attr,omitempty"`
+	Text      string `xml:",chardata"`
+}
+
+// Notification is an asynchronous notify packet from the engine, such as
+// "error" (a PHP warning or notice) or "breakpoint_resolved".
+type Notification struct {
+	XMLName    xml.Name        `xml:"notify"`
+	Name       string          `xml:"name,attr"`
+	Message    *Message        `xml:"https://xdebug.org/dbgp/xdebug message"`
+	Breakpoint *BreakpointInfo `xml:"breakpoint"`
+}
+
+// Stream is program output the engine forwards (see the stdout command).
+type Stream struct {
+	XMLName  xml.Name `xml:"stream"`
+	Type     string   `xml:"type,attr"`
+	Encoding string   `xml:"encoding,attr"`
+	Value    string   `xml:",chardata"`
 }
 
 // BreakpointInfo contains breakpoint details
@@ -260,6 +283,51 @@ func ParseResponse(data []byte) (*Response, error) {
 		return nil, fmt.Errorf("parse response: %w", err)
 	}
 	return &resp, nil
+}
+
+// ParseNotification parses a notify packet
+func ParseNotification(data []byte) (*Notification, error) {
+	var n Notification
+	decoder := xml.NewDecoder(bytes.NewReader(data))
+	decoder.CharsetReader = charsetReader
+	if err := decoder.Decode(&n); err != nil {
+		return nil, fmt.Errorf("parse notification: %w", err)
+	}
+	if n.Message != nil {
+		n.Message.Filename = FormatFileURI(n.Message.Filename)
+	}
+	return &n, nil
+}
+
+// ParseStream parses a stream packet and returns its decoded output
+func ParseStream(data []byte) (*Stream, string, error) {
+	var st Stream
+	decoder := xml.NewDecoder(bytes.NewReader(data))
+	decoder.CharsetReader = charsetReader
+	if err := decoder.Decode(&st); err != nil {
+		return nil, "", fmt.Errorf("parse stream: %w", err)
+	}
+	text, err := decodeEncoded(st.Encoding, st.Value)
+	if err != nil {
+		return nil, "", fmt.Errorf("parse stream: %w", err)
+	}
+	return &st, text, nil
+}
+
+// packetKind returns the root element name of a packet: "init",
+// "response", "notify" or "stream".
+func packetKind(data []byte) (string, error) {
+	decoder := xml.NewDecoder(bytes.NewReader(data))
+	decoder.CharsetReader = charsetReader
+	for {
+		tok, err := decoder.Token()
+		if err != nil {
+			return "", fmt.Errorf("read packet root: %w", err)
+		}
+		if start, ok := tok.(xml.StartElement); ok {
+			return start.Name.Local, nil
+		}
+	}
 }
 
 // ParseMessage extracts breakpoint hit info from response
