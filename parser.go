@@ -6,6 +6,7 @@ import (
 	"encoding/xml"
 	"fmt"
 	"strings"
+	"unicode/utf8"
 )
 
 // Variable represents a parsed variable
@@ -136,7 +137,7 @@ func formatSimpleValue(typ, content, classname string) string {
 			return `""`
 		}
 		if len(content) > 60 {
-			return `"` + content[:55] + `..."`
+			return `"` + truncate(content, 55) + `..."`
 		}
 		return `"` + content + `"`
 	case "int", "float":
@@ -153,10 +154,21 @@ func formatSimpleValue(typ, content, classname string) string {
 			return "<" + typ + ">"
 		}
 		if len(content) > 60 {
-			return content[:57] + "..."
+			return truncate(content, 57) + "..."
 		}
 		return content
 	}
+}
+
+// truncate shortens s to at most n bytes without splitting a UTF-8 character.
+func truncate(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	for n > 0 && !utf8.RuneStart(s[n]) {
+		n--
+	}
+	return s[:n]
 }
 
 // FormatVariable formats a variable for display

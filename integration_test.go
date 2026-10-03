@@ -128,7 +128,6 @@ func TestEngineBreakpointCallback(t *testing.T) {
 }
 
 func TestEngineConditionalBreakpoint(t *testing.T) {
-	knownBug(t, "txn-after-data", "-i is appended after --; the engine rejects the command")
 	c := startEngineSession(t)
 	if _, err := c.SetConditionalBreakpoint(debuggeePath(t), lineLoopBody, "$i == 3"); err != nil {
 		t.Fatal(err)
@@ -148,7 +147,6 @@ func TestEngineConditionalBreakpoint(t *testing.T) {
 }
 
 func TestEngineEval(t *testing.T) {
-	knownBug(t, "txn-after-data", "-i is appended after --; the engine rejects the command")
 	c := startEngineSession(t)
 	if _, err := c.SetBreakpoint(debuggeePath(t), lineAddBody); err != nil {
 		t.Fatal(err)
@@ -162,7 +160,6 @@ func TestEngineEval(t *testing.T) {
 }
 
 func TestEngineReportsVersion(t *testing.T) {
-	knownBug(t, "init-engine-version", "engine version is an attribute, parsed as a child element")
 	c := startEngineSession(t)
 	if c.Init().EngineVersion == "" {
 		t.Error("EngineVersion is empty")

@@ -112,11 +112,16 @@ func parseFakeCommand(raw string) fakeCommand {
 		rest = strings.TrimPrefix(rest[2:], " ")
 		var value string
 		if strings.HasPrefix(rest, `"`) {
+			// Quoted values are unescaped like the engine's stripcslashes.
 			var b strings.Builder
 			i := 1
 			for ; i < len(rest) && rest[i] != '"'; i++ {
 				if rest[i] == '\\' && i+1 < len(rest) {
 					i++
+					if r, ok := cEscapes[rest[i]]; ok {
+						b.WriteByte(r)
+						continue
+					}
 				}
 				b.WriteByte(rest[i])
 			}
@@ -136,6 +141,9 @@ func parseFakeCommand(raw string) fakeCommand {
 	}
 	return cmd
 }
+
+// cEscapes are the C escapes stripcslashes understands (octal/hex omitted).
+var cEscapes = map[byte]byte{'n': '\n', 't': '\t', 'r': '\r', 'a': '\a', 'v': '\v', 'b': '\b', 'f': '\f'}
 
 // startFakeEngine connects a fake engine to client c, sends the init packet
 // and waits for c.WaitForConnection to return.
@@ -161,9 +169,14 @@ func startFakeEngineWithInit(t *testing.T, c *Client, init string, handlers map[
 	return e
 }
 
-// serve reads NUL-terminated commands and dispatches them to handlers.
+// serve reads NUL-terminated commands as they arrive, recording each one,
+// and answers them in order on a separate goroutine, so tests can see
+// commands the client sends before an earlier one is answered.
 func (e *fakeEngine) serve() {
+	queue := make(chan fakeCommand, 100)
+	go e.answer(queue)
 	defer close(e.done)
+	defer close(queue)
 	r := bufio.NewReader(e.conn)
 	for {
 		raw, err := r.ReadString(0)
@@ -173,11 +186,22 @@ func (e *fakeEngine) serve() {
 		cmd := parseFakeCommand(strings.TrimSuffix(raw, "\x00"))
 		e.mu.Lock()
 		e.received = append(e.received, cmd)
+		e.mu.Unlock()
+		queue <- cmd
+	}
+}
+
+// answer runs the handlers for queued commands, one at a time.
+func (e *fakeEngine) answer(queue <-chan fakeCommand) {
+	for cmd := range queue {
+		e.mu.Lock()
 		handler, ok := e.handlers[cmd.Name]
 		e.mu.Unlock()
 
 		var packets []string
 		switch {
+		case cmd.Err == "parse error":
+			packets = []string{errorPacket(cmd, 1, cmd.Err)}
 		case cmd.Err != "":
 			packets = []string{errorPacket(cmd, 3, cmd.Err)}
 		case !ok:
@@ -263,16 +287,7 @@ func newTestClient(t *testing.T) *Client {
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() {
-		// Not c.Close(): it races with the read loop (known bug close-race).
-		c.mu.Lock()
-		conn := c.conn
-		c.mu.Unlock()
-		if conn != nil {
-			_ = conn.Close()
-		}
-		_ = c.listener.Close()
-	})
+	t.Cleanup(func() { _ = c.Close() })
 	return c
 }
 
