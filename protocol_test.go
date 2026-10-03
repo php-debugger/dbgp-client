@@ -81,9 +81,11 @@ func TestParseInitFixture(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := InitPacket{AppID: fixtureAppID, Language: "PHP", Protocol: "1.0", FileURI: fixtureScriptURI}
+	want := InitPacket{
+		AppID: fixtureAppID, Language: "PHP", Protocol: "1.0", FileURI: fixtureScriptURI,
+		Engine: Engine{Name: "PHP Debugger", Version: "0.3.3"}, EngineVersion: "0.3.3",
+	}
 	init.XMLName = want.XMLName
-	init.EngineVersion = "" // known bug init-engine-version, covered by the client test
 	if *init != want {
 		t.Errorf("init = %+v, want %+v", *init, want)
 	}
@@ -247,9 +249,58 @@ func TestFormatStack(t *testing.T) {
 }
 
 func TestFormatStackDecodesURI(t *testing.T) {
-	knownBug(t, "stack-uri", "FormatStack strips file:// but does not unescape the URI")
 	got := FormatStack([]StackFrame{{Where: "f", Filename: "file:///my%20app/a.php", Lineno: 1}})
 	if want := "#0 f() at /my app/a.php:1"; got[0] != want {
 		t.Errorf("FormatStack = %q, want %q", got[0], want)
+	}
+}
+
+func TestParseBreakpoints(t *testing.T) {
+	resp, err := ParseResponse([]byte(fixture(t, "breakpoint_list")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []BreakpointInfo{
+		{ID: 42420001, Type: "line", Filename: fixtureScriptURI, Lineno: 24, State: "enabled", Resolved: "resolved"},
+		{ID: 42420002, Type: "conditional", Filename: fixtureScriptURI, Lineno: 39, State: "enabled", Resolved: "resolved", Expression: "$i == 3"},
+		{ID: 42420003, Type: "call", Function: "add", State: "disabled", Resolved: "resolved"},
+		{ID: 42420004, Type: "exception", Exception: "Exception", State: "enabled", Resolved: "resolved"},
+	}
+	if !reflect.DeepEqual(resp.Breakpoints, want) {
+		t.Errorf("Breakpoints =\n%+v\nwant\n%+v", resp.Breakpoints, want)
+	}
+
+	resp, err = ParseResponse([]byte(fixture(t, "breakpoint_get")))
+	if err != nil || len(resp.Breakpoints) != 1 || resp.Breakpoints[0].Expression != "$i == 3" {
+		t.Errorf("breakpoint_get = %+v, %v", resp, err)
+	}
+}
+
+func TestParseBreakpointExpressionForms(t *testing.T) {
+	parse := func(bp string) (*Response, error) {
+		return ParseResponse([]byte(`<response command="breakpoint_get" transaction_id="1">` + bp + `</response>`))
+	}
+	resp, err := parse(`<breakpoint id="1" type="conditional" expression="$a &gt; 1"></breakpoint>`)
+	if err != nil || resp.Breakpoints[0].Expression != "$a > 1" {
+		t.Errorf("attribute form: %+v, %v", resp, err)
+	}
+	resp, err = parse(`<breakpoint id="1" type="conditional"><expression>$b</expression></breakpoint>`)
+	if err != nil || resp.Breakpoints[0].Expression != "$b" {
+		t.Errorf("plain element form: %+v, %v", resp, err)
+	}
+	if _, err := parse(`<breakpoint id="1"><expression encoding="base64">!!</expression></breakpoint>`); err == nil {
+		t.Error("invalid base64 expression accepted")
+	}
+	if _, err := parse(`<breakpoint id="1"><expression encoding="rot13">x</expression></breakpoint>`); err == nil {
+		t.Error("unknown expression encoding accepted")
+	}
+}
+
+func TestParseFeatureGetSupported(t *testing.T) {
+	for name, want := range map[string]string{"feature_get": "1", "feature_get_unsupported": "0"} {
+		resp, err := ParseResponse([]byte(fixture(t, name)))
+		if err != nil || resp.Supported != want {
+			t.Errorf("%s: Supported = %q, %v; want %q", name, resp.Supported, err, want)
+		}
 	}
 }

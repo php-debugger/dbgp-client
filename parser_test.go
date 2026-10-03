@@ -255,7 +255,6 @@ func TestFormatSimpleValueEdgeCases(t *testing.T) {
 }
 
 func TestFormatSimpleValueTruncatesOnRuneBoundary(t *testing.T) {
-	knownBug(t, "utf8-truncation", "long strings are cut by byte, splitting multi-byte characters")
 	got := formatSimpleValue("string", strings.Repeat("é", 40), "")
 	if !utf8.ValidString(got) {
 		t.Errorf("truncated value is not valid UTF-8: %q", got)

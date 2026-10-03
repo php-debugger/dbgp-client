@@ -3,6 +3,7 @@ package dbgp
 
 import (
 	"bytes"
+	"encoding/base64"
 	"encoding/xml"
 	"fmt"
 	"io"
@@ -10,6 +11,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"unicode"
 )
 
 // charsetReader handles non-UTF-8 XML encodings
@@ -75,16 +77,24 @@ const (
 
 // InitPacket is sent by PHP when connection is established
 type InitPacket struct {
-	XMLName       xml.Name `xml:"init"`
-	AppID         string   `xml:"appid,attr"`
-	IDEKey        string   `xml:"idekey,attr"`
-	Session       string   `xml:"session,attr"`
-	Thread        string   `xml:"thread,attr"`
-	Parent        string   `xml:"parent,attr"`
-	Language      string   `xml:"language,attr"`
-	Protocol      string   `xml:"protocol_version,attr"`
-	FileURI       string   `xml:"fileuri,attr"`
-	EngineVersion string   `xml:"engine>version"`
+	XMLName  xml.Name `xml:"init"`
+	AppID    string   `xml:"appid,attr"`
+	IDEKey   string   `xml:"idekey,attr"`
+	Session  string   `xml:"session,attr"`
+	Thread   string   `xml:"thread,attr"`
+	Parent   string   `xml:"parent,attr"`
+	Language string   `xml:"language,attr"`
+	Protocol string   `xml:"protocol_version,attr"`
+	FileURI  string   `xml:"fileuri,attr"`
+	Engine   Engine   `xml:"engine"`
+	// EngineVersion is Engine.Version, kept for compatibility.
+	EngineVersion string `xml:"-"`
+}
+
+// Engine identifies the debugger engine, e.g. PHP Debugger or Xdebug.
+type Engine struct {
+	Name    string `xml:",chardata"`
+	Version string `xml:"version,attr"`
 }
 
 // Response is the generic DBGp response
@@ -98,8 +108,12 @@ type Response struct {
 	BreakpointID int      `xml:"id,attr,omitempty"`
 	Encoding     string   `xml:"encoding,attr,omitempty"`
 
-	// For breakpoint_set
-	Breakpoint *BreakpointInfo `xml:"breakpoint,omitempty"`
+	// For feature_get: "0" when the engine does not support the feature
+	FeatureName string `xml:"feature_name,attr,omitempty"`
+	Supported   string `xml:"supported,attr,omitempty"`
+
+	// For breakpoint_get, breakpoint_list, breakpoint_remove
+	Breakpoints []BreakpointInfo `xml:"breakpoint,omitempty"`
 
 	// For context_get
 	Context    int        `xml:"context,attr,omitempty"`
@@ -134,16 +148,70 @@ type Message struct {
 
 // BreakpointInfo contains breakpoint details
 type BreakpointInfo struct {
-	ID         int    `xml:"id,attr"`
-	Type       string `xml:"type,attr"`
-	Filename   string `xml:"filename,attr"`
-	Lineno     int    `xml:"lineno,attr"`
-	State      string `xml:"state,attr"`
-	Exception  string `xml:"exception,attr,omitempty"`
-	Expression string `xml:"expression,attr,omitempty"`
-	HitCount   int    `xml:"hit_count,attr,omitempty"`
-	HitValue   int    `xml:"hit_value,attr,omitempty"`
-	Temporary  int    `xml:"temporary,attr,omitempty"`
+	ID           int    `xml:"id,attr"`
+	Type         string `xml:"type,attr"`
+	Filename     string `xml:"filename,attr"`
+	Lineno       int    `xml:"lineno,attr"`
+	Function     string `xml:"function,attr,omitempty"`
+	State        string `xml:"state,attr"`
+	Resolved     string `xml:"resolved,attr,omitempty"`
+	Exception    string `xml:"exception,attr,omitempty"`
+	HitCount     int    `xml:"hit_count,attr,omitempty"`
+	HitValue     int    `xml:"hit_value,attr,omitempty"`
+	HitCondition string `xml:"hit_condition,attr,omitempty"`
+	Temporary    int    `xml:"temporary,attr,omitempty"`
+	// Expression is the decoded condition of a conditional breakpoint.
+	Expression string `xml:"-"`
+}
+
+// UnmarshalXML reads the expression from its <expression> child element
+// (base64-encoded by Xdebug and PHP Debugger), or from an expression
+// attribute as some engines send it.
+func (b *BreakpointInfo) UnmarshalXML(d *xml.Decoder, start xml.StartElement) error {
+	type plain BreakpointInfo // drops this method, avoiding recursion
+	var raw struct {
+		plain
+		ExpressionAttr string `xml:"expression,attr"`
+		ExpressionElem *struct {
+			Encoding string `xml:"encoding,attr"`
+			Value    string `xml:",chardata"`
+		} `xml:"expression"`
+	}
+	if err := d.DecodeElement(&raw, &start); err != nil {
+		return err
+	}
+	*b = BreakpointInfo(raw.plain)
+	b.Expression = raw.ExpressionAttr
+	if e := raw.ExpressionElem; e != nil {
+		expr, err := decodeEncoded(e.Encoding, e.Value)
+		if err != nil {
+			return fmt.Errorf("breakpoint %d expression: %w", b.ID, err)
+		}
+		b.Expression = expr
+	}
+	return nil
+}
+
+// decodeEncoded decodes a value sent with the given DBGp encoding attribute.
+func decodeEncoded(encoding, value string) (string, error) {
+	switch encoding {
+	case "", "none":
+		return value, nil
+	case "base64":
+		cleaned := strings.Map(func(r rune) rune {
+			if unicode.IsSpace(r) {
+				return -1
+			}
+			return r
+		}, value)
+		decoded, err := base64.StdEncoding.DecodeString(cleaned)
+		if err != nil {
+			return "", fmt.Errorf("decode base64: %w", err)
+		}
+		return string(decoded), nil
+	default:
+		return "", fmt.Errorf("unsupported encoding %q", encoding)
+	}
 }
 
 // Property represents a variable
@@ -179,6 +247,7 @@ func ParseInit(data []byte) (*InitPacket, error) {
 	if err := decoder.Decode(&init); err != nil {
 		return nil, fmt.Errorf("parse init: %w", err)
 	}
+	init.EngineVersion = init.Engine.Version
 	return &init, nil
 }
 
@@ -202,48 +271,11 @@ func (r *Response) ParseMessage() (file string, line int) {
 	return
 }
 
-func formatValue(p Property) string {
-	if p.Encoding == "base64" {
-		return "<base64>"
-	}
-
-	if p.Type == "array" || p.Type == "object" {
-		count := p.NumChildren
-		if count == 0 {
-			count = p.Children
-		}
-		if count > 0 {
-			return fmt.Sprintf("%s(%d)", p.Type, count)
-		}
-		return p.Type + "(0)"
-	}
-
-	if p.Value == "" {
-		switch p.Type {
-		case "null":
-			return "null"
-		case "bool":
-			return "false"
-		case "string":
-			return `""`
-		default:
-			return p.Type
-		}
-	}
-
-	// Truncate long values
-	if len(p.Value) > 100 {
-		return p.Value[:97] + "..."
-	}
-
-	return p.Value
-}
-
 // FormatStack formats the call stack for display
 func FormatStack(frames []StackFrame) []string {
 	lines := make([]string, len(frames))
 	for i, f := range frames {
-		file := strings.TrimPrefix(f.Filename, "file://")
+		file := FormatFileURI(f.Filename)
 		lines[i] = fmt.Sprintf("#%d %s() at %s:%d", f.Level, f.Where, file, f.Lineno)
 	}
 	return lines

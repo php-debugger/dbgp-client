@@ -23,7 +23,6 @@ func TestWaitForConnectionReadsInit(t *testing.T) {
 }
 
 func TestWaitForConnectionReadsEngineVersion(t *testing.T) {
-	knownBug(t, "init-engine-version", "engine version is an attribute, parsed as a child element")
 	c := newTestClient(t)
 	startFakeEngine(t, c, standardHandlers())
 	if got := c.Init().EngineVersion; got != "0.3.3" {
@@ -90,7 +89,6 @@ func TestPortAndAddr(t *testing.T) {
 // Every byte sequence the client sends must be a valid DBGp command: the
 // spec frames IDE commands as "command args NUL" with no length prefix.
 func TestCommandsAreSpecFramed(t *testing.T) {
-	knownBug(t, "length-prefix", "commands are sent as len NUL cmd NUL; Xdebug rejects the length as a command")
 	c := newTestClient(t)
 	e := startFakeEngine(t, c, standardHandlers())
 	if _, err := c.Status(); err != nil {
@@ -127,35 +125,72 @@ func TestTransactionIDsAreUniqueAndIncreasing(t *testing.T) {
 	}
 }
 
-func TestExplicitTransactionIDIsKept(t *testing.T) {
-	c := newTestClient(t)
-	e := startFakeEngine(t, c, standardHandlers())
-	if _, err := c.sendCommand("status -i 77"); err != nil {
-		t.Fatal(err)
+func TestFormatCommand(t *testing.T) {
+	tests := []struct {
+		name string
+		args []string
+		data []byte
+		want string
+	}{
+		{"status", nil, nil, "status -i 7"},
+		{"breakpoint_set", []string{"-t", "line", "-n", "3"}, nil, "breakpoint_set -t line -n 3 -i 7"},
+		{"eval", nil, []byte("$a + 1"), "eval -i 7 -- JGEgKyAx"},
+		{"eval", nil, []byte{}, "eval -i 7 -- "},
+		{"breakpoint_set", []string{"-t", "conditional"}, []byte("$i == 3"), "breakpoint_set -t conditional -i 7 -- JGkgPT0gMw=="},
+		{"feature_set", []string{"-n", "x", "-v", "a b"}, nil, `feature_set -n x -v "a b" -i 7`},
+		{"feature_set", []string{"-n", "x", "-v", ""}, nil, `feature_set -n x -v "" -i 7`},
+		{"feature_set", []string{"-n", "x", "-v", `say "hi" \o/`}, nil, `feature_set -n x -v "say \"hi\" \\o/" -i 7`},
+		{"feature_set", []string{"-n", "x", "-v", `C:\dir`}, nil, `feature_set -n x -v "C:\\dir" -i 7`},
+		{"feature_set", []string{"-n", "x", "-v", "tab\there"}, nil, "feature_set -n x -v \"tab\there\" -i 7"},
 	}
-	if got := e.LastCommand("status").Args["i"]; got != "77" {
-		t.Errorf("-i = %q, want 77", got)
+	for _, tt := range tests {
+		got, err := formatCommand(tt.name, 7, tt.args, tt.data)
+		if err != nil || got != tt.want {
+			t.Errorf("formatCommand(%q, %q, %q) = %q, %v; want %q", tt.name, tt.args, tt.data, got, err, tt.want)
+			continue
+		}
+		// The fake engine parses commands like the real one: round-trip.
+		parsed := parseFakeCommand(got)
+		if parsed.Err != "" || parsed.Name != tt.name || parsed.Data != string(tt.data) || parsed.Args["i"] != "7" {
+			t.Errorf("engine parses %q as %+v", got, parsed)
+		}
+		for i := 0; i < len(tt.args); i += 2 {
+			if v := parsed.Args[tt.args[i][1:]]; v != tt.args[i+1] {
+				t.Errorf("engine parses %s in %q as %q, want %q", tt.args[i], got, v, tt.args[i+1])
+			}
+		}
 	}
 }
 
-func TestSendCommandRejectsBadTransactionID(t *testing.T) {
-	c := newTestClient(t)
-	startFakeEngine(t, c, standardHandlers())
-	for _, cmd := range []string{"status -i", "status -i abc"} {
-		if _, err := c.sendCommand(cmd); err == nil {
-			t.Errorf("sendCommand(%q) succeeded", cmd)
+func TestFormatCommandRejectsInvalidInput(t *testing.T) {
+	tests := []struct {
+		name string
+		args []string
+	}{
+		{"", nil},
+		{"two words", nil},
+		{"status", []string{"-n"}},
+		{"status", []string{"-i", "5"}},
+		{"status", []string{"--", "x"}},
+		{"status", []string{"-N", "x"}},
+		{"status", []string{"n", "x"}},
+		{"status", []string{"-nn", "x"}},
+		{"status", []string{"-n", "a\x00b"}},
+	}
+	for _, tt := range tests {
+		if got, err := formatCommand(tt.name, 1, tt.args, nil); err == nil {
+			t.Errorf("formatCommand(%q, %q) = %q, want error", tt.name, tt.args, got)
 		}
 	}
 }
 
 // wireCase describes the command an API call must put on the wire.
 type wireCase struct {
-	name     string
-	call     func(c *Client) error
-	command  string
-	args     map[string]string // expected options, excluding -i
-	data     string
-	knownBug string
+	name    string
+	call    func(c *Client) error
+	command string
+	args    map[string]string // expected options, excluding -i
+	data    string
 }
 
 func TestCommandWireFormat(t *testing.T) {
@@ -171,9 +206,8 @@ func TestCommandWireFormat(t *testing.T) {
 				_, err := c.SetConditionalBreakpoint("/app/basic.php", 39, "$i == 3")
 				return err
 			},
-			args:     map[string]string{"t": "conditional", "f": "file:///app/basic.php", "n": "39"},
-			data:     "$i == 3",
-			knownBug: "txn-after-data: -i is appended after --, so it becomes part of the data"},
+			args: map[string]string{"t": "conditional", "f": "file:///app/basic.php", "n": "39"},
+			data: "$i == 3"},
 		{name: "RemoveBreakpoint", command: "breakpoint_remove",
 			call: func(c *Client) error { return c.RemoveBreakpoint(42420002) },
 			args: map[string]string{"d": "42420002"}},
@@ -193,10 +227,9 @@ func TestCommandWireFormat(t *testing.T) {
 			call: func(c *Client) error { _, err := c.GetContext(1, 2); return err },
 			args: map[string]string{"d": "1", "c": "2"}},
 		{name: "Eval", command: "eval",
-			call:     func(c *Client) error { _, err := c.Eval(`$a . " " . $b`); return err },
-			args:     map[string]string{},
-			data:     `$a . " " . $b`,
-			knownBug: "txn-after-data: -i is appended after --, so it becomes part of the data"},
+			call: func(c *Client) error { _, err := c.Eval(`$a . " " . $b`); return err },
+			args: map[string]string{},
+			data: `$a . " " . $b`},
 		{name: "GetSource whole file", command: "source",
 			call: func(c *Client) error { _, err := c.GetSource("/app/basic.php", 0, 0); return err },
 			args: map[string]string{"f": "file:///app/basic.php"}},
@@ -212,13 +245,13 @@ func TestCommandWireFormat(t *testing.T) {
 		{name: "FeatureSet", command: "feature_set",
 			call: func(c *Client) error { return c.FeatureSet("max_children", "100") },
 			args: map[string]string{"n": "max_children", "v": "100"}},
+		{name: "FeatureSet quoted value", command: "feature_set",
+			call: func(c *Client) error { return c.FeatureSet("idekey", `my "ide" key\`) },
+			args: map[string]string{"n": "idekey", "v": `my "ide" key\`}},
 	}
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			if tc.knownBug != "" {
-				knownBug(t, strings.SplitN(tc.knownBug, ":", 2)[0], tc.knownBug)
-			}
 			c := newTestClient(t)
 			e := startFakeEngine(t, c, standardHandlers())
 			if err := tc.call(c); err != nil {
@@ -252,9 +285,6 @@ func TestFeatureArgumentsRejectWhitespace(t *testing.T) {
 	}
 	if err := c.FeatureSet("max depth", "1"); err == nil {
 		t.Error("FeatureSet accepted a name with whitespace")
-	}
-	if err := c.FeatureSet("max_depth", "1 2"); err == nil {
-		t.Error("FeatureSet accepted a value with whitespace")
 	}
 	if n := len(e.Received()); n != 0 {
 		t.Errorf("engine received %d commands, want 0", n)
@@ -339,7 +369,6 @@ func TestResponseDecoding(t *testing.T) {
 }
 
 func TestListBreakpointsReadsExpression(t *testing.T) {
-	knownBug(t, "breakpoint-expression", "expression is a base64 child element, parsed as an attribute")
 	c := newTestClient(t)
 	startFakeEngine(t, c, standardHandlers())
 	bps, err := c.ListBreakpoints()
@@ -352,7 +381,6 @@ func TestListBreakpointsReadsExpression(t *testing.T) {
 }
 
 func TestFeatureGetUnsupportedIsAnError(t *testing.T) {
-	knownBug(t, "feature-supported", "the supported attribute is ignored")
 	c := newTestClient(t)
 	startFakeEngine(t, c, map[string]fakeHandler{"feature_get": reply("feature_get_unsupported")})
 	if v, err := c.FeatureGet("no_such_feature"); err == nil {
@@ -361,7 +389,6 @@ func TestFeatureGetUnsupportedIsAnError(t *testing.T) {
 }
 
 func TestEvalReturnsValue(t *testing.T) {
-	knownBug(t, "eval-raw-xml", "Eval returns the raw property XML instead of the value")
 	c := newTestClient(t)
 	startFakeEngine(t, c, standardHandlers())
 	if v, err := c.Eval("$a + $b"); err != nil || v != "12" {
@@ -379,7 +406,6 @@ func TestEngineErrorIsReturned(t *testing.T) {
 }
 
 func TestEvalErrorIsReturned(t *testing.T) {
-	knownBug(t, "txn-after-data", "-i is appended after --, so eval never gets a matching response")
 	c := newTestClient(t)
 	startFakeEngine(t, c, map[string]fakeHandler{"eval": reply("eval_error")})
 	_, err := c.Eval("$a +")
@@ -392,7 +418,6 @@ func TestEvalErrorIsReturned(t *testing.T) {
 // with an error that carries no transaction_id. The caller must get that
 // error, not a 30s timeout.
 func TestErrorWithoutTransactionIDReachesCaller(t *testing.T) {
-	knownBug(t, "untagged-errors", "errors without transaction_id are dropped and the caller times out")
 	c := newTestClient(t)
 	startFakeEngine(t, c, map[string]fakeHandler{
 		"status": func(e *fakeEngine, cmd fakeCommand) []string {
@@ -464,7 +489,6 @@ func TestDisconnectFailsPendingCommand(t *testing.T) {
 }
 
 func TestCommandAfterDisconnectFailsFast(t *testing.T) {
-	knownBug(t, "dead-connection", "after the read loop exits, commands wait for the 30s timeout")
 	c := newTestClient(t)
 	e := startFakeEngine(t, c, standardHandlers())
 	e.Close()
@@ -601,7 +625,6 @@ func TestConcurrentCommands(t *testing.T) {
 }
 
 func TestCloseDisconnects(t *testing.T) {
-	knownBug(t, "close-race", "Close clears c.reader while readLoop reads it without the lock (go test -race)")
 	c := newTestClient(t)
 	e := startFakeEngine(t, c, standardHandlers())
 	if err := c.Close(); err != nil {
@@ -631,5 +654,93 @@ func TestRunWaitsForSlowBreak(t *testing.T) {
 	})
 	if err := c.Run(); err != nil {
 		t.Errorf("Run: %v", err)
+	}
+}
+
+// After an unimplemented command the engine sends a response with neither
+// command nor transaction_id once the script ends. It answers no command.
+func TestUntaggedNonErrorResponseIsIgnored(t *testing.T) {
+	c := newTestClient(t)
+	startFakeEngine(t, c, map[string]fakeHandler{
+		"status": func(e *fakeEngine, cmd fakeCommand) []string {
+			return []string{
+				e.fixture("error_unimplemented_after_1"),
+				e.withTransaction(e.fixture("status_break"), cmd),
+			}
+		},
+	})
+	if st, err := c.Status(); err != nil || st != StatusBreak {
+		t.Errorf("Status = %q, %v; want break", st, err)
+	}
+}
+
+// An untagged error that arrives while no command is waiting must not be
+// handed to the next command.
+func TestStrayUntaggedErrorIsDropped(t *testing.T) {
+	c := newTestClient(t)
+	e := startFakeEngine(t, c, standardHandlers())
+	e.Send(e.fixture("error_invalid_options"))
+	time.Sleep(50 * time.Millisecond)
+	if st, err := c.Status(); err != nil || st != StatusBreak {
+		t.Errorf("Status = %q, %v; want break", st, err)
+	}
+}
+
+// Only one command may be in flight: the client must not send another
+// until the engine has answered the first.
+func TestCommandsAreSentOneAtATime(t *testing.T) {
+	c := newTestClient(t)
+	release := make(chan struct{})
+	e := startFakeEngine(t, c, map[string]fakeHandler{
+		"run": func(e *fakeEngine, cmd fakeCommand) []string {
+			<-release
+			return []string{e.withTransaction(e.fixture("run_break"), cmd)}
+		},
+		"status": reply("status_break"),
+	})
+
+	runErr := make(chan error, 1)
+	go func() { runErr <- c.Run() }()
+	waitFor(t, func() bool { return len(e.Received()) == 1 })
+	statusErr := make(chan error, 1)
+	go func() { _, err := c.Status(); statusErr <- err }()
+
+	time.Sleep(200 * time.Millisecond)
+	if got := len(e.Received()); got != 1 {
+		t.Errorf("engine received %d commands while run was unanswered, want 1", got)
+	}
+	close(release)
+	if err := <-runErr; err != nil {
+		t.Errorf("Run: %v", err)
+	}
+	if err := <-statusErr; err != nil {
+		t.Errorf("Status: %v", err)
+	}
+}
+
+func TestReconnectAfterSessionEnds(t *testing.T) {
+	c := newTestClient(t)
+	first := startFakeEngine(t, c, standardHandlers())
+	first.Close()
+	time.Sleep(50 * time.Millisecond)
+	if _, err := c.Status(); err == nil {
+		t.Fatal("Status succeeded on the closed first session")
+	}
+
+	startFakeEngine(t, c, standardHandlers())
+	if st, err := c.Status(); err != nil || st != StatusBreak {
+		t.Errorf("Status on second session = %q, %v; want break", st, err)
+	}
+}
+
+// waitFor polls cond until it holds, failing the test after 3s.
+func waitFor(t *testing.T, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	for !cond() {
+		if time.Now().After(deadline) {
+			t.Fatal("condition not met after 3s")
+		}
+		time.Sleep(5 * time.Millisecond)
 	}
 }
