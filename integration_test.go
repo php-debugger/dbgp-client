@@ -7,14 +7,14 @@ import (
 	"time"
 )
 
-// Tests in this file drive Client against a real PHP + Xdebug and are skipped
-// when that is not installed (or with -short).
+// Tests in this file drive Client against a real PHP with PHP Debugger or
+// Xdebug and are skipped when neither is installed (or with -short).
 
-// startXdebugSession returns a client connected to the debuggee, stopped at
+// startEngineSession returns a client connected to the debuggee, stopped at
 // the start of the script.
-func startXdebugSession(t *testing.T) *Client {
+func startEngineSession(t *testing.T) *Client {
 	t.Helper()
-	requireXdebug(t)
+	requireDebugEngine(t)
 	c := newTestClient(t)
 	startDebuggee(t, c.Port())
 	if err := c.WaitForConnection(10 * time.Second); err != nil {
@@ -23,8 +23,8 @@ func startXdebugSession(t *testing.T) *Client {
 	return c
 }
 
-func TestXdebugSession(t *testing.T) {
-	c := startXdebugSession(t)
+func TestEngineSession(t *testing.T) {
+	c := startEngineSession(t)
 	script := debuggeePath(t)
 
 	init := c.Init()
@@ -105,8 +105,8 @@ func TestXdebugSession(t *testing.T) {
 	}
 }
 
-func TestXdebugBreakpointCallback(t *testing.T) {
-	c := startXdebugSession(t)
+func TestEngineBreakpointCallback(t *testing.T) {
+	c := startEngineSession(t)
 	hits := make(chan string, 1)
 	c.OnBreakpoint(func(file string, line int, stack []StackFrame, vars []Variable) {
 		hits <- fmt.Sprintf("%s:%d %d %d", file, line, len(stack), len(vars))
@@ -127,9 +127,9 @@ func TestXdebugBreakpointCallback(t *testing.T) {
 	}
 }
 
-func TestXdebugConditionalBreakpoint(t *testing.T) {
-	knownBug(t, "txn-after-data", "-i is appended after --; Xdebug rejects the command")
-	c := startXdebugSession(t)
+func TestEngineConditionalBreakpoint(t *testing.T) {
+	knownBug(t, "txn-after-data", "-i is appended after --; the engine rejects the command")
+	c := startEngineSession(t)
 	if _, err := c.SetConditionalBreakpoint(debuggeePath(t), lineLoopBody, "$i == 3"); err != nil {
 		t.Fatal(err)
 	}
@@ -147,9 +147,9 @@ func TestXdebugConditionalBreakpoint(t *testing.T) {
 	}
 }
 
-func TestXdebugEval(t *testing.T) {
-	knownBug(t, "txn-after-data", "-i is appended after --; Xdebug rejects the command")
-	c := startXdebugSession(t)
+func TestEngineEval(t *testing.T) {
+	knownBug(t, "txn-after-data", "-i is appended after --; the engine rejects the command")
+	c := startEngineSession(t)
 	if _, err := c.SetBreakpoint(debuggeePath(t), lineAddBody); err != nil {
 		t.Fatal(err)
 	}
@@ -161,16 +161,16 @@ func TestXdebugEval(t *testing.T) {
 	}
 }
 
-func TestXdebugEngineVersion(t *testing.T) {
+func TestEngineReportsVersion(t *testing.T) {
 	knownBug(t, "init-engine-version", "engine version is an attribute, parsed as a child element")
-	c := startXdebugSession(t)
+	c := startEngineSession(t)
 	if c.Init().EngineVersion == "" {
 		t.Error("EngineVersion is empty")
 	}
 }
 
-func TestXdebugDetach(t *testing.T) {
-	c := startXdebugSession(t)
+func TestEngineDetach(t *testing.T) {
+	c := startEngineSession(t)
 	if err := c.Detach(); err != nil {
 		t.Fatal(err)
 	}

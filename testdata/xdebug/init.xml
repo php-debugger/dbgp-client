@@ -1,2 +1,0 @@
-<?xml version="1.0" encoding="iso-8859-1"?>
-<init xmlns="urn:debugger_protocol_v1" xmlns:xdebug="https://xdebug.org/dbgp/xdebug" fileuri="file:///app/basic.php" language="PHP" xdebug:language_version="8.5.8" protocol_version="1.0" appid="4242"><engine version="3.5.3"><![CDATA[Xdebug]]></engine><author><![CDATA[Derick Rethans]]></author><url><![CDATA[https://xdebug.org]]></url><copyright><![CDATA[Copyright (c) 2002-2026 by Derick Rethans]]></copyright></init>

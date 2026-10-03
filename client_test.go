@@ -26,8 +26,8 @@ func TestWaitForConnectionReadsEngineVersion(t *testing.T) {
 	knownBug(t, "init-engine-version", "engine version is an attribute, parsed as a child element")
 	c := newTestClient(t)
 	startFakeEngine(t, c, standardHandlers())
-	if got := c.Init().EngineVersion; got != "3.5.3" {
-		t.Errorf("EngineVersion = %q, want %q", got, "3.5.3")
+	if got := c.Init().EngineVersion; got != "0.3.3" {
+		t.Errorf("EngineVersion = %q, want %q", got, "0.3.3")
 	}
 }
 
@@ -388,8 +388,9 @@ func TestEvalErrorIsReturned(t *testing.T) {
 	}
 }
 
-// Xdebug answers commands it cannot parse with an error that carries no
-// transaction_id. The caller must get that error, not a 30s timeout.
+// The engine (Xdebug and PHP Debugger alike) answers commands it cannot parse
+// with an error that carries no transaction_id. The caller must get that
+// error, not a 30s timeout.
 func TestErrorWithoutTransactionIDReachesCaller(t *testing.T) {
 	knownBug(t, "untagged-errors", "errors without transaction_id are dropped and the caller times out")
 	c := newTestClient(t)

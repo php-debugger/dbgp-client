@@ -42,7 +42,7 @@ type fakeCommand struct {
 // fakeHandler returns the packets to send in reply to cmd (nil sends nothing).
 type fakeHandler func(e *fakeEngine, cmd fakeCommand) []string
 
-// fixture returns a recorded Xdebug packet from testdata/xdebug.
+// fixture returns a recorded engine packet from testdata/dbgp.
 func fixture(t *testing.T, name string) string {
 	t.Helper()
 	data, err := os.ReadFile(filepath.Join(fixtureDir, name+".xml"))
@@ -277,7 +277,7 @@ func newTestClient(t *testing.T) *Client {
 }
 
 // standardHandlers answers every command the client issues with the
-// matching Xdebug fixture.
+// matching recorded fixture.
 func standardHandlers() map[string]fakeHandler {
 	return map[string]fakeHandler{
 		"status":            reply("status_break"),

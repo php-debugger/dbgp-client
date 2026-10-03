@@ -184,7 +184,7 @@ func TestParseAllVariablesFromRealXML(t *testing.T) {
 	}
 }
 
-// Variables from a context_get recorded from Xdebug (max_children=10).
+// Variables from a recorded context_get (max_children=10).
 func TestParseVariablesFromXdebugFixture(t *testing.T) {
 	vars := ParseVariables(fixture(t, "context_get_main"))
 	got := map[string]Variable{}

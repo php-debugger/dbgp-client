@@ -1,2 +1,0 @@
-<?xml version="1.0" encoding="iso-8859-1"?>
-<response xmlns="urn:debugger_protocol_v1" xmlns:xdebug="https://xdebug.org/dbgp/xdebug" command="breakpoint_remove" transaction_id="36"><breakpoint type="conditional" resolved="resolved" filename="file:///app/basic.php" lineno="39" state="enabled" hit_count="1" hit_value="0" id="42420002"><expression encoding="base64"><![CDATA[AAAAAAAAAA==]]></expression></breakpoint></response>

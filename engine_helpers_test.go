@@ -17,7 +17,8 @@ import (
 	"time"
 )
 
-// Helpers for tests that run against a real PHP + Xdebug installation.
+// Helpers for tests that run against a real PHP with a DBGp debug engine:
+// PHP Debugger or Xdebug. Both accept the xdebug.* ini settings used here.
 // They speak DBGp directly (spec-conformant framing) rather than through
 // Client, so fixture capture does not depend on the code under test.
 
@@ -40,18 +41,25 @@ func knownBug(t *testing.T, id, summary string) {
 	}
 }
 
-// requireXdebug skips the test unless php with the Xdebug extension is available.
-func requireXdebug(t *testing.T) {
+// requireDebugEngine skips the test unless php has a DBGp debug engine loaded:
+// PHP Debugger (php_debugger) or Xdebug. With DBGP_REQUIRE_ENGINE=1 (as in CI)
+// a missing engine fails the test instead.
+func requireDebugEngine(t *testing.T) {
 	t.Helper()
+	skip := t.Skip
+	if os.Getenv("DBGP_REQUIRE_ENGINE") != "" {
+		skip = t.Fatal
+	}
 	if testing.Short() {
-		t.Skip("skipping Xdebug test in -short mode")
+		skip("skipping debug engine test in -short mode")
 	}
 	php, err := exec.LookPath("php")
 	if err != nil {
-		t.Skip("php not found in PATH")
+		skip("php not found in PATH")
 	}
-	if err := exec.Command(php, "-r", `exit(extension_loaded("xdebug") ? 0 : 1);`).Run(); err != nil {
-		t.Skip("php Xdebug extension not loaded")
+	loaded := `exit(extension_loaded("php_debugger") || extension_loaded("xdebug") ? 0 : 1);`
+	if err := exec.Command(php, "-r", loaded).Run(); err != nil {
+		skip("php has neither PHP Debugger nor Xdebug loaded")
 	}
 }
 

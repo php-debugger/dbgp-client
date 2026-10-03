@@ -8,9 +8,10 @@ import (
 	"testing"
 )
 
-// fixtureDir holds DBGp packets recorded from a real Xdebug session.
-// The fake engine replays them, so tests see byte-for-byte Xdebug output.
-const fixtureDir = "testdata/xdebug"
+// fixtureDir holds DBGp packets recorded from a real debug engine session
+// (PHP Debugger). The fake engine replays them, so tests see byte-for-byte
+// engine output.
+const fixtureDir = "testdata/dbgp"
 
 // fixtureScriptURI replaces the debuggee's absolute URI in recorded fixtures.
 const fixtureScriptURI = "file:///app/basic.php"
@@ -18,13 +19,13 @@ const fixtureScriptURI = "file:///app/basic.php"
 // fixtureAppID replaces the debuggee's process id (appid, breakpoint ids).
 const fixtureAppID = "4242"
 
-// TestCaptureXdebugFixtures regenerates testdata/xdebug from a real Xdebug.
-// Run with: DBGP_CAPTURE=1 go test -run TestCaptureXdebugFixtures
-func TestCaptureXdebugFixtures(t *testing.T) {
+// TestCaptureFixtures regenerates testdata/dbgp from the engine php has loaded.
+// Run with: DBGP_CAPTURE=1 go test -run TestCaptureFixtures
+func TestCaptureFixtures(t *testing.T) {
 	if os.Getenv("DBGP_CAPTURE") == "" {
-		t.Skip("set DBGP_CAPTURE=1 to re-record Xdebug fixtures")
+		t.Skip("set DBGP_CAPTURE=1 to re-record engine fixtures")
 	}
-	requireXdebug(t)
+	requireDebugEngine(t)
 	if err := os.MkdirAll(fixtureDir, 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -119,8 +120,10 @@ func TestCaptureXdebugFixtures(t *testing.T) {
 
 	// Run to the conditional breakpoint, then to the end.
 	cmd("run_break_conditional", "run", "")
-	cmd("breakpoint_remove", "breakpoint_remove", "-d "+attr(condBP, "id"))
-	cmd("", "breakpoint_remove", "-d "+attr(lineBP, "id"))
+	// Removing the conditional breakpoint is not recorded: both engines echo
+	// its expression from freed memory, so the reply differs on every run.
+	cmd("breakpoint_remove", "breakpoint_remove", "-d "+attr(lineBP, "id"))
+	cmd("", "breakpoint_remove", "-d "+attr(condBP, "id"))
 	cmd("run_stopping", "run", "")
 	cmd("stop", "stop", "")
 
@@ -129,7 +132,7 @@ func TestCaptureXdebugFixtures(t *testing.T) {
 	resp, _ := d.command("detach", "")
 	save("detach", bytes.ReplaceAll(resp, []byte(attr(d.init, "appid")), []byte(fixtureAppID)))
 
-	// A third session for an unimplemented command: Xdebug answers with
+	// A third session for an unimplemented command: the engine answers with
 	// error 4 and then resumes the script, which runs to completion.
 	u := newRawSession(t)
 	resp, _ = u.command("no_such_command", "")
