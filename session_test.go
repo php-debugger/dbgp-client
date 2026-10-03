@@ -163,6 +163,41 @@ func TestCommandWireFormat(t *testing.T) {
 		{name: "Continue step_out", command: "step_out", call: continueWith(ContinueStepOut), args: map[string]string{}},
 		{name: "Stop", command: "stop", call: (*Session).Stop, args: map[string]string{}},
 		{name: "Detach", command: "detach", call: (*Session).Detach, args: map[string]string{}},
+		{name: "GetProperty", command: "property_get",
+			call: func(s *Session) error { _, err := s.GetProperty("$obj", PropertyOptions{}); return err },
+			args: map[string]string{"n": "$obj", "d": "0", "c": "0"}},
+		{name: "GetProperty paged", command: "property_get",
+			call: func(s *Session) error {
+				_, err := s.GetProperty(`$user["first name"]`, PropertyOptions{Depth: 1, Context: 1, Page: 2, MaxData: 100})
+				return err
+			},
+			args: map[string]string{"n": `$user["first name"]`, "d": "1", "c": "1", "p": "2", "m": "100"}},
+		{name: "GetPropertyValue", command: "property_value",
+			call: func(s *Session) error { _, err := s.GetPropertyValue("$long", PropertyOptions{Depth: 1}); return err },
+			args: map[string]string{"n": "$long", "d": "1", "c": "0", "m": "0"}},
+		{name: "SetProperty", command: "property_set",
+			call: func(s *Session) error { return s.SetProperty("$b", "7 * 2", PropertyOptions{}) },
+			args: map[string]string{"n": "$b", "d": "0", "c": "0"},
+			data: "7 * 2"},
+		{name: "GetContextProperties", command: "context_get",
+			call: func(s *Session) error { _, err := s.GetContextProperties(1, 1); return err },
+			args: map[string]string{"d": "1", "c": "1"}},
+		{name: "ContextNames", command: "context_names",
+			call: func(s *Session) error { _, err := s.ContextNames(1); return err },
+			args: map[string]string{"d": "1"}},
+		{name: "StackDepth", command: "stack_depth",
+			call: func(s *Session) error { _, err := s.StackDepth(); return err },
+			args: map[string]string{}},
+		{name: "GetStackFrame", command: "stack_get",
+			call: func(s *Session) error { _, err := s.GetStackFrame(1); return err },
+			args: map[string]string{"d": "1"}},
+		{name: "EvalProperty paged", command: "eval",
+			call: func(s *Session) error { _, err := s.EvalProperty("$numbers", 3); return err },
+			args: map[string]string{"p": "3"},
+			data: "$numbers"},
+		{name: "TypeMap", command: "typemap_get",
+			call: func(s *Session) error { _, err := s.TypeMap(); return err },
+			args: map[string]string{}},
 		{name: "SetBreakpointSpec call", command: "breakpoint_set",
 			call: func(s *Session) error {
 				_, err := s.SetBreakpointSpec(Breakpoint{Type: BreakpointCall, Function: "App\\add"})
@@ -831,5 +866,137 @@ func TestNotificationsAreBounded(t *testing.T) {
 	notes, next := s.Notifications(0)
 	if len(notes) != maxNotifications || notes[0].Name != "5" || next != maxNotifications+5 {
 		t.Errorf("Notifications(0) = %d notes from %q, next %d", len(notes), notes[0].Name, next)
+	}
+}
+
+func TestInspectionDecoding(t *testing.T) {
+	s, e := startFakeSession(t, standardHandlers())
+
+	t.Run("GetProperty", func(t *testing.T) {
+		p, err := s.GetProperty("$obj", PropertyOptions{Depth: 1})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if p.FullName != "$obj" || p.ClassName != "Service" || p.NumChildren != 3 || p.PageSize != 10 || p.Pages() != 1 {
+			t.Errorf("property = %+v", p)
+		}
+		var names []string
+		for _, c := range p.ChildProperties {
+			names = append(names, c.FullName+"/"+c.Facet)
+		}
+		if want := "$obj->id/public $obj->cache/protected $obj->name/private"; strings.Join(names, " ") != want {
+			t.Errorf("children = %q, want %q", strings.Join(names, " "), want)
+		}
+		if v, err := p.ChildProperties[2].DecodedValue(); err != nil || v != "svc" {
+			t.Errorf("$obj->name = %q, %v", v, err)
+		}
+	})
+	t.Run("GetProperty page", func(t *testing.T) {
+		e.Handle("property_get", reply("property_get_page"))
+		defer e.Handle("property_get", reply("property_get_object"))
+		p, err := s.GetProperty("$numbers", PropertyOptions{Depth: 1, Page: 1})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if p.Page != 1 || p.Pages() != 4 || len(p.ChildProperties) != 10 || p.ChildProperties[0].FullName != "$numbers[10]" {
+			t.Errorf("page = %+v", p)
+		}
+	})
+	t.Run("GetProperty truncated", func(t *testing.T) {
+		e.Handle("property_get", reply("property_get_maxdata"))
+		defer e.Handle("property_get", reply("property_get_object"))
+		p, err := s.GetProperty("$long", PropertyOptions{Depth: 1, MaxData: 20})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if v, _ := p.DecodedValue(); v != "abcdefghijabcdefghij" || p.Size != 200 || !p.Truncated() {
+			t.Errorf("value %q, size %d, truncated %v", v, p.Size, p.Truncated())
+		}
+	})
+	t.Run("GetPropertyValue", func(t *testing.T) {
+		v, err := s.GetPropertyValue("$long", PropertyOptions{Depth: 1})
+		if err != nil || v != strings.Repeat("abcdefghij", 20) {
+			t.Errorf("GetPropertyValue = %q, %v", v, err)
+		}
+	})
+	t.Run("SetProperty", func(t *testing.T) {
+		if err := s.SetProperty("$b", "10", PropertyOptions{}); err != nil {
+			t.Error(err)
+		}
+	})
+	t.Run("ContextNames", func(t *testing.T) {
+		names, err := s.ContextNames(0)
+		want := []ContextName{{0, "Locals"}, {1, "Superglobals"}, {2, "User defined constants"}}
+		if err != nil || !reflect.DeepEqual(names, want) {
+			t.Errorf("ContextNames = %+v, %v", names, err)
+		}
+	})
+	t.Run("StackDepth", func(t *testing.T) {
+		if d, err := s.StackDepth(); err != nil || d != 2 {
+			t.Errorf("StackDepth = %d, %v; want 2", d, err)
+		}
+	})
+	t.Run("GetStackFrame", func(t *testing.T) {
+		e.Handle("stack_get", reply("stack_get_depth"))
+		defer e.Handle("stack_get", reply("stack_get"))
+		f, err := s.GetStackFrame(1)
+		if err != nil || f.Level != 1 || f.Where != "{main}" || f.Lineno != lineCallAdd {
+			t.Errorf("GetStackFrame = %+v, %v", f, err)
+		}
+	})
+	t.Run("GetContextProperties", func(t *testing.T) {
+		props, err := s.GetContextProperties(0, 0)
+		if err != nil || len(props) != 3 || props[0].FullName != "$a" || props[2].Type != "uninitialized" {
+			t.Errorf("GetContextProperties = %+v, %v", props, err)
+		}
+	})
+	t.Run("EvalProperty", func(t *testing.T) {
+		e.Handle("eval", reply("eval_array"))
+		defer e.Handle("eval", reply("eval"))
+		p, err := s.EvalProperty("[$a, $b, 'k' => 'v']", 0)
+		if err != nil || p.Type != "array" || p.NumChildren != 3 || len(p.ChildProperties) != 3 {
+			t.Fatalf("EvalProperty = %+v, %v", p, err)
+		}
+		if v, _ := p.ChildProperties[2].DecodedValue(); p.ChildProperties[2].Name != "k" || v != "v" {
+			t.Errorf("child k = %+v", p.ChildProperties[2])
+		}
+		if v, err := s.Eval("[$a, $b, 'k' => 'v']"); err != nil || v != "array[3]" {
+			t.Errorf("Eval = %q, %v; want array[3]", v, err)
+		}
+	})
+	t.Run("TypeMap", func(t *testing.T) {
+		types, err := s.TypeMap()
+		if err != nil || len(types) != 8 {
+			t.Fatalf("TypeMap = %+v, %v", types, err)
+		}
+		if want := (TypeMapEntry{Name: "int", Type: "int", SchemaType: "xsd:decimal"}); types[1] != want {
+			t.Errorf("types[1] = %+v, want %+v", types[1], want)
+		}
+		if want := (TypeMapEntry{Name: "array", Type: "hash"}); types[5] != want {
+			t.Errorf("types[5] = %+v, want %+v", types[5], want)
+		}
+	})
+}
+
+func TestEngineErrorCarriesCode(t *testing.T) {
+	s, _ := startFakeSession(t, map[string]fakeHandler{"property_get": reply("error_property_not_found")})
+	_, err := s.GetProperty("$nope", PropertyOptions{})
+	var engineErr *EngineError
+	if !errors.As(err, &engineErr) || engineErr.Code != 300 || engineErr.Command != "property_get" {
+		t.Fatalf("err = %#v, want *EngineError with code 300", err)
+	}
+	if err.Error() != "error 300: can not get property" {
+		t.Errorf("Error() = %q", err.Error())
+	}
+}
+
+func TestSetPropertyFailure(t *testing.T) {
+	s, _ := startFakeSession(t, map[string]fakeHandler{
+		"property_set": func(e *fakeEngine, cmd fakeCommand) []string {
+			return []string{strings.Replace(e.withTransaction(e.fixture("property_set"), cmd), `success="1"`, `success="0"`, 1)}
+		},
+	})
+	if err := s.SetProperty("$b", "1", PropertyOptions{}); err == nil {
+		t.Error("SetProperty succeeded although the engine reported failure")
 	}
 }

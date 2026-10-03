@@ -438,10 +438,22 @@ func (s *Session) clearPending(p *pendingCommand) {
 	s.mu.Unlock()
 }
 
-// responseResult turns an engine error response into a Go error.
+// EngineError is an error response from the engine, such as code 300 for
+// a property that does not exist.
+type EngineError struct {
+	Command string
+	Code    int
+	Message string
+}
+
+func (e *EngineError) Error() string {
+	return fmt.Sprintf("error %d: %s", e.Code, e.Message)
+}
+
+// responseResult turns an engine error response into an *EngineError.
 func responseResult(resp *Response) (*Response, error) {
 	if resp.Error != nil {
-		return resp, fmt.Errorf("error %d: %s", resp.Error.Code, resp.Error.Message)
+		return resp, &EngineError{Command: resp.Command, Code: resp.Error.Code, Message: resp.Error.Message}
 	}
 	return resp, nil
 }
@@ -655,18 +667,141 @@ func (s *Session) GetContext(depth int, context int) ([]Variable, error) {
 // Eval evaluates an expression and returns its value. Strings and numbers
 // are returned as-is; arrays and objects in summary form, e.g. "array[3]".
 func (s *Session) Eval(code string) (string, error) {
-	resp, err := s.sendCommand("eval", nil, []byte(code))
+	p, err := s.EvalProperty(code, 0)
+	if err != nil || p == nil {
+		return "", err
+	}
+	if p.Type == "array" || p.Type == "object" {
+		return formatPropertyValue(*p), nil
+	}
+	return p.DecodedValue()
+}
+
+// EvalProperty evaluates an expression and returns the result as a
+// property, with children for arrays and objects (page selects which).
+// It returns nil for expressions without a value.
+func (s *Session) EvalProperty(code string, page int) (*Property, error) {
+	var args []string
+	if page > 0 {
+		args = []string{"-p", strconv.Itoa(page)}
+	}
+	resp, err := s.sendCommand("eval", args, []byte(code))
+	if err != nil || len(resp.Properties) == 0 {
+		return nil, err
+	}
+	return &resp.Properties[0], nil
+}
+
+// PropertyOptions selects where a property is looked up and how much of
+// it the engine returns.
+type PropertyOptions struct {
+	Depth   int // stack depth: 0 is the current frame
+	Context int // context id (see ContextNames): 0 is Locals
+	Page    int // page of children, from 0
+	MaxData int // bytes of a value to return; 0 uses the max_data feature
+}
+
+func (o PropertyOptions) args(fullname string) []string {
+	args := []string{"-n", fullname, "-d", strconv.Itoa(o.Depth), "-c", strconv.Itoa(o.Context)}
+	if o.Page > 0 {
+		args = append(args, "-p", strconv.Itoa(o.Page))
+	}
+	if o.MaxData > 0 {
+		args = append(args, "-m", strconv.Itoa(o.MaxData))
+	}
+	return args
+}
+
+// GetProperty returns a variable, or a path into one such as $user["name"]
+// or $obj->cache, with one page of its children down to the max_depth
+// feature. String values longer than max_data are truncated; see
+// Property.Truncated and GetPropertyValue.
+func (s *Session) GetProperty(fullname string, opts PropertyOptions) (*Property, error) {
+	resp, err := s.sendCommand("property_get", opts.args(fullname), nil)
+	if err != nil {
+		return nil, err
+	}
+	if len(resp.Properties) == 0 {
+		return nil, fmt.Errorf("property_get %s: no property in response", fullname)
+	}
+	return &resp.Properties[0], nil
+}
+
+// GetPropertyValue returns a property's value. With opts.MaxData 0 it
+// returns the whole value, however long; Page is ignored.
+func (s *Session) GetPropertyValue(fullname string, opts PropertyOptions) (string, error) {
+	args := []string{"-n", fullname, "-d", strconv.Itoa(opts.Depth), "-c", strconv.Itoa(opts.Context),
+		"-m", strconv.Itoa(opts.MaxData)}
+	resp, err := s.sendCommand("property_value", args, nil)
 	if err != nil {
 		return "", err
 	}
-	if len(resp.Properties) == 0 {
-		return "", nil
+	return decodeEncoded(resp.Encoding, resp.Value)
+}
+
+// SetProperty assigns value, a PHP expression, to a variable or a path
+// into one. Page and MaxData are ignored.
+func (s *Session) SetProperty(fullname, value string, opts PropertyOptions) error {
+	args := []string{"-n", fullname, "-d", strconv.Itoa(opts.Depth), "-c", strconv.Itoa(opts.Context)}
+	resp, err := s.sendCommand("property_set", args, []byte(value))
+	if err != nil {
+		return err
 	}
-	p := resp.Properties[0]
-	if p.Type == "array" || p.Type == "object" {
-		return formatPropertyValue(p), nil
+	if resp.Success == "0" {
+		return fmt.Errorf("property_set %s: engine reported failure", fullname)
 	}
-	return decodeEncoded(p.Encoding, p.Value)
+	return nil
+}
+
+// GetContextProperties returns the variables of a context at a stack depth
+// as properties, with children down to the max_depth feature.
+func (s *Session) GetContextProperties(depth, context int) ([]Property, error) {
+	args := []string{"-d", strconv.Itoa(depth), "-c", strconv.Itoa(context)}
+	resp, err := s.sendCommand("context_get", args, nil)
+	if err != nil {
+		return nil, err
+	}
+	return resp.Properties, nil
+}
+
+// ContextNames returns the variable contexts available at a stack depth,
+// such as Locals and Superglobals.
+func (s *Session) ContextNames(depth int) ([]ContextName, error) {
+	resp, err := s.sendCommand("context_names", []string{"-d", strconv.Itoa(depth)}, nil)
+	if err != nil {
+		return nil, err
+	}
+	return resp.Contexts, nil
+}
+
+// StackDepth returns the number of frames on the call stack.
+func (s *Session) StackDepth() (int, error) {
+	resp, err := s.sendCommand("stack_depth", nil, nil)
+	if err != nil {
+		return 0, err
+	}
+	return resp.Depth, nil
+}
+
+// GetStackFrame returns the frame at a stack depth: 0 is the current one.
+func (s *Session) GetStackFrame(depth int) (StackFrame, error) {
+	resp, err := s.sendCommand("stack_get", []string{"-d", strconv.Itoa(depth)}, nil)
+	if err != nil {
+		return StackFrame{}, err
+	}
+	if len(resp.Stack) == 0 {
+		return StackFrame{}, fmt.Errorf("stack_get: no frame at depth %d", depth)
+	}
+	return resp.Stack[0], nil
+}
+
+// TypeMap returns how the engine's types map to DBGp and XML Schema types.
+func (s *Session) TypeMap() ([]TypeMapEntry, error) {
+	resp, err := s.sendCommand("typemap_get", nil, nil)
+	if err != nil {
+		return nil, err
+	}
+	return resp.TypeMap, nil
 }
 
 // GetSource returns source code

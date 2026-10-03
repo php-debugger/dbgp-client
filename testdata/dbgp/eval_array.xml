@@ -1,0 +1,2 @@
+<?xml version="1.0" encoding="iso-8859-1"?>
+<response xmlns="urn:debugger_protocol_v1" xmlns:xdebug="https://xdebug.org/dbgp/xdebug" command="eval" transaction_id="34"><property type="array" children="1" numchildren="3" page="0" pagesize="10"><property name="0" type="int"><![CDATA[2]]></property><property name="1" type="int"><![CDATA[10]]></property><property name="k" type="string" size="1" encoding="base64"><![CDATA[dg==]]></property></property></response>

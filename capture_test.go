@@ -108,9 +108,13 @@ func TestCaptureFixtures(t *testing.T) {
 	cmd("property_get_page", "property_get", "-d 1 -n $numbers -p 1")
 	cmd("property_get_object", "property_get", "-d 1 -n $obj")
 	cmd("property_value", "property_value", "-d 1 -n $long")
+	cmd("property_get_maxdata", "property_get", "-d 1 -n $long -m 20")
+	cmd("property_get_quoted", "property_get", `-d 1 -n "$user[\"name\"]"`)
+	cmd("error_property_not_found", "property_get", "-d 1 -n $nope")
 	cmd("property_set", "property_set", "-d 0 -n $b", "10")
 	cmd("eval", "eval", "", "$a + $b")
 	cmd("eval_error", "eval", "", "$a +")
+	cmd("eval_array", "eval", "", "[$a, $b, 'k' => 'v']")
 	cmd("source", "source", "-f "+scriptURI+" -b 22 -e 26")
 
 	// Stepping.

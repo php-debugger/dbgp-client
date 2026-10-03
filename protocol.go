@@ -115,12 +115,23 @@ type Response struct {
 	// For breakpoint_get, breakpoint_list, breakpoint_remove
 	Breakpoints []BreakpointInfo `xml:"breakpoint,omitempty"`
 
-	// For context_get
+	// For context_get, property_get and eval
 	Context    int        `xml:"context,attr,omitempty"`
 	Properties []Property `xml:"property,omitempty"`
 
-	// For stack_get
+	// For property_value
+	Type string `xml:"type,attr,omitempty"`
+	Size int    `xml:"size,attr,omitempty"`
+
+	// For context_names
+	Contexts []ContextName `xml:"context,omitempty"`
+
+	// For typemap_get
+	TypeMap []TypeMapEntry `xml:"map,omitempty"`
+
+	// For stack_get and stack_depth
 	Stack []StackFrame `xml:"stack,omitempty"`
+	Depth int          `xml:"depth,attr,omitempty"`
 
 	// For errors
 	Error *Error `xml:"error,omitempty"`
@@ -239,17 +250,72 @@ func decodeEncoded(encoding, value string) (string, error) {
 
 // Property represents a variable
 type Property struct {
-	Name            string     `xml:"name,attr"`
-	FullName        string     `xml:"fullname,attr"`
-	Type            string     `xml:"type,attr"`
-	ClassName       string     `xml:"classname,attr,omitempty"`
-	Facet           string     `xml:"facet,attr,omitempty"`
-	Size            int        `xml:"size,attr,omitempty"`
-	Children        int        `xml:"children,attr,omitempty"`
-	NumChildren     int        `xml:"numchildren,attr,omitempty"`
+	Name        string `xml:"name,attr"`
+	FullName    string `xml:"fullname,attr"`
+	Type        string `xml:"type,attr"`
+	ClassName   string `xml:"classname,attr,omitempty"`
+	Facet       string `xml:"facet,attr,omitempty"`
+	Size        int    `xml:"size,attr,omitempty"` // full length of a string value
+	Children    int    `xml:"children,attr,omitempty"`
+	NumChildren int    `xml:"numchildren,attr,omitempty"`
+	// Page and PageSize locate ChildProperties among all NumChildren.
+	Page            int        `xml:"page,attr,omitempty"`
+	PageSize        int        `xml:"pagesize,attr,omitempty"`
 	Encoding        string     `xml:"encoding,attr,omitempty"`
 	Value           string     `xml:",chardata"`
 	ChildProperties []Property `xml:"property,omitempty"`
+}
+
+// DecodedValue returns the property's value with its encoding removed.
+// Arrays and objects have no value of their own; see ChildProperties.
+func (p Property) DecodedValue() (string, error) {
+	return decodeEncoded(p.Encoding, p.Value)
+}
+
+// Truncated reports whether the engine sent only part of a string value
+// (see the max_data feature); GetPropertyValue returns all of it.
+func (p Property) Truncated() bool {
+	value, err := p.DecodedValue()
+	return err == nil && p.Size > len(value)
+}
+
+// Pages returns how many pages of children the property has.
+func (p Property) Pages() int {
+	if p.PageSize <= 0 || p.NumChildren == 0 {
+		return 1
+	}
+	return (p.NumChildren + p.PageSize - 1) / p.PageSize
+}
+
+// ContextName is a variable context, such as Locals or Superglobals.
+type ContextName struct {
+	ID   int    `xml:"id,attr"`
+	Name string `xml:"name,attr"`
+}
+
+// TypeMapEntry maps a language type to its DBGp type and XML Schema type.
+type TypeMapEntry struct {
+	Name       string // PHP type name, e.g. "int"
+	Type       string // DBGp common type, e.g. "int" or "hash"
+	SchemaType string // XML Schema type, e.g. "xsd:decimal"; may be empty
+}
+
+const xsiNamespace = "http://www.w3.org/2001/XMLSchema-instance"
+
+// UnmarshalXML reads a map element. It has both type and xsi:type
+// attributes, which plain struct tags cannot tell apart.
+func (m *TypeMapEntry) UnmarshalXML(d *xml.Decoder, start xml.StartElement) error {
+	for _, a := range start.Attr {
+		switch {
+		case a.Name.Local == "name":
+			m.Name = a.Value
+		case a.Name.Local == "type" && a.Name.Space == "":
+			m.Type = a.Value
+		case a.Name.Local == "type" && a.Name.Space == xsiNamespace:
+			m.SchemaType = a.Value
+		}
+	}
+	return d.Skip()
 }
 
 // StackFrame represents a call stack entry
