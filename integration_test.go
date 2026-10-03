@@ -3,6 +3,7 @@ package dbgp
 import (
 	"context"
 	"errors"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -315,5 +316,45 @@ func TestEngineInspection(t *testing.T) {
 	var engineErr *EngineError
 	if _, err := sess.GetProperty("$nope", PropertyOptions{}); !errors.As(err, &engineErr) || engineErr.Code != 300 {
 		t.Errorf("GetProperty($nope) err = %v, want engine error 300", err)
+	}
+}
+
+// The engine sees the debuggee's real directory; the test works only with
+// an imaginary local checkout, as when debugging a container or a server.
+func TestEnginePathMapping(t *testing.T) {
+	requireDebugEngine(t)
+	remoteDir := filepath.Dir(debuggeePath(t))
+	localDir := filepath.FromSlash("/home/agent/my project")
+	srv := newTestServer(t, Config{PathMap: []PathMapping{{Local: localDir, Remote: remoteDir}}})
+	script := filepath.Join(localDir, "basic.php")
+
+	if _, err := srv.AddBreakpoint(Breakpoint{File: script, Line: lineAddBody}); err != nil {
+		t.Fatal(err)
+	}
+	startDebuggee(t, srv.Port())
+	sess := waitSession(t, srv)
+	if sess.Script() != script {
+		t.Errorf("Script() = %q, want %q", sess.Script(), script)
+	}
+
+	st := mustContinue(t, sess, ContinueRun)
+	if st.File != script || st.Line != lineAddBody {
+		t.Fatalf("stopped at %s:%d, want %s:%d", st.File, st.Line, script, lineAddBody)
+	}
+	if stack, err := sess.GetStack(); err != nil || stack[0].Filename != script || stack[1].Filename != script {
+		t.Errorf("GetStack = %+v, %v", stack, err)
+	}
+	if src, err := sess.GetSource(script, lineAddBody, lineAddBody); err != nil || !strings.Contains(src, "$sum = $a + $b;") {
+		t.Errorf("GetSource = %q, %v", src, err)
+	}
+
+	if st := mustContinue(t, sess, ContinueRun); st.Status != StatusStopping {
+		t.Fatalf("at end: %+v", st)
+	}
+	notes, _ := sess.Notifications(0)
+	for _, n := range notes {
+		if n.Name == "error" && n.Message.Filename != script {
+			t.Errorf("warning reported in %q, want %q", n.Message.Filename, script)
+		}
 	}
 }

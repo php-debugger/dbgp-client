@@ -8,9 +8,14 @@ Code imported from `cli/dbgp` in https://github.com/php-debugger/php-debugger/pu
 A `Server` listens for [PHP Debugger](https://php-debugger.dev) or Xdebug connections. Each PHP request or script run becomes a `Session`, which waits at the start of the script until it is continued.
 
 ```go
-srv, err := dbgp.Listen(dbgp.Config{Addr: "127.0.0.1:9003"})
+srv, err := dbgp.Listen(dbgp.Config{
+	Addr: "0.0.0.0:9003",
+	// For PHP in a container or on a remote server: sessions take and
+	// return local paths, and the engine sees its own.
+	PathMap: []dbgp.PathMapping{{Local: "/home/me/project", Remote: "/var/www/html"}},
+})
 // Server breakpoints apply to every session, including ones that connect later.
-srv.AddBreakpoint(dbgp.Breakpoint{File: "/app/index.php", Line: 12})
+srv.AddBreakpoint(dbgp.Breakpoint{File: "/home/me/project/index.php", Line: 12})
 
 sess, err := srv.WaitForSession(ctx)
 // Continue waits up to the given time; if the script is still running then,

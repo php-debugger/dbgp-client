@@ -359,9 +359,6 @@ func ParseNotification(data []byte) (*Notification, error) {
 	if err := decoder.Decode(&n); err != nil {
 		return nil, fmt.Errorf("parse notification: %w", err)
 	}
-	if n.Message != nil {
-		n.Message.Filename = FormatFileURI(n.Message.Filename)
-	}
 	return &n, nil
 }
 

@@ -60,6 +60,7 @@ type State struct {
 type Session struct {
 	id     int
 	server *Server
+	paths  PathMap
 	conn   net.Conn
 	init   *InitPacket
 	closed chan struct{} // closed when the read loop exits
@@ -99,6 +100,7 @@ func newSession(id int, server *Server, conn net.Conn, reader *bufio.Reader, ini
 	s := &Session{
 		id:      id,
 		server:  server,
+		paths:   server.paths,
 		conn:    conn,
 		init:    init,
 		closed:  make(chan struct{}),
@@ -116,6 +118,9 @@ func (s *Session) ID() int { return s.id }
 
 // Init returns the session's init packet.
 func (s *Session) Init() *InitPacket { return s.init }
+
+// Script returns the local path of the script being debugged.
+func (s *Session) Script() string { return s.paths.localPath(s.init.FileURI) }
 
 // State returns the session's current state without asking the engine.
 func (s *Session) State() State {
@@ -252,7 +257,7 @@ func (s *Session) dispatch(resp *Response) {
 
 	if s.contID != 0 && (resp.Transaction == s.contID || (untaggedError && s.pending == nil)) {
 		s.contID = 0
-		s.setStateLocked(continuationState(resp, s.contPrev))
+		s.setStateLocked(continuationState(resp, s.contPrev, s.paths))
 		return
 	}
 
@@ -274,14 +279,14 @@ func (s *Session) dispatch(resp *Response) {
 }
 
 // continuationState is the state a continuation response leaves the session in.
-func continuationState(resp *Response, prev State) State {
+func continuationState(resp *Response, prev State, paths PathMap) State {
 	if resp.Error != nil {
 		prev.Error = fmt.Sprintf("error %d: %s", resp.Error.Code, resp.Error.Message)
 		return prev
 	}
 	st := State{Status: resp.Status, Reason: resp.Reason}
 	if st.Status == StatusBreak && resp.Message != nil {
-		st.File, st.Line = resp.ParseMessage()
+		st.File, st.Line = paths.localPath(resp.Message.Filename), resp.Message.Lineno
 		st.Exception = resp.Message.Exception
 		st.Message = strings.TrimSpace(resp.Message.Text)
 	}
@@ -305,6 +310,12 @@ func (s *Session) appendOutput(text string) {
 }
 
 func (s *Session) addNotification(n Notification) {
+	if n.Message != nil {
+		n.Message.Filename = s.paths.localPath(n.Message.Filename)
+	}
+	if n.Breakpoint != nil && n.Breakpoint.Filename != "" {
+		n.Breakpoint.Filename = s.paths.localPath(n.Breakpoint.Filename)
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.notes = append(s.notes, n)
@@ -592,7 +603,7 @@ func (s *Session) SetBreakpointSpec(bp Breakpoint) (int, error) {
 	var data []byte
 	switch bp.typeName() {
 	case BreakpointLine, BreakpointConditional:
-		args = append(args, "-f", MakeFileURI(bp.File), "-n", strconv.Itoa(bp.Line))
+		args = append(args, "-f", s.paths.engineURI(bp.File), "-n", strconv.Itoa(bp.Line))
 		if bp.typeName() == BreakpointConditional {
 			data = []byte(bp.Condition)
 		}
@@ -624,11 +635,16 @@ func (s *Session) RemoveBreakpoint(id int) error {
 	return err
 }
 
-// ListBreakpoints lists all breakpoints
+// ListBreakpoints lists the engine's breakpoints, with local paths.
 func (s *Session) ListBreakpoints() ([]BreakpointInfo, error) {
 	resp, err := s.sendCommand("breakpoint_list", nil, nil)
 	if err != nil {
 		return nil, err
+	}
+	for i, bp := range resp.Breakpoints {
+		if bp.Filename != "" {
+			resp.Breakpoints[i].Filename = s.paths.localPath(bp.Filename)
+		}
 	}
 	return resp.Breakpoints, nil
 }
@@ -645,11 +661,14 @@ func (s *Session) Detach() error {
 	return err
 }
 
-// GetStack returns the call stack
+// GetStack returns the call stack, with local paths.
 func (s *Session) GetStack() ([]StackFrame, error) {
 	resp, err := s.sendCommand("stack_get", nil, nil)
 	if err != nil {
 		return nil, err
+	}
+	for i := range resp.Stack {
+		resp.Stack[i].Filename = s.paths.localPath(resp.Stack[i].Filename)
 	}
 	return resp.Stack, nil
 }
@@ -792,7 +811,9 @@ func (s *Session) GetStackFrame(depth int) (StackFrame, error) {
 	if len(resp.Stack) == 0 {
 		return StackFrame{}, fmt.Errorf("stack_get: no frame at depth %d", depth)
 	}
-	return resp.Stack[0], nil
+	frame := resp.Stack[0]
+	frame.Filename = s.paths.localPath(frame.Filename)
+	return frame, nil
 }
 
 // TypeMap returns how the engine's types map to DBGp and XML Schema types.
@@ -804,9 +825,9 @@ func (s *Session) TypeMap() ([]TypeMapEntry, error) {
 	return resp.TypeMap, nil
 }
 
-// GetSource returns source code
+// GetSource returns source code of a local path
 func (s *Session) GetSource(file string, begin, end int) (string, error) {
-	args := []string{"-f", MakeFileURI(file)}
+	args := []string{"-f", s.paths.engineURI(file)}
 	if begin > 0 {
 		args = append(args, "-b", strconv.Itoa(begin))
 	}
