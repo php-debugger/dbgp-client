@@ -11,7 +11,8 @@ A `Server` listens for [PHP Debugger](https://php-debugger.dev) or Xdebug connec
 srv, err := dbgp.Listen(dbgp.Config{
 	Addr: "0.0.0.0:9003",
 	// For PHP in a container or on a remote server: sessions take and
-	// return local paths, and the engine sees its own.
+	// return local paths, and the engine sees its own. Not needed when the
+	// server has its own .xdebug map files; Session.EngineMapping reports that.
 	PathMap: []dbgp.PathMapping{{Local: "/home/me/project", Remote: "/var/www/html"}},
 })
 // Server breakpoints apply to every session, including ones that connect later.

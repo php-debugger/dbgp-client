@@ -3,6 +3,7 @@ package dbgp
 import (
 	"context"
 	"errors"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -48,6 +49,9 @@ func TestEngineSession(t *testing.T) {
 	}
 	if err := sess.SetupError(); err != nil {
 		t.Fatalf("SetupError: %v", err)
+	}
+	if m := sess.EngineMapping(); !m.Detected || m.Enabled || m.RemoteScript != script {
+		t.Errorf("EngineMapping() = %+v, want detected, off, %s", m, script)
 	}
 	if st := sess.State(); st.Status != StatusStarting {
 		t.Fatalf("State = %+v, want starting", st)
@@ -356,5 +360,60 @@ func TestEnginePathMapping(t *testing.T) {
 		if n.Name == "error" && n.Message.Filename != script {
 			t.Errorf("warning reported in %q, want %q", n.Message.Filename, script)
 		}
+	}
+}
+
+// The engine maps paths itself, from map files on the server; the client
+// detects it and passes local paths through.
+func TestEngineOwnPathMapping(t *testing.T) {
+	requireDebugEngine(t)
+	src, err := os.ReadFile(debuggeePath(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The map's remote prefix must be the path PHP sees, without symlinks.
+	remoteDir, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	remoteScript := filepath.Join(remoteDir, "basic.php")
+	localDir := "/home/agent/project"
+	script := localDir + "/basic.php"
+	files := map[string]string{
+		remoteScript: string(src),
+		filepath.Join(remoteDir, ".xdebug", "agent.map"): "remote_prefix: " + filepath.ToSlash(remoteDir) +
+			"\nlocal_prefix: " + localDir + "\n/basic.php = /basic.php\n",
+	}
+	for path, content := range files {
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	srv := newTestServer(t, Config{})
+	if _, err := srv.AddBreakpoint(Breakpoint{File: script, Line: lineAddBody}); err != nil {
+		t.Fatal(err)
+	}
+	startDebuggeeScript(t, srv.Port(), remoteScript, "xdebug.path_mapping=1")
+	sess := waitSession(t, srv)
+
+	if m := sess.EngineMapping(); !m.Detected || !m.Enabled || m.RemoteScript != remoteScript {
+		t.Errorf("EngineMapping() = %+v, want enabled with remote script %s", m, remoteScript)
+	}
+	if sess.Script() != script {
+		t.Errorf("Script() = %q, want %q", sess.Script(), script)
+	}
+	if w := sess.SetupWarnings(); len(w) != 0 {
+		t.Errorf("SetupWarnings() = %q", w)
+	}
+	if st := mustContinue(t, sess, ContinueRun); st.File != script || st.Line != lineAddBody {
+		t.Fatalf("stopped at %s:%d, want %s:%d", st.File, st.Line, script, lineAddBody)
+	}
+	stack, err := sess.GetStack()
+	if err != nil || stack[0].Filename != script || stack[0].Facet != "mapped" {
+		t.Errorf("GetStack = %+v, %v; want mapped frames in %s", stack, err, script)
 	}
 }

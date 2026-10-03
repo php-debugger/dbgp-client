@@ -2,6 +2,8 @@ package dbgp
 
 import (
 	"context"
+	"encoding/base64"
+	"fmt"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -175,5 +177,95 @@ func TestSessionUsesPathMap(t *testing.T) {
 	}
 	if got := e.LastCommand("breakpoint_set").Args["f"]; !strings.HasSuffix(got, "/elsewhere/x.php") {
 		t.Errorf("unmapped breakpoint sent for %q", got)
+	}
+}
+
+// evalString is an eval response with a string result, shaped like the
+// recorded ones. size is the full length the engine reports.
+func evalString(cmd fakeCommand, value string, size int) string {
+	return fmt.Sprintf(`<?xml version="1.0" encoding="iso-8859-1"?>`+"\n"+
+		`<response xmlns="urn:debugger_protocol_v1" xmlns:xdebug="https://xdebug.org/dbgp/xdebug" command="eval" transaction_id="%s">`+
+		`<property type="string" size="%d" encoding="base64"><![CDATA[%s]]></property></response>`,
+		cmd.Args["i"], size, base64.StdEncoding.EncodeToString([]byte(value)))
+}
+
+// probeReply answers the engine-mapping probe with reply, and other evals
+// with the recorded eval response.
+func probeReply(reply func(e *fakeEngine, cmd fakeCommand) []string) map[string]fakeHandler {
+	h := standardHandlers()
+	h["eval"] = func(e *fakeEngine, cmd fakeCommand) []string {
+		if cmd.Data == engineMappingProbe {
+			return reply(e, cmd)
+		}
+		return []string{e.withTransaction(e.fixture("eval"), cmd)}
+	}
+	return h
+}
+
+func TestEngineMappingDetection(t *testing.T) {
+	answer := func(json string) func(e *fakeEngine, cmd fakeCommand) []string {
+		return func(e *fakeEngine, cmd fakeCommand) []string { return []string{evalString(cmd, json, len(json))} }
+	}
+	tests := []struct {
+		name  string
+		reply func(e *fakeEngine, cmd fakeCommand) []string
+		want  EngineMapping
+	}{
+		{"xdebug setting on", answer(`["1","0","/srv/app/basic.php"]`),
+			EngineMapping{Detected: true, Enabled: true, RemoteScript: "/srv/app/basic.php"}},
+		{"php_debugger setting on", answer(`["0","On","/srv/app/basic.php"]`),
+			EngineMapping{Detected: true, Enabled: true, RemoteScript: "/srv/app/basic.php"}},
+		{"off", answer(`["0","0","/srv/app/basic.php"]`),
+			EngineMapping{Detected: true, RemoteScript: "/srv/app/basic.php"}},
+		{"engine without the setting", answer(`[false,false,"/srv/app/basic.php"]`),
+			EngineMapping{Detected: true, RemoteScript: "/srv/app/basic.php"}},
+		{"not json", answer(`oops`), EngineMapping{}},
+		{"truncated", func(e *fakeEngine, cmd fakeCommand) []string {
+			return []string{evalString(cmd, `["1","0","/sr`, 40)}
+		}, EngineMapping{}},
+		{"eval error", func(e *fakeEngine, cmd fakeCommand) []string {
+			return []string{e.withTransaction(e.fixture("eval_error"), cmd)}
+		}, EngineMapping{}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			srv := newTestServer(t, Config{})
+			dialFakeEngine(t, srv, fixture(t, "init"), probeReply(tt.reply))
+			sess := waitSession(t, srv)
+			if got := sess.EngineMapping(); got != tt.want {
+				t.Errorf("EngineMapping() = %+v, want %+v", got, tt.want)
+			}
+			if w := sess.SetupWarnings(); len(w) != 0 {
+				t.Errorf("SetupWarnings() = %q, want none", w)
+			}
+		})
+	}
+}
+
+func TestEngineMappingWithPathMapWarns(t *testing.T) {
+	on := func(e *fakeEngine, cmd fakeCommand) []string {
+		v := `["1","1","/srv/app/basic.php"]`
+		return []string{evalString(cmd, v, len(v))}
+	}
+	srv := newTestServer(t, Config{PathMap: []PathMapping{{Local: "/home/me/app", Remote: "/srv/app"}}})
+	dialFakeEngine(t, srv, fixture(t, "init"), probeReply(on))
+	sess := waitSession(t, srv)
+	if w := sess.SetupWarnings(); len(w) != 1 || !strings.Contains(w[0], "Config.PathMap") {
+		t.Errorf("SetupWarnings() = %q, want a double-mapping warning", w)
+	}
+}
+
+func TestStackFrameFacet(t *testing.T) {
+	s, _ := startFakeSession(t, map[string]fakeHandler{
+		"stack_get": func(e *fakeEngine, cmd fakeCommand) []string {
+			packet := e.withTransaction(e.fixture("stack_get"), cmd)
+			packet = strings.Replace(packet, `level="0"`, `level="0" xdebug:facet="mapped"`, 1)
+			packet = strings.Replace(packet, `level="1"`, `level="1" xdebug:facet="skipped"`, 1)
+			return []string{packet}
+		},
+	})
+	stack, err := s.GetStack()
+	if err != nil || stack[0].Facet != "mapped" || stack[1].Facet != "skipped" {
+		t.Errorf("GetStack = %+v, %v; want facets mapped, skipped", stack, err)
 	}
 }
