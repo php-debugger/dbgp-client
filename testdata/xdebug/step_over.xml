@@ -1,0 +1,2 @@
+<?xml version="1.0" encoding="iso-8859-1"?>
+<response xmlns="urn:debugger_protocol_v1" xmlns:xdebug="https://xdebug.org/dbgp/xdebug" command="step_over" transaction_id="32" status="break" reason="ok"><xdebug:message filename="file:///app/basic.php" lineno="25"></xdebug:message></response>
