@@ -12,6 +12,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -61,7 +62,6 @@ type State struct {
 type Session struct {
 	id     int
 	server *Server
-	paths  PathMap
 	conn   net.Conn
 	init   *InitPacket
 	closed chan struct{} // closed when the read loop exits
@@ -74,6 +74,9 @@ type Session struct {
 	// server breakpoint ids to this engine's breakpoint ids.
 	syncMu sync.Mutex
 	bpIDs  map[int]int
+	// resync asks the next sync to set every breakpoint again, because a
+	// path mapping changed.
+	resync atomic.Bool
 
 	mu         sync.Mutex
 	transID    int
@@ -169,7 +172,6 @@ func newSession(id int, server *Server, conn net.Conn, reader *bufio.Reader, ini
 	s := &Session{
 		id:      id,
 		server:  server,
-		paths:   server.paths,
 		conn:    conn,
 		init:    init,
 		closed:  make(chan struct{}),
@@ -188,8 +190,16 @@ func (s *Session) ID() int { return s.id }
 // Init returns the session's init packet.
 func (s *Session) Init() *InitPacket { return s.init }
 
+// pathMap returns the server's current path map.
+func (s *Session) pathMap() PathMap {
+	if s.server == nil {
+		return nil
+	}
+	return s.server.pathMap()
+}
+
 // Script returns the local path of the script being debugged.
-func (s *Session) Script() string { return s.paths.localPath(s.init.FileURI) }
+func (s *Session) Script() string { return s.pathMap().localPath(s.init.FileURI) }
 
 // State returns the session's current state without asking the engine.
 func (s *Session) State() State {
@@ -326,7 +336,7 @@ func (s *Session) dispatch(resp *Response) {
 
 	if s.contID != 0 && (resp.Transaction == s.contID || (untaggedError && s.pending == nil)) {
 		s.contID = 0
-		s.setStateLocked(continuationState(resp, s.contPrev, s.paths))
+		s.setStateLocked(continuationState(resp, s.contPrev, s.pathMap()))
 		return
 	}
 
@@ -380,10 +390,10 @@ func (s *Session) appendOutput(text string) {
 
 func (s *Session) addNotification(n Notification) {
 	if n.Message != nil {
-		n.Message.Filename = s.paths.localPath(n.Message.Filename)
+		n.Message.Filename = s.pathMap().localPath(n.Message.Filename)
 	}
 	if n.Breakpoint != nil && n.Breakpoint.Filename != "" {
-		n.Breakpoint.Filename = s.paths.localPath(n.Breakpoint.Filename)
+		n.Breakpoint.Filename = s.pathMap().localPath(n.Breakpoint.Filename)
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -634,6 +644,15 @@ func (s *Session) syncBreakpoints() error {
 	defer s.syncMu.Unlock()
 
 	var errs []error
+	if s.resync.Swap(false) {
+		// A path mapping changed: set every breakpoint again.
+		for serverID, engineID := range s.bpIDs {
+			delete(s.bpIDs, serverID)
+			if err := s.RemoveBreakpoint(engineID); err != nil && !errors.Is(err, errConnectionClosed) {
+				errs = append(errs, fmt.Errorf("remove breakpoint %d: %w", serverID, err))
+			}
+		}
+	}
 	want := map[int]bool{}
 	for _, bp := range s.server.Breakpoints() {
 		want[bp.ID] = true
@@ -672,7 +691,7 @@ func (s *Session) SetBreakpointSpec(bp Breakpoint) (int, error) {
 	var data []byte
 	switch bp.typeName() {
 	case BreakpointLine, BreakpointConditional:
-		args = append(args, "-f", s.paths.engineURI(bp.File), "-n", strconv.Itoa(bp.Line))
+		args = append(args, "-f", s.pathMap().engineURI(bp.File), "-n", strconv.Itoa(bp.Line))
 		if bp.typeName() == BreakpointConditional {
 			data = []byte(bp.Condition)
 		}
@@ -712,7 +731,7 @@ func (s *Session) ListBreakpoints() ([]BreakpointInfo, error) {
 	}
 	for i, bp := range resp.Breakpoints {
 		if bp.Filename != "" {
-			resp.Breakpoints[i].Filename = s.paths.localPath(bp.Filename)
+			resp.Breakpoints[i].Filename = s.pathMap().localPath(bp.Filename)
 		}
 	}
 	return resp.Breakpoints, nil
@@ -737,7 +756,7 @@ func (s *Session) GetStack() ([]StackFrame, error) {
 		return nil, err
 	}
 	for i := range resp.Stack {
-		resp.Stack[i].Filename = s.paths.localPath(resp.Stack[i].Filename)
+		resp.Stack[i].Filename = s.pathMap().localPath(resp.Stack[i].Filename)
 	}
 	return resp.Stack, nil
 }
@@ -881,7 +900,7 @@ func (s *Session) GetStackFrame(depth int) (StackFrame, error) {
 		return StackFrame{}, fmt.Errorf("stack_get: no frame at depth %d", depth)
 	}
 	frame := resp.Stack[0]
-	frame.Filename = s.paths.localPath(frame.Filename)
+	frame.Filename = s.pathMap().localPath(frame.Filename)
 	return frame, nil
 }
 
@@ -896,7 +915,7 @@ func (s *Session) TypeMap() ([]TypeMapEntry, error) {
 
 // GetSource returns source code of a local path
 func (s *Session) GetSource(file string, begin, end int) (string, error) {
-	args := []string{"-f", s.paths.engineURI(file)}
+	args := []string{"-f", s.pathMap().engineURI(file)}
 	if begin > 0 {
 		args = append(args, "-b", strconv.Itoa(begin))
 	}

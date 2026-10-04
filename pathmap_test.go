@@ -269,3 +269,91 @@ func TestStackFrameFacet(t *testing.T) {
 		t.Errorf("GetStack = %+v, %v; want facets mapped, skipped", stack, err)
 	}
 }
+
+// Adding a mapping applies to a connected session at once: paths from the
+// engine are translated, and breakpoints are set again with their new path.
+func TestAddPathMapping(t *testing.T) {
+	srv := newTestServer(t, Config{})
+	if _, err := srv.AddBreakpoint(Breakpoint{File: "/home/me/app/basic.php", Line: lineAddBody}); err != nil {
+		t.Fatal(err)
+	}
+	e := dialFakeEngine(t, srv, fixture(t, "init"), standardHandlers())
+	sess := waitSession(t, srv)
+	if got := e.LastCommand("breakpoint_set").Args["f"]; got != "file:///home/me/app/basic.php" {
+		t.Fatalf("breakpoint before mapping sent for %q", got)
+	}
+	if sess.Script() != "/app/basic.php" {
+		t.Fatalf("Script() before mapping = %q", sess.Script())
+	}
+	e.ClearReceived()
+
+	if err := srv.AddPathMapping(PathMapping{Local: "/home/me/app", Remote: "/app"}); err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"breakpoint_remove -d 42420001", "breakpoint_set -t line -f " + fixtureScriptURI + " -n 24"}
+	if got := breakpointCommands(e); strings.Join(got, "\n") != strings.Join(want, "\n") {
+		t.Errorf("after mapping, engine got\n%s\nwant\n%s", strings.Join(got, "\n"), strings.Join(want, "\n"))
+	}
+	if sess.Script() != filepath.FromSlash("/home/me/app/basic.php") {
+		t.Errorf("Script() after mapping = %q", sess.Script())
+	}
+	st, err := sess.Continue(context.Background(), ContinueRun, time.Second)
+	if err != nil || st.File != filepath.FromSlash("/home/me/app/basic.php") {
+		t.Errorf("stopped at %q, %v", st.File, err)
+	}
+
+	// A mapping for the same local directory replaces the old one.
+	if err := srv.AddPathMapping(PathMapping{Local: "/home/me/app/", Remote: "/srv/app"}); err != nil {
+		t.Fatal(err)
+	}
+	if got := srv.PathMap(); len(got) != 1 || got[0].Remote != "/srv/app" {
+		t.Errorf("PathMap() = %+v, want one mapping to /srv/app", got)
+	}
+	for _, bad := range []PathMapping{{Local: "/a"}, {Remote: "/b"}} {
+		if err := srv.AddPathMapping(bad); err == nil {
+			t.Errorf("AddPathMapping(%+v) succeeded", bad)
+		}
+	}
+}
+
+// A running session sets its breakpoints again on its next Continue.
+func TestAddPathMappingWhileRunning(t *testing.T) {
+	release := make(chan struct{})
+	handlers := standardHandlers()
+	handlers["run"] = func(e *fakeEngine, cmd fakeCommand) []string {
+		<-release
+		return []string{e.withTransaction(e.fixture("run_break"), cmd)}
+	}
+	srv := newTestServer(t, Config{})
+	if _, err := srv.AddBreakpoint(Breakpoint{File: "/home/me/app/basic.php", Line: lineAddBody}); err != nil {
+		t.Fatal(err)
+	}
+	e := dialFakeEngine(t, srv, fixture(t, "init"), handlers)
+	sess := waitSession(t, srv)
+	if st, _ := sess.Continue(context.Background(), ContinueRun, 0); st.Status != StatusRunning {
+		t.Fatalf("State = %+v, want running", st)
+	}
+	e.ClearReceived()
+
+	if err := srv.AddPathMapping(PathMapping{Local: "/home/me/app", Remote: "/app"}); err != nil {
+		t.Fatal(err)
+	}
+	if got := breakpointCommands(e); len(got) != 0 {
+		t.Fatalf("breakpoint commands sent to a running session: %q", got)
+	}
+	close(release)
+	if _, err := sess.Wait(context.Background(), time.Second); err != nil {
+		t.Fatal(err)
+	}
+	e.Handle("run", reply("run_stopping"))
+	if _, err := sess.Continue(context.Background(), ContinueRun, time.Second); err != nil {
+		t.Fatal(err)
+	}
+	var names []string
+	for _, cmd := range e.Received() {
+		names = append(names, cmd.Name)
+	}
+	if want := "run breakpoint_remove breakpoint_set run"; strings.Join(names, " ") != want {
+		t.Errorf("commands = %q, want %q", strings.Join(names, " "), want)
+	}
+}

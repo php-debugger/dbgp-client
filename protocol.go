@@ -9,7 +9,6 @@ import (
 	"io"
 	"net/url"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"unicode"
 )
@@ -469,33 +468,4 @@ func MakeFileURI(path string) string {
 	}
 
 	return (&url.URL{Scheme: "file", Path: "/" + slashed}).String()
-}
-
-// ParseBreakpointSpec parses "file.php:42" or "file.php:42,55,60"
-func ParseBreakpointSpec(spec string) (file string, lines []int, err error) {
-	sep := strings.LastIndex(spec, ":")
-	if sep <= 0 || sep == len(spec)-1 {
-		return "", nil, fmt.Errorf("invalid breakpoint spec: %s (expected file:line)", spec)
-	}
-
-	file = spec[:sep]
-	linePart := spec[sep+1:]
-	for _, r := range linePart {
-		if (r < '0' || r > '9') && r != ',' {
-			return "", nil, fmt.Errorf("invalid breakpoint spec: %s (expected file:line)", spec)
-		}
-	}
-
-	lineStrs := strings.Split(linePart, ",")
-	lines = make([]int, 0, len(lineStrs))
-
-	for _, ls := range lineStrs {
-		l, err := strconv.Atoi(strings.TrimSpace(ls))
-		if err != nil {
-			return "", nil, fmt.Errorf("invalid line number: %s", ls)
-		}
-		lines = append(lines, l)
-	}
-
-	return file, lines, nil
 }

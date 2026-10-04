@@ -5,7 +5,7 @@ Code imported from `cli/dbgp` in https://github.com/php-debugger/php-debugger/pu
 
 ## Usage
 
-A `Server` listens for [PHP Debugger](https://php-debugger.dev) or Xdebug connections. Each PHP request or script run becomes a `Session`, which waits at the start of the script until it is continued.
+A `Server` listens for [PHP Debugger](https://php-debugger.dev) or Xdebug connections. Each PHP request or script run becomes a `Session`, which waits at the start of the script until it is continued. `NewServer` creates a server that is not listening yet: until `StartListening`, its port is closed, so PHP's connection is refused at once and scripts run undebugged at full speed. `StopListening` refuses new connections again without affecting connected sessions; `Listen` is `NewServer` plus `StartListening`. `AddPathMapping` adds a path mapping at any time; connected sessions use it at once.
 
 ```go
 srv, err := dbgp.Listen(dbgp.Config{
@@ -29,6 +29,17 @@ if st.Status == dbgp.StatusBreak {
 out, next, _ := sess.Output(0)      // program output, read incrementally
 notes, _ := sess.Notifications(0)   // PHP warnings and other notifications
 ```
+
+## Command-line debugger
+
+`cmd/dbgp` is an interactive debugger built on the library:
+
+```sh
+go install github.com/php-debugger/dbgp-client/cmd/dbgp@latest
+dbgp -break src/Controller/HomeController.php:25
+```
+
+Then start PHP with debugging enabled (e.g. `php -dxdebug.mode=debug -dxdebug.start_with_request=yes app.php`). Sessions are announced as they connect, and commands that need one wait for it, as `run` and the step commands wait for the script to stop (Ctrl-C cancels a wait). It listens from the start; `unlisten` refuses new PHP connections, so scripts run undebugged, and `listen` accepts them again. `map LOCAL=REMOTE` adds a path mapping while debugging (also applied to connected sessions) and `maps` lists them. Type `help` for commands such as `run`, `next`, `step`, `stack`, `vars`, `print $user["name"]`, `eval`, `output` and `notes`. On a terminal it has line editing, tab completion and history (kept in `~/.dbgp_history`; change it with `-history`, or pass `-history ""` to disable it). Other options: `-addr`, `-idekey`, `-map LOCAL=REMOTE` for PHP in a container or on a server, and `-break FILE:LINE`. Commands can also be piped in on stdin.
 
 ## Testing
 

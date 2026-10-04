@@ -70,14 +70,20 @@ func (bp Breakpoint) typeName() string {
 	return bp.Type
 }
 
-// Server accepts engine connections and manages their sessions.
+// Server accepts engine connections and manages their sessions. It only
+// accepts them while listening: otherwise its port is closed, so the
+// engine's connection is refused at once and the script runs undebugged.
 type Server struct {
-	cfg      Config
-	paths    PathMap
-	listener net.Listener
-	done     chan struct{} // closed when the accept loop exits
+	cfg Config
+
+	// pathsMu guards paths, which is replaced, never changed in place.
+	pathsMu sync.RWMutex
+	paths   PathMap
 
 	mu          sync.Mutex
+	addr        string       // where to listen; the bound address after the first start
+	listener    net.Listener // nil while not listening
+	acceptDone  chan struct{}
 	closed      bool
 	handshakes  map[net.Conn]struct{}
 	nextID      int
@@ -88,8 +94,20 @@ type Server struct {
 	breakpoints []Breakpoint
 }
 
-// Listen starts a server that accepts engine connections.
+// Listen creates a server and starts listening for engine connections.
 func Listen(cfg Config) (*Server, error) {
+	s, err := NewServer(cfg)
+	if err != nil {
+		return nil, err
+	}
+	if err := s.StartListening(); err != nil {
+		return nil, err
+	}
+	return s, nil
+}
+
+// NewServer creates a server that is not listening yet; see StartListening.
+func NewServer(cfg Config) (*Server, error) {
 	if cfg.Addr == "" {
 		cfg.Addr = DefaultAddr
 	}
@@ -100,38 +118,79 @@ func Listen(cfg Config) (*Server, error) {
 	if err != nil {
 		return nil, err
 	}
-	listener, err := net.Listen("tcp", cfg.Addr)
-	if err != nil {
-		return nil, fmt.Errorf("listen on %s: %w", cfg.Addr, err)
-	}
-	s := &Server{
+	return &Server{
 		cfg:        cfg,
 		paths:      paths,
-		listener:   listener,
-		done:       make(chan struct{}),
+		addr:       cfg.Addr,
 		handshakes: map[net.Conn]struct{}{},
 		arrived:    make(chan struct{}),
+	}, nil
+}
+
+// StartListening starts accepting engine connections. It does nothing if
+// the server is already listening. After the first start the server keeps
+// its port, so restarting reuses it even when Config.Addr asked for port 0.
+func (s *Server) StartListening() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed {
+		return ErrServerClosed
 	}
-	go s.acceptLoop()
-	return s, nil
+	if s.listener != nil {
+		return nil
+	}
+	listener, err := net.Listen("tcp", s.addr)
+	if err != nil {
+		return fmt.Errorf("listen on %s: %w", s.addr, err)
+	}
+	s.addr = listener.Addr().String()
+	s.listener = listener
+	s.acceptDone = make(chan struct{})
+	go s.acceptLoop(listener, s.acceptDone)
+	return nil
 }
 
-// Addr returns the address the server is listening on.
+// StopListening stops accepting engine connections: new ones are refused.
+// Sessions already connected are not affected.
+func (s *Server) StopListening() error {
+	s.mu.Lock()
+	listener, done := s.listener, s.acceptDone
+	s.listener = nil
+	s.mu.Unlock()
+	if listener == nil {
+		return nil
+	}
+	err := listener.Close()
+	<-done
+	return err
+}
+
+// Listening reports whether the server is accepting engine connections.
+func (s *Server) Listening() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.listener != nil
+}
+
+// Addr returns the address the server listens on: the bound address once
+// it has listened, Config.Addr before.
 func (s *Server) Addr() string {
-	return s.listener.Addr().String()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.addr
 }
 
-// Port returns the port the server is listening on.
+// Port returns the port the server listens on.
 func (s *Server) Port() int {
 	_, port, _ := net.SplitHostPort(s.Addr())
 	p, _ := strconv.Atoi(port)
 	return p
 }
 
-func (s *Server) acceptLoop() {
-	defer close(s.done)
+func (s *Server) acceptLoop(listener net.Listener, done chan struct{}) {
+	defer close(done)
 	for {
-		conn, err := s.listener.Accept()
+		conn, err := listener.Accept()
 		if err != nil {
 			var ne net.Error
 			if errors.As(err, &ne) && ne.Timeout() {
@@ -188,7 +247,7 @@ func (s *Server) handshake(conn net.Conn) {
 	s.mu.Unlock()
 
 	sess := newSession(id, s, conn, reader, init)
-	sess.setup(s.cfg, s.paths)
+	sess.setup(s.cfg, s.pathMap())
 	// Failed breakpoints are retried, and reported, by the first Continue.
 	_ = sess.syncBreakpoints()
 
@@ -236,6 +295,45 @@ func (sess *Session) setup(cfg Config, paths PathMap) {
 	sess.mu.Lock()
 	sess.setupErr = errors.Join(errs...)
 	sess.mu.Unlock()
+}
+
+// pathMap returns the current path map.
+func (s *Server) pathMap() PathMap {
+	s.pathsMu.RLock()
+	defer s.pathsMu.RUnlock()
+	return s.paths
+}
+
+// PathMap returns the current path mappings.
+func (s *Server) PathMap() []PathMapping {
+	return append([]PathMapping(nil), s.pathMap()...)
+}
+
+// AddPathMapping adds a mapping, or replaces the one for the same local
+// directory. It applies to every session at once: paths from the engine are
+// translated with it from now on, and breakpoints already set are set again
+// with their new paths, now in stopped sessions and on the next Continue in
+// running ones. The returned error lists sessions that rejected a breakpoint.
+func (s *Server) AddPathMapping(m PathMapping) error {
+	added, err := newPathMap([]PathMapping{m})
+	if err != nil {
+		return err
+	}
+	m = added[0]
+	s.pathsMu.Lock()
+	paths := make(PathMap, 0, len(s.paths)+1)
+	for _, old := range s.paths {
+		if old.Local != m.Local {
+			paths = append(paths, old)
+		}
+	}
+	s.paths = append(paths, m)
+	s.pathsMu.Unlock()
+
+	for _, sess := range s.Sessions() {
+		sess.resync.Store(true)
+	}
+	return s.syncStoppedSessions()
 }
 
 // Sessions returns all sessions in connection order, including ended ones.
@@ -362,7 +460,7 @@ func (bp Breakpoint) validate() error {
 	return nil
 }
 
-// Close stops accepting connections and closes every session.
+// Close stops listening and closes every session.
 func (s *Server) Close() error {
 	s.mu.Lock()
 	if s.closed {
@@ -378,10 +476,9 @@ func (s *Server) Close() error {
 	sessions := append([]*Session(nil), s.sessions...)
 	s.mu.Unlock()
 
-	err := s.listener.Close()
+	err := s.StopListening()
 	for _, sess := range sessions {
 		_ = sess.Close()
 	}
-	<-s.done
 	return err
 }

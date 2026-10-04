@@ -60,7 +60,9 @@ func requireDebugEngine(t *testing.T) {
 		skip("php not found in PATH")
 	}
 	loaded := `exit(extension_loaded("php_debugger") || extension_loaded("xdebug") ? 0 : 1);`
-	if err := exec.Command(php, "-r", loaded).Run(); err != nil {
+	// Debugging off: with it on, php would try to connect to whatever
+	// listens on the default port and wait for it.
+	if err := exec.Command(php, "-dxdebug.mode=off", "-r", loaded).Run(); err != nil {
 		skip("php has neither PHP Debugger nor Xdebug loaded")
 	}
 }
