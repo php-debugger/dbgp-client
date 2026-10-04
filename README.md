@@ -41,6 +41,18 @@ dbgp -break src/Controller/HomeController.php:25
 
 Then start PHP with debugging enabled (e.g. `php -dxdebug.mode=debug -dxdebug.start_with_request=yes app.php`). Sessions are announced as they connect, and commands that need one wait for it, as `run` and the step commands wait for the script to stop (Ctrl-C cancels a wait). It listens from the start; `unlisten` refuses new PHP connections, so scripts run undebugged, and `listen` accepts them again. `map LOCAL=REMOTE` adds a path mapping while debugging (also applied to connected sessions) and `maps` lists them. Type `help` for commands such as `run`, `next`, `step`, `stack`, `vars`, `print $user["name"]`, `eval`, `output` and `notes`. On a terminal it has line editing, tab completion and history (kept in `~/.dbgp_history`; change it with `-history`, or pass `-history ""` to disable it). Other options: `-addr`, `-idekey`, `-map LOCAL=REMOTE` for PHP in a container or on a server, and `-break FILE:LINE`. Commands can also be piped in on stdin.
 
+## MCP server for AI agents
+
+`dbgp mcp` runs the debugger as an [MCP](https://modelcontextprotocol.io) server on stdin and stdout, so an AI agent can debug PHP. To add it to Claude Code:
+
+```sh
+claude mcp add dbgp -- dbgp mcp
+```
+
+Unlike the interactive mode, it does not listen for PHP connections until the agent calls the `listen` tool, so PHP runs at full speed until there is something to debug; `-listen` starts listening right away. `-addr`, `-idekey` and `-map LOCAL=REMOTE` work as in the interactive mode.
+
+Tools so far: `status` (listening state, sessions, breakpoints and path mappings), `listen` and `unlisten`. Debugging tools follow.
+
 ## Testing
 
 ```sh
