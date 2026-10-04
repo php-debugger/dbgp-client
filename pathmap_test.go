@@ -330,10 +330,11 @@ func TestAddPathMappingWhileRunning(t *testing.T) {
 	}
 	e := dialFakeEngine(t, srv, fixture(t, "init"), handlers)
 	sess := waitSession(t, srv)
+	// Clear before run: the engine records it asynchronously.
+	e.ClearReceived()
 	if st, _ := sess.Continue(context.Background(), ContinueRun, 0); st.Status != StatusRunning {
 		t.Fatalf("State = %+v, want running", st)
 	}
-	e.ClearReceived()
 
 	if err := srv.AddPathMapping(PathMapping{Local: "/home/me/app", Remote: "/app"}); err != nil {
 		t.Fatal(err)
