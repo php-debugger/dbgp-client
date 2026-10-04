@@ -1,7 +1,8 @@
 // Command dbgp is an interactive debugger for PHP Debugger and Xdebug.
 //
 // It listens for DBGp connections from PHP and reads commands from stdin;
-// type help at the prompt for the list.
+// type help at the prompt for the list. dbgp mcp runs it as an MCP server
+// for AI agents instead.
 package main
 
 import (
@@ -24,6 +25,10 @@ func (l *listFlag) String() string     { return strings.Join(*l, ", ") }
 func (l *listFlag) Set(v string) error { *l = append(*l, v); return nil }
 
 func main() {
+	if len(os.Args) > 1 && os.Args[1] == "mcp" {
+		os.Exit(runMCP(os.Args[2:]))
+	}
+
 	addr := flag.String("addr", dbgp.DefaultAddr, "address to listen on for PHP connections")
 	idekey := flag.String("idekey", "", "accept only sessions with this IDE key")
 	history := flag.String("history", defaultHistoryFile(), "`file` to keep command history in; empty disables it")
@@ -31,9 +36,10 @@ func main() {
 	flag.Var(&maps, "map", "path mapping `LOCAL=REMOTE` for PHP in a container or on a server (repeatable)")
 	flag.Var(&breaks, "break", "breakpoint at `FILE:LINE` (repeatable)")
 	flag.Usage = func() {
-		fmt.Fprintf(flag.CommandLine.Output(), "Usage: dbgp [options]\n\n"+
+		fmt.Fprintf(flag.CommandLine.Output(), "Usage: dbgp [options]\n       dbgp mcp [options]\n\n"+
 			"Interactive debugger for PHP Debugger and Xdebug. Start PHP with debugging\n"+
-			"enabled and pointed at -addr; type help at the prompt for commands.\n\nOptions:\n")
+			"enabled and pointed at -addr; type help at the prompt for commands.\n"+
+			"dbgp mcp runs it as an MCP server for AI agents instead (dbgp mcp -h).\n\nOptions:\n")
 		flag.PrintDefaults()
 	}
 	flag.Parse()
