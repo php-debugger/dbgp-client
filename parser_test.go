@@ -283,3 +283,15 @@ func TestFormatVariable(t *testing.T) {
 		}
 	}
 }
+
+// Eval results have no fullname; their children are shown by name.
+func TestParseVariablesFallsBackToName(t *testing.T) {
+	vars := ParseVariables(fixture(t, "eval_array"))
+	var names []string
+	for _, v := range vars {
+		names = append(names, v.Name)
+	}
+	if got := strings.Join(names, ","); got != ",0,1,k" {
+		t.Errorf("names = %q, want %q", got, ",0,1,k")
+	}
+}

@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"errors"
 	"io"
+	"net"
 	"strconv"
 	"strings"
 	"testing"
@@ -369,5 +370,108 @@ func TestServerBreakpointErrors(t *testing.T) {
 	}
 	if _, err := sess.Continue(context.Background(), ContinueRun, time.Second); err == nil || !strings.Contains(err.Error(), "200") {
 		t.Errorf("Continue err = %v, want breakpoint error 200", err)
+	}
+}
+
+// dialRefused reports whether a connection to addr is refused.
+func dialRefused(addr string) bool {
+	conn, err := net.DialTimeout("tcp", addr, time.Second)
+	if err == nil {
+		_ = conn.Close()
+	}
+	return err != nil
+}
+
+func TestNewServerDoesNotListen(t *testing.T) {
+	srv, err := NewServer(Config{Addr: "127.0.0.1:0"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = srv.Close() })
+	if srv.Listening() || srv.Addr() != "127.0.0.1:0" {
+		t.Fatalf("new server: listening %v, addr %s", srv.Listening(), srv.Addr())
+	}
+	if err := srv.StartListening(); err != nil {
+		t.Fatal(err)
+	}
+	if !srv.Listening() || srv.Port() == 0 {
+		t.Fatalf("after start: listening %v, port %d", srv.Listening(), srv.Port())
+	}
+	dialFakeEngine(t, srv, fixture(t, "init"), standardHandlers())
+	waitSession(t, srv)
+}
+
+func TestStopListening(t *testing.T) {
+	srv := newTestServer(t, Config{})
+	addr := srv.Addr()
+	dialFakeEngine(t, srv, fixture(t, "init"), standardHandlers())
+	first := waitSession(t, srv)
+
+	if err := srv.StopListening(); err != nil {
+		t.Fatal(err)
+	}
+	if srv.Listening() || !dialRefused(addr) {
+		t.Fatal("still accepting connections after StopListening")
+	}
+	// The connected session is not affected.
+	if st, err := first.Status(); err != nil || st != StatusBreak {
+		t.Errorf("connected session: Status = %q, %v", st, err)
+	}
+
+	// Restarting reuses the port the server had.
+	if err := srv.StartListening(); err != nil {
+		t.Fatal(err)
+	}
+	if srv.Addr() != addr {
+		t.Errorf("restarted on %s, want %s", srv.Addr(), addr)
+	}
+	dialFakeEngine(t, srv, fixture(t, "init"), standardHandlers())
+	if second := waitSession(t, srv); second.ID() != 2 {
+		t.Errorf("session after restart has id %d, want 2", second.ID())
+	}
+}
+
+func TestStartAndStopListeningTwice(t *testing.T) {
+	srv := newTestServer(t, Config{})
+	if err := srv.StartListening(); err != nil || !srv.Listening() {
+		t.Errorf("second StartListening: %v, listening %v", err, srv.Listening())
+	}
+	for i := 0; i < 2; i++ {
+		if err := srv.StopListening(); err != nil || srv.Listening() {
+			t.Errorf("StopListening #%d: %v, listening %v", i+1, err, srv.Listening())
+		}
+	}
+}
+
+func TestRestartWhenPortTaken(t *testing.T) {
+	srv := newTestServer(t, Config{})
+	addr := srv.Addr()
+	if err := srv.StopListening(); err != nil {
+		t.Fatal(err)
+	}
+	other, err := net.Listen("tcp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := srv.StartListening(); err == nil || srv.Listening() {
+		t.Errorf("StartListening on a taken port: %v, listening %v", err, srv.Listening())
+	}
+	_ = other.Close()
+	if err := srv.StartListening(); err != nil {
+		t.Errorf("StartListening once the port is free: %v", err)
+	}
+}
+
+func TestStartListeningAfterClose(t *testing.T) {
+	srv := newTestServer(t, Config{})
+	addr := srv.Addr()
+	if err := srv.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := srv.StartListening(); !errors.Is(err, ErrServerClosed) {
+		t.Errorf("StartListening after Close: %v, want ErrServerClosed", err)
+	}
+	if !dialRefused(addr) {
+		t.Error("port still open after Close")
 	}
 }

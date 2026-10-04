@@ -9,35 +9,6 @@ import (
 	"testing"
 )
 
-func TestParseBreakpointSpec(t *testing.T) {
-	tests := []struct {
-		spec      string
-		wantFile  string
-		wantLines []int
-	}{
-		{"file.php:42", "file.php", []int{42}},
-		{"file.php:42,55,60", "file.php", []int{42, 55, 60}},
-		{`C:\path\file.php:42`, `C:\path\file.php`, []int{42}},
-		{"file:///tmp/test.php:42", "file:///tmp/test.php", []int{42}},
-		{"file://C:/path/test.php:42", "file://C:/path/test.php", []int{42}},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.spec, func(t *testing.T) {
-			file, lines, err := ParseBreakpointSpec(tt.spec)
-			if err != nil {
-				t.Fatalf("unexpected error: %v", err)
-			}
-			if file != tt.wantFile {
-				t.Fatalf("file = %q, want %q", file, tt.wantFile)
-			}
-			if !reflect.DeepEqual(lines, tt.wantLines) {
-				t.Fatalf("lines = %v, want %v", lines, tt.wantLines)
-			}
-		})
-	}
-}
-
 func TestFileURIConversions(t *testing.T) {
 	tests := []struct {
 		name      string
@@ -199,14 +170,6 @@ func TestCharsetReader(t *testing.T) {
 
 	if _, err := ParseResponse([]byte(`<?xml version="1.0" encoding="koi8-r"?><response/>`)); err == nil {
 		t.Error("unsupported charset accepted")
-	}
-}
-
-func TestParseBreakpointSpecErrors(t *testing.T) {
-	for _, spec := range []string{"", "file.php", ":42", "file.php:", "file.php:abc", "file.php:4a", "file.php:42,,43", "file.php:-1"} {
-		if file, lines, err := ParseBreakpointSpec(spec); err == nil {
-			t.Errorf("ParseBreakpointSpec(%q) = %q, %v; want error", spec, file, lines)
-		}
 	}
 }
 

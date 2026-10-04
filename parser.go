@@ -41,7 +41,7 @@ func ParseVariablesFromProperties(properties []Property) []Variable {
 	var vars []Variable
 	for _, p := range properties {
 		vars = append(vars, Variable{
-			Name:  p.FullName,
+			Name:  displayName(p),
 			Type:  p.Type,
 			Value: formatPropertyValue(p),
 			Level: 0,
@@ -49,7 +49,7 @@ func ParseVariablesFromProperties(properties []Property) []Variable {
 		// Add immediate child properties for objects/arrays
 		for _, child := range p.ChildProperties {
 			vars = append(vars, Variable{
-				Name:  child.FullName,
+				Name:  displayName(child),
 				Type:  child.Type,
 				Value: formatPropertyValue(child),
 				Level: 1,
@@ -57,6 +57,15 @@ func ParseVariablesFromProperties(properties []Property) []Variable {
 		}
 	}
 	return vars
+}
+
+// displayName is a property's full name, or its name when it has none
+// (e.g. the children of an eval result).
+func displayName(p Property) string {
+	if p.FullName != "" {
+		return p.FullName
+	}
+	return p.Name
 }
 
 // ParseAllVariables extracts all variables including nested ones
@@ -77,7 +86,7 @@ func flattenProperties(props []Property, level int) []Variable {
 	var vars []Variable
 	for _, p := range props {
 		vars = append(vars, Variable{
-			Name:  p.FullName,
+			Name:  displayName(p),
 			Type:  p.Type,
 			Value: formatPropertyValue(p),
 			Level: level,
