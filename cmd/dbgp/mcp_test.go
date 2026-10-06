@@ -83,13 +83,19 @@ func TestMCPTools(t *testing.T) {
 			t.Errorf("%s has no description", tool.Name)
 		}
 	}
-	for _, name := range []string{"status", "listen", "unlisten"} {
+	names := []string{"status", "listen", "unlisten", "add_breakpoint", "remove_breakpoint", "breakpoints", "add_path_mapping", "path_mappings"}
+	for _, name := range names {
 		if got[name] == nil {
 			t.Errorf("tool %s missing", name)
 		}
 	}
-	if len(got) != 3 {
-		t.Errorf("got %d tools, want 3", len(got))
+	if len(got) != len(names) {
+		t.Errorf("got %d tools, want %d", len(got), len(names))
+	}
+	for _, name := range []string{"status", "breakpoints", "path_mappings"} {
+		if a := got[name].Annotations; a == nil || !a.ReadOnlyHint {
+			t.Errorf("%s is not marked read-only", name)
+		}
 	}
 	if a := got["status"].Annotations; a == nil || !a.ReadOnlyHint {
 		t.Error("status is not marked read-only")
@@ -268,27 +274,186 @@ func TestMCPOutputSchemas(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, tool := range res.Tools {
-		data, _ := json.Marshal(tool.OutputSchema)
-		var schema map[string]any
-		if err := json.Unmarshal(data, &schema); err != nil {
-			t.Fatalf("%s: %v", tool.Name, err)
-		}
-		var check func(path string, s map[string]any)
-		check = func(path string, s map[string]any) {
-			props, _ := s["properties"].(map[string]any)
-			for name, p := range props {
-				prop := p.(map[string]any)
-				if d, _ := prop["description"].(string); d == "" {
-					t.Errorf("%s: %s%s has no description", tool.Name, path, name)
-				}
-				if prop["type"] != "array" && prop["items"] != nil {
-					t.Errorf("%s: %s%s has type %v, want array", tool.Name, path, name, prop["type"])
-				}
-				if items, ok := prop["items"].(map[string]any); ok {
-					check(path+name+"[].", items)
+		for kind, sch := range map[string]any{"input": tool.InputSchema, "output": tool.OutputSchema} {
+			data, _ := json.Marshal(sch)
+			var schema map[string]any
+			if err := json.Unmarshal(data, &schema); err != nil {
+				t.Fatalf("%s %s: %v", tool.Name, kind, err)
+			}
+			var check func(path string, s map[string]any)
+			check = func(path string, s map[string]any) {
+				props, _ := s["properties"].(map[string]any)
+				for name, p := range props {
+					prop := p.(map[string]any)
+					if d, _ := prop["description"].(string); d == "" {
+						t.Errorf("%s %s: %s%s has no description", tool.Name, kind, path, name)
+					}
+					if prop["type"] != "array" && prop["items"] != nil {
+						t.Errorf("%s %s: %s%s has type %v, want array", tool.Name, kind, path, name, prop["type"])
+					}
+					if items, ok := prop["items"].(map[string]any); ok {
+						check(path+name+"[].", items)
+					}
+					check(path+name+".", prop) // nested objects
 				}
 			}
+			check("", schema)
 		}
-		check("", schema)
+	}
+}
+
+// callToolError calls a tool that must fail and returns its error text.
+func callToolError(t *testing.T, cs *mcp.ClientSession, name string, args any) string {
+	t.Helper()
+	res, err := cs.CallTool(context.Background(), &mcp.CallToolParams{Name: name, Arguments: args})
+	if err != nil {
+		return err.Error() // rejected before reaching the tool, e.g. by its schema
+	}
+	if !res.IsError {
+		t.Fatalf("%s(%v) succeeded: %s", name, args, resultText(res))
+	}
+	return resultText(res)
+}
+
+func TestMCPAddBreakpoint(t *testing.T) {
+	cs, _ := newTestMCP(t)
+	abs, _ := filepath.Abs("app/a.php")
+	tests := []struct {
+		args map[string]any
+		want breakpointInfo
+	}{
+		{map[string]any{"file": "/app/a.php", "line": 12}, breakpointInfo{ID: 1, Type: "line", File: "/app/a.php", Line: 12}},
+		{map[string]any{"type": "line", "file": "app/a.php", "line": 3}, breakpointInfo{ID: 2, Type: "line", File: abs, Line: 3}},
+		{map[string]any{"file": "/app/a.php", "line": 5, "condition": "$i > 2"}, breakpointInfo{ID: 3, Type: "conditional", File: "/app/a.php", Line: 5, Condition: "$i > 2"}},
+		{map[string]any{"type": "call", "function": "add"}, breakpointInfo{ID: 4, Type: "call", Function: "add"}},
+		{map[string]any{"type": "return", "function": "add"}, breakpointInfo{ID: 5, Type: "return", Function: "add"}},
+		{map[string]any{"type": "exception", "exception": "RuntimeException"}, breakpointInfo{ID: 6, Type: "exception", Exception: "RuntimeException"}},
+	}
+	var want []breakpointInfo
+	for _, tt := range tests {
+		var out addBreakpointOutput
+		callTool(t, cs, "add_breakpoint", tt.args, &out)
+		if out.Breakpoint != tt.want || out.Warning != "" {
+			t.Errorf("add_breakpoint(%v) = %+v, want %+v", tt.args, out, tt.want)
+		}
+		want = append(want, tt.want)
+	}
+
+	for _, tt := range []struct {
+		args map[string]any
+		want string
+	}{
+		{map[string]any{"file": "/app/a.php"}, "needs a file and line"},
+		{map[string]any{"line": 4}, "needs a file and line"},
+		{map[string]any{"type": "call"}, "needs a function"},
+		{map[string]any{"type": "exception"}, "needs an exception class"},
+		{map[string]any{"type": "conditional", "file": "/app/a.php", "line": 3}, "type"},
+		{map[string]any{"type": "watch", "file": "/app/a.php", "line": 3}, "type"},
+	} {
+		if msg := callToolError(t, cs, "add_breakpoint", tt.args); !strings.Contains(msg, tt.want) {
+			t.Errorf("add_breakpoint(%v) error = %q, want it to mention %q", tt.args, msg, tt.want)
+		}
+	}
+
+	var list breakpointListOutput
+	callTool(t, cs, "breakpoints", nil, &list)
+	if fmt.Sprint(list.Breakpoints) != fmt.Sprint(want) {
+		t.Errorf("breakpoints = %+v, want %+v", list.Breakpoints, want)
+	}
+}
+
+func TestMCPRemoveBreakpoint(t *testing.T) {
+	cs, _ := newTestMCP(t)
+	for _, line := range []int{1, 2} {
+		callTool(t, cs, "add_breakpoint", map[string]any{"file": "/app/a.php", "line": line}, &addBreakpointOutput{})
+	}
+	var out breakpointsOutput
+	callTool(t, cs, "remove_breakpoint", map[string]any{"id": 1}, &out)
+	if len(out.Breakpoints) != 1 || out.Breakpoints[0].ID != 2 || out.Warning != "" {
+		t.Errorf("remove_breakpoint = %+v, want only breakpoint 2", out)
+	}
+	if msg := callToolError(t, cs, "remove_breakpoint", map[string]any{"id": 1}); !strings.Contains(msg, "no breakpoint 1") {
+		t.Errorf("removing it again: %q", msg)
+	}
+	callTool(t, cs, "remove_breakpoint", map[string]any{"id": 2}, &out)
+	if out.Breakpoints == nil || len(out.Breakpoints) != 0 {
+		t.Errorf("after removing all: %+v, want an empty list", out.Breakpoints)
+	}
+}
+
+func TestMCPPathMappings(t *testing.T) {
+	cs, _ := newTestMCP(t)
+	abs, _ := filepath.Abs("testdata/php")
+	var listed pathMappingListOutput
+	callTool(t, cs, "path_mappings", nil, &listed)
+	if listed.PathMappings == nil || len(listed.PathMappings) != 0 {
+		t.Errorf("initial path_mappings = %+v, want an empty list", listed.PathMappings)
+	}
+	var out pathMappingsOutput
+	callTool(t, cs, "add_path_mapping", map[string]any{"local": "/home/me/app", "remote": "/var/www/html"}, &out)
+	callTool(t, cs, "add_path_mapping", map[string]any{"local": "testdata/php", "remote": "/srv/php"}, &out)
+	callTool(t, cs, "add_path_mapping", map[string]any{"local": "/home/me/app/", "remote": "/app"}, &out)
+	want := []pathMapping{{Local: abs, Remote: "/srv/php"}, {Local: "/home/me/app", Remote: "/app"}}
+	if fmt.Sprint(out.PathMappings) != fmt.Sprint(want) || out.Warning != "" {
+		t.Errorf("add_path_mapping = %+v, want %+v", out, want)
+	}
+	callTool(t, cs, "path_mappings", nil, &listed)
+	if fmt.Sprint(listed.PathMappings) != fmt.Sprint(want) {
+		t.Errorf("path_mappings = %+v, want %+v", listed.PathMappings, want)
+	}
+	for _, args := range []map[string]any{{"local": "/a"}, {"remote": "/b"}, {"local": "", "remote": "/b"}} {
+		callToolError(t, cs, "add_path_mapping", args)
+	}
+}
+
+// Breakpoints added and removed over MCP reach a connected PHP session.
+func TestMCPBreakpointsReachSession(t *testing.T) {
+	requireEngine(t)
+	cs, srv := newTestMCP(t)
+	script, err := filepath.Abs("../../testdata/php/basic.php")
+	if err != nil {
+		t.Fatal(err)
+	}
+	callTool(t, cs, "add_breakpoint", map[string]any{"file": script, "line": 24}, &addBreakpointOutput{})
+	callTool(t, cs, "listen", nil, &listenOutput{})
+	php := exec.Command("php", "-dxdebug.mode=debug", "-dxdebug.start_with_request=yes",
+		fmt.Sprintf("-dxdebug.client_port=%d", srv.Port()), "-dxdebug.client_host=127.0.0.1", "-ddisplay_errors=0", script)
+	if err := php.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = php.Process.Kill(); _ = php.Wait() })
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	sess, err := srv.WaitForSession(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	engineLines := func() []int {
+		t.Helper()
+		bps, err := sess.ListBreakpoints()
+		if err != nil {
+			t.Fatal(err)
+		}
+		var lines []int
+		for _, bp := range bps {
+			if bp.Filename != script {
+				t.Errorf("engine breakpoint in %q, want %q", bp.Filename, script)
+			}
+			lines = append(lines, bp.Lineno)
+		}
+		return lines
+	}
+	if got := engineLines(); fmt.Sprint(got) != "[24]" {
+		t.Errorf("engine breakpoints on connect = %v, want [24]", got)
+	}
+	var added addBreakpointOutput
+	callTool(t, cs, "add_breakpoint", map[string]any{"file": script, "line": 39, "condition": "$i == 3"}, &added)
+	if got := engineLines(); fmt.Sprint(got) != "[24 39]" {
+		t.Errorf("engine breakpoints after add = %v, want [24 39]", got)
+	}
+	callTool(t, cs, "remove_breakpoint", map[string]any{"id": 1}, &breakpointsOutput{})
+	if got := engineLines(); fmt.Sprint(got) != "[39]" {
+		t.Errorf("engine breakpoints after remove = %v, want [39]", got)
 	}
 }

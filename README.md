@@ -51,7 +51,7 @@ claude mcp add dbgp -- dbgp mcp
 
 Unlike the interactive mode, it does not listen for PHP connections until the agent calls the `listen` tool, so PHP runs at full speed until there is something to debug; `-listen` starts listening right away. `-addr`, `-idekey` and `-map LOCAL=REMOTE` work as in the interactive mode.
 
-Tools so far: `status` (listening state, sessions, breakpoints and path mappings), `listen` and `unlisten`. Debugging tools follow.
+Tools so far: `status` (listening state, sessions, breakpoints and path mappings), `listen` and `unlisten`; `add_breakpoint`, `remove_breakpoint` and `breakpoints`; `add_path_mapping` and `path_mappings`. Debugging tools follow.
 
 ## Testing
 
