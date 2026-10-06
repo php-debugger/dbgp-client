@@ -40,6 +40,16 @@ and the listen tool's address is localhost:9003, dbgp's default, those
 defaults already reach dbgp and neither needs to be set. Otherwise set them to
 the port from that address and a host PHP can reach this machine on.`
 
+// noCodeInstructions are added to mcpInstructions when dbgp mcp runs with
+// -no-eval, so agents know the code tools were left out on purpose.
+const noCodeInstructions = `
+
+The user started dbgp with -no-eval, which turns off the eval and set_variable
+tools, so you cannot evaluate PHP or change variables in the debugged script.
+This is the user's choice, not a missing feature or an outdated build: do not
+suggest rebuilding or restarting dbgp to get them. Read values with variables,
+variable and variable_value instead, and work out results from them.`
+
 // runMCP runs dbgp as an MCP server on stdin and stdout until the client
 // disconnects. stdout carries the protocol, so diagnostics go to stderr.
 func runMCP(args []string) int {
@@ -47,6 +57,7 @@ func runMCP(args []string) int {
 	addr := fs.String("addr", dbgp.DefaultAddr, "address to listen on for PHP connections")
 	idekey := fs.String("idekey", "", "accept only sessions with this IDE key")
 	listen := fs.Bool("listen", false, "listen for PHP connections from the start, instead of waiting for the listen tool")
+	noEval := fs.Bool("no-eval", false, "leave out the eval and set_variable tools, which run PHP code in the debugged script")
 	var maps listFlag
 	fs.Var(&maps, "map", "path mapping `LOCAL=REMOTE` for PHP in a container or on a server (repeatable)")
 	fs.Usage = func() {
@@ -82,17 +93,22 @@ func runMCP(args []string) int {
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	if err := newMCPServer(srv).Run(ctx, &mcp.StdioTransport{}); err != nil && ctx.Err() == nil {
+	if err := newMCPServer(srv, !*noEval).Run(ctx, &mcp.StdioTransport{}); err != nil && ctx.Err() == nil {
 		fmt.Fprintln(os.Stderr, err)
 		return 1
 	}
 	return 0
 }
 
-// newMCPServer returns an MCP server whose tools drive srv.
-func newMCPServer(srv *dbgp.Server) *mcp.Server {
+// newMCPServer returns an MCP server whose tools drive srv. allowCode adds
+// the tools that run PHP code in the debugged script.
+func newMCPServer(srv *dbgp.Server, allowCode bool) *mcp.Server {
+	instructions := mcpInstructions
+	if !allowCode {
+		instructions += noCodeInstructions
+	}
 	server := mcp.NewServer(&mcp.Implementation{Name: "dbgp", Title: "PHP debugger", Version: version},
-		&mcp.ServerOptions{Instructions: mcpInstructions})
+		&mcp.ServerOptions{Instructions: instructions})
 	t := &tools{srv: srv}
 
 	mcp.AddTool(server, &mcp.Tool{
@@ -154,6 +170,9 @@ func newMCPServer(srv *dbgp.Server) *mcp.Server {
 	t.addSessionTools(server)
 	t.addInspectTools(server)
 	t.addOutputTools(server)
+	if allowCode {
+		t.addCodeTools(server)
+	}
 	return server
 }
 
