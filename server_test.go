@@ -577,3 +577,52 @@ func TestListenFailsWhenEveryAddressIsTaken(t *testing.T) {
 		t.Errorf("StartListening with every address taken: %v, listening %v", err, srv.Listening())
 	}
 }
+
+// Once a script has finished, breakpoint changes are not sent to its
+// session: the engine refuses them while stopping or stopped, which happens
+// just before the connection closes.
+func TestBreakpointChangesSkipFinishedSessions(t *testing.T) {
+	srv := newTestServer(t, Config{})
+	handlers := standardHandlers()
+	handlers["run"] = reply("run_stopping")
+	e := dialFakeEngine(t, srv, fixture(t, "init"), handlers)
+	sess := waitSession(t, srv)
+	bp, err := srv.AddBreakpoint(Breakpoint{File: "/app/basic.php", Line: 24})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st, err := sess.Continue(context.Background(), ContinueRun, time.Second); err != nil || st.Status != StatusStopping {
+		t.Fatalf("Continue = %+v, %v; want stopping", st, err)
+	}
+
+	change := func(when string) {
+		t.Helper()
+		e.ClearReceived()
+		added, err := srv.AddBreakpoint(Breakpoint{File: "/app/basic.php", Line: 30})
+		if err != nil {
+			t.Errorf("%s: AddBreakpoint: %v", when, err)
+		}
+		if err := srv.RemoveBreakpoint(added.ID); err != nil {
+			t.Errorf("%s: RemoveBreakpoint: %v", when, err)
+		}
+		if err := srv.AddPathMapping(PathMapping{Local: "/home/me/app", Remote: "/app"}); err != nil {
+			t.Errorf("%s: AddPathMapping: %v", when, err)
+		}
+		if got := breakpointCommands(e); len(got) != 0 {
+			t.Errorf("%s: sent %q", when, got)
+		}
+	}
+	change("stopping")
+	// The engine reports stopped while the connection is still open.
+	e.Handle("status", reply("stop"))
+	if st, err := sess.Status(); err != nil || st != StatusStopped {
+		t.Fatalf("Status = %q, %v; want stopped", st, err)
+	}
+	if st := sess.State(); st.Closed || st.Status != StatusStopped {
+		t.Fatalf("State = %+v, want stopped and still connected", st)
+	}
+	change("stopped")
+	if err := srv.RemoveBreakpoint(bp.ID); err != nil {
+		t.Errorf("removing the first breakpoint: %v", err)
+	}
+}

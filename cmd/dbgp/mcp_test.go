@@ -7,6 +7,7 @@ import (
 	"net"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -61,6 +62,10 @@ func callTool(t *testing.T, cs *mcp.ClientSession, name string, args any, out an
 	if err != nil {
 		t.Fatal(err)
 	}
+	// Clear out first: decoding into a used value keeps fields and list
+	// elements the new result leaves out.
+	v := reflect.ValueOf(out).Elem()
+	v.Set(reflect.Zero(v.Type()))
 	if err := json.Unmarshal(data, out); err != nil {
 		t.Fatalf("%s: decode %s: %v", name, data, err)
 	}
@@ -90,7 +95,8 @@ func TestMCPTools(t *testing.T) {
 		}
 	}
 	names := []string{"status", "listen", "unlisten", "add_breakpoint", "remove_breakpoint", "breakpoints",
-		"add_path_mapping", "path_mappings", "sessions", "wait_for_session", "continue", "wait_for_stop", "stop", "detach"}
+		"add_path_mapping", "path_mappings", "sessions", "wait_for_session", "continue", "wait_for_stop", "stop", "detach",
+		"stack", "variables", "variable", "variable_value"}
 	for _, name := range names {
 		if got[name] == nil {
 			t.Errorf("tool %s missing", name)
@@ -99,7 +105,8 @@ func TestMCPTools(t *testing.T) {
 	if len(got) != len(names) {
 		t.Errorf("got %d tools, want %d", len(got), len(names))
 	}
-	for _, name := range []string{"status", "breakpoints", "path_mappings", "sessions", "wait_for_session", "wait_for_stop"} {
+	for _, name := range []string{"status", "breakpoints", "path_mappings", "sessions", "wait_for_session", "wait_for_stop",
+		"stack", "variables", "variable", "variable_value"} {
 		if a := got[name].Annotations; a == nil || !a.ReadOnlyHint {
 			t.Errorf("%s is not marked read-only", name)
 		}

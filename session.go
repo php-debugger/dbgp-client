@@ -634,10 +634,18 @@ func (s *Session) Wait(ctx context.Context, wait time.Duration) (State, error) {
 	}
 }
 
+// finished reports whether the script has finished, so breakpoints no
+// longer matter: the engine refuses breakpoint commands once it is stopping
+// or stopped, and a closed session has none.
+func (s *Session) finished() bool {
+	st := s.State()
+	return st.Closed || st.Status == StatusStopping || st.Status == StatusStopped
+}
+
 // syncBreakpoints makes the engine's breakpoints match the server's: it
 // sets breakpoints added since the last sync and removes deleted ones.
 func (s *Session) syncBreakpoints() error {
-	if s.server == nil {
+	if s.server == nil || s.finished() {
 		return nil
 	}
 	s.syncMu.Lock()
@@ -737,10 +745,16 @@ func (s *Session) ListBreakpoints() ([]BreakpointInfo, error) {
 	return resp.Breakpoints, nil
 }
 
-// Stop ends the script. The engine closes the connection afterwards.
+// Stop ends the script and the session. Stopped mid-script, the engine
+// waits for the IDE to close the connection before PHP exits, so Stop closes
+// it, and returns once the session has ended.
 func (s *Session) Stop() error {
-	_, err := s.sendCommand("stop", nil, nil)
-	return err
+	if _, err := s.sendCommand("stop", nil, nil); err != nil {
+		return err
+	}
+	_ = s.conn.Close()
+	<-s.closed
+	return nil
 }
 
 // Detach stops debugging and lets the script run to completion.

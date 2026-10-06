@@ -792,16 +792,22 @@ func TestDisconnectEndsContinuation(t *testing.T) {
 	}
 }
 
-func TestStopUpdatesState(t *testing.T) {
-	s, _ := startFakeSession(t, standardHandlers())
+// Stopped mid-script, the engine waits for the IDE to close the connection
+// (the fake engine never closes it), so Stop closes it and returns once the
+// session has ended.
+func TestStopEndsTheSession(t *testing.T) {
+	s, e := startFakeSession(t, standardHandlers())
 	if _, err := s.Continue(context.Background(), ContinueRun, time.Second); err != nil {
 		t.Fatal(err)
 	}
 	if err := s.Stop(); err != nil {
 		t.Fatal(err)
 	}
-	if st := s.State(); st.Status != StatusStopped || st.File != "" {
-		t.Errorf("State after stop = %+v, want stopped with no location", st)
+	if st := s.State(); st.Status != StatusStopped || !st.Closed || st.File != "" {
+		t.Errorf("State after stop = %+v, want stopped and closed, with no location", st)
+	}
+	if !e.WaitClosed(3 * time.Second) {
+		t.Error("the engine's connection is still open after Stop")
 	}
 }
 
