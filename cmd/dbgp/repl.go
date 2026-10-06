@@ -342,7 +342,15 @@ func (r *repl) cmdListen(context.Context, string) error {
 		return err
 	}
 	r.printf("Listening on %s.\n", r.srv.Addr())
+	r.printListenWarnings()
 	return nil
+}
+
+// printListenWarnings reports addresses dbgp could not listen on.
+func (r *repl) printListenWarnings() {
+	for _, w := range r.srv.ListenWarnings() {
+		r.printf("Warning: %s; PHP connecting there may reach another program instead.\n", w)
+	}
 }
 
 func (r *repl) cmdUnlisten(context.Context, string) error {

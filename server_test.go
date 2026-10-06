@@ -6,6 +6,7 @@ import (
 	"errors"
 	"io"
 	"net"
+	"sort"
 	"strconv"
 	"strings"
 	"testing"
@@ -473,5 +474,106 @@ func TestStartListeningAfterClose(t *testing.T) {
 	}
 	if !dialRefused(addr) {
 		t.Error("port still open after Close")
+	}
+}
+
+// requireIPv6 skips the test unless the IPv6 loopback address can be used.
+func requireIPv6(t *testing.T) {
+	t.Helper()
+	l, err := net.Listen("tcp", "[::1]:0")
+	if err != nil {
+		t.Skipf("IPv6 loopback unavailable: %v", err)
+	}
+	_ = l.Close()
+}
+
+// freePort returns a port that is free on the IPv4 loopback address.
+func freePort(t *testing.T) string {
+	t.Helper()
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer l.Close()
+	_, port, _ := net.SplitHostPort(l.Addr().String())
+	return port
+}
+
+// A host name listens on every address it resolves to: for localhost,
+// both 127.0.0.1 and ::1, whichever PHP resolves it to.
+func TestListenOnHostName(t *testing.T) {
+	requireIPv6(t)
+	srv := newTestServer(t, Config{Addr: "localhost:0"})
+	port := strconv.Itoa(srv.Port())
+	if srv.Addr() != "localhost:"+port {
+		t.Errorf("Addr() = %q, want localhost:%s", srv.Addr(), port)
+	}
+	addrs := srv.Addrs()
+	sort.Strings(addrs)
+	if want := []string{"127.0.0.1:" + port, "[::1]:" + port}; strings.Join(addrs, " ") != strings.Join(want, " ") {
+		t.Errorf("Addrs() = %v, want %v", addrs, want)
+	}
+	if w := srv.ListenWarnings(); len(w) != 0 {
+		t.Errorf("ListenWarnings() = %v", w)
+	}
+	for _, addr := range []string{"127.0.0.1:" + port, "[::1]:" + port} {
+		if dialRefused(addr) {
+			t.Errorf("%s refused", addr)
+		}
+	}
+
+	if err := srv.StopListening(); err != nil {
+		t.Fatal(err)
+	}
+	for _, addr := range []string{"127.0.0.1:" + port, "[::1]:" + port} {
+		if !dialRefused(addr) {
+			t.Errorf("%s still accepting after StopListening", addr)
+		}
+	}
+	if err := srv.StartListening(); err != nil || len(srv.Addrs()) != 2 || srv.Addr() != "localhost:"+port {
+		t.Errorf("restart: %v, Addrs %v, Addr %q", err, srv.Addrs(), srv.Addr())
+	}
+}
+
+// If another program holds one of the addresses, the server listens on the
+// others and reports it: PHP connecting there would reach that program.
+func TestListenWarnsWhenAnAddressIsTaken(t *testing.T) {
+	requireIPv6(t)
+	port := freePort(t)
+	other, err := net.Listen("tcp", "[::1]:"+port)
+	if err != nil {
+		t.Skipf("cannot take [::1]:%s: %v", port, err)
+	}
+	defer other.Close()
+
+	srv := newTestServer(t, Config{Addr: "localhost:" + port})
+	if addrs := srv.Addrs(); len(addrs) != 1 || addrs[0] != "127.0.0.1:"+port {
+		t.Errorf("Addrs() = %v, want only 127.0.0.1:%s", addrs, port)
+	}
+	if w := srv.ListenWarnings(); len(w) != 1 || !strings.Contains(w[0], "[::1]:"+port) {
+		t.Errorf("ListenWarnings() = %v, want one about [::1]:%s", w, port)
+	}
+	if dialRefused("127.0.0.1:" + port) {
+		t.Error("127.0.0.1 refused")
+	}
+}
+
+func TestListenFailsWhenEveryAddressIsTaken(t *testing.T) {
+	requireIPv6(t)
+	port := freePort(t)
+	for _, addr := range []string{"127.0.0.1:" + port, "[::1]:" + port} {
+		l, err := net.Listen("tcp", addr)
+		if err != nil {
+			t.Skipf("cannot take %s: %v", addr, err)
+		}
+		defer l.Close()
+	}
+	srv, err := NewServer(Config{Addr: "localhost:" + port})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer srv.Close()
+	if err := srv.StartListening(); err == nil || srv.Listening() {
+		t.Errorf("StartListening with every address taken: %v, listening %v", err, srv.Listening())
 	}
 }

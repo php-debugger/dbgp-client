@@ -8,12 +8,15 @@ import (
 	"net"
 	"sort"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 )
 
-// DefaultAddr is where PHP Debugger and Xdebug 3 connect by default.
-const DefaultAddr = "127.0.0.1:9003"
+// DefaultAddr is where PHP Debugger and Xdebug 3 connect by default:
+// localhost, which may resolve to ::1 or 127.0.0.1, so the server listens
+// on both.
+const DefaultAddr = "localhost:9003"
 
 // ErrServerClosed is returned by WaitForSession after Close.
 var ErrServerClosed = errors.New("server closed")
@@ -32,8 +35,9 @@ const (
 
 // Config configures a Server.
 type Config struct {
-	// Addr is the address to listen on. Defaults to DefaultAddr; use
-	// "0.0.0.0:9003" to accept engines in containers or on other hosts.
+	// Addr is the address to listen on. Defaults to DefaultAddr. A host
+	// name listens on every address it resolves to; use "0.0.0.0:9003" to
+	// accept engines in containers or on other hosts.
 	Addr string
 	// IDEKey, when set, accepts only sessions with this idekey. Others are
 	// detached, so their scripts run on without debugging.
@@ -81,9 +85,10 @@ type Server struct {
 	paths   PathMap
 
 	mu          sync.Mutex
-	addr        string       // where to listen; the bound address after the first start
-	listener    net.Listener // nil while not listening
-	acceptDone  chan struct{}
+	addr        string         // where to listen; the bound address after the first start
+	listeners   []net.Listener // empty while not listening
+	acceptDone  []chan struct{}
+	warnings    []string // addresses the last StartListening could not use
 	closed      bool
 	handshakes  map[net.Conn]struct{}
 	nextID      int
@@ -136,44 +141,119 @@ func (s *Server) StartListening() error {
 	if s.closed {
 		return ErrServerClosed
 	}
-	if s.listener != nil {
+	if len(s.listeners) > 0 {
 		return nil
 	}
-	listener, err := net.Listen("tcp", s.addr)
+	host, port, err := net.SplitHostPort(s.addr)
 	if err != nil {
 		return fmt.Errorf("listen on %s: %w", s.addr, err)
 	}
-	s.addr = listener.Addr().String()
-	s.listener = listener
-	s.acceptDone = make(chan struct{})
-	go s.acceptLoop(listener, s.acceptDone)
+	hosts, err := listenHosts(host)
+	if err != nil {
+		return fmt.Errorf("listen on %s: %w", s.addr, err)
+	}
+
+	var listeners []net.Listener
+	var failures []string
+	for _, h := range hosts {
+		listener, err := net.Listen("tcp", net.JoinHostPort(h, port))
+		if err != nil {
+			failures = append(failures, err.Error())
+			continue
+		}
+		if port == "0" {
+			// The other addresses take the same port.
+			_, port, _ = net.SplitHostPort(listener.Addr().String())
+		}
+		listeners = append(listeners, listener)
+	}
+	if len(listeners) == 0 {
+		return fmt.Errorf("listen on %s: %s", s.addr, strings.Join(failures, "; "))
+	}
+
+	if len(hosts) == 1 {
+		s.addr = listeners[0].Addr().String()
+	} else {
+		s.addr = net.JoinHostPort(host, port)
+	}
+	s.listeners, s.warnings, s.acceptDone = listeners, failures, nil
+	for _, listener := range listeners {
+		done := make(chan struct{})
+		s.acceptDone = append(s.acceptDone, done)
+		go s.acceptLoop(listener, done)
+	}
 	return nil
+}
+
+// listenHosts returns the hosts to listen on for a configured host: an IP
+// address or empty (all addresses) as it is, a name as every address it
+// resolves to, except link-local ones.
+func listenHosts(host string) ([]string, error) {
+	if host == "" || net.ParseIP(host) != nil {
+		return []string{host}, nil
+	}
+	addrs, err := net.DefaultResolver.LookupHost(context.Background(), host)
+	if err != nil {
+		return nil, err
+	}
+	var hosts []string
+	for _, a := range addrs {
+		if ip := net.ParseIP(a); ip != nil && !ip.IsLinkLocalUnicast() {
+			hosts = append(hosts, a)
+		}
+	}
+	if len(hosts) == 0 {
+		return nil, fmt.Errorf("%s has no usable address", host)
+	}
+	return hosts, nil
+}
+
+// ListenWarnings reports addresses the last StartListening could not
+// listen on, although it listened on others: for localhost, typically
+// another program holding [::1]:PORT, which PHP may then reach instead.
+func (s *Server) ListenWarnings() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]string(nil), s.warnings...)
+}
+
+// Addrs returns the addresses the server is listening on.
+func (s *Server) Addrs() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var addrs []string
+	for _, l := range s.listeners {
+		addrs = append(addrs, l.Addr().String())
+	}
+	return addrs
 }
 
 // StopListening stops accepting engine connections: new ones are refused.
 // Sessions already connected are not affected.
 func (s *Server) StopListening() error {
 	s.mu.Lock()
-	listener, done := s.listener, s.acceptDone
-	s.listener = nil
+	listeners, done := s.listeners, s.acceptDone
+	s.listeners, s.acceptDone = nil, nil
 	s.mu.Unlock()
-	if listener == nil {
-		return nil
+	var errs []error
+	for _, l := range listeners {
+		errs = append(errs, l.Close())
 	}
-	err := listener.Close()
-	<-done
-	return err
+	for _, d := range done {
+		<-d
+	}
+	return errors.Join(errs...)
 }
 
 // Listening reports whether the server is accepting engine connections.
 func (s *Server) Listening() bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.listener != nil
+	return len(s.listeners) > 0
 }
 
-// Addr returns the address the server listens on: the bound address once
-// it has listened, Config.Addr before.
+// Addr returns the address the server listens on, as configured but with
+// the port it got once it has listened (a host name stays a name; see Addrs).
 func (s *Server) Addr() string {
 	s.mu.Lock()
 	defer s.mu.Unlock()

@@ -19,7 +19,13 @@ import (
 // is not listening yet.
 func newTestMCP(t *testing.T) (*mcp.ClientSession, *dbgp.Server) {
 	t.Helper()
-	srv, err := dbgp.NewServer(dbgp.Config{Addr: "127.0.0.1:0"})
+	return newTestMCPOn(t, "127.0.0.1:0")
+}
+
+// newTestMCPOn is newTestMCP with the server on addr.
+func newTestMCPOn(t *testing.T, addr string) (*mcp.ClientSession, *dbgp.Server) {
+	t.Helper()
+	srv, err := dbgp.NewServer(dbgp.Config{Addr: addr})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -83,7 +89,8 @@ func TestMCPTools(t *testing.T) {
 			t.Errorf("%s has no description", tool.Name)
 		}
 	}
-	names := []string{"status", "listen", "unlisten", "add_breakpoint", "remove_breakpoint", "breakpoints", "add_path_mapping", "path_mappings"}
+	names := []string{"status", "listen", "unlisten", "add_breakpoint", "remove_breakpoint", "breakpoints",
+		"add_path_mapping", "path_mappings", "sessions", "wait_for_session", "continue", "wait_for_stop", "stop", "detach"}
 	for _, name := range names {
 		if got[name] == nil {
 			t.Errorf("tool %s missing", name)
@@ -92,7 +99,7 @@ func TestMCPTools(t *testing.T) {
 	if len(got) != len(names) {
 		t.Errorf("got %d tools, want %d", len(got), len(names))
 	}
-	for _, name := range []string{"status", "breakpoints", "path_mappings"} {
+	for _, name := range []string{"status", "breakpoints", "path_mappings", "sessions", "wait_for_session", "wait_for_stop"} {
 		if a := got[name].Annotations; a == nil || !a.ReadOnlyHint {
 			t.Errorf("%s is not marked read-only", name)
 		}
@@ -103,7 +110,7 @@ func TestMCPTools(t *testing.T) {
 	if got["status"].OutputSchema == nil {
 		t.Error("status has no output schema")
 	}
-	for _, want := range []string{"listen", "php -v", "with PHP Debugger", "do not set xdebug.mode"} {
+	for _, want := range []string{"listen", "php -v", "with PHP Debugger", "do not set xdebug.mode", "remove_breakpoint"} {
 		if !strings.Contains(cs.InitializeResult().Instructions, want) {
 			t.Errorf("instructions lack %q: %s", want, cs.InitializeResult().Instructions)
 		}
@@ -455,5 +462,28 @@ func TestMCPBreakpointsReachSession(t *testing.T) {
 	callTool(t, cs, "remove_breakpoint", map[string]any{"id": 1}, &breakpointsOutput{})
 	if got := engineLines(); fmt.Sprint(got) != "[39]" {
 		t.Errorf("engine breakpoints after remove = %v, want [39]", got)
+	}
+}
+
+// listen reports addresses it could not use, e.g. another program holding
+// [::1] on the port, which PHP connecting to localhost may reach instead.
+func TestMCPListenWarnings(t *testing.T) {
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, port, _ := net.SplitHostPort(l.Addr().String())
+	_ = l.Close()
+	other, err := net.Listen("tcp", "[::1]:"+port)
+	if err != nil {
+		t.Skipf("cannot take [::1]:%s: %v", port, err)
+	}
+	defer other.Close()
+
+	cs, _ := newTestMCPOn(t, "localhost:"+port)
+	var out listenOutput
+	callTool(t, cs, "listen", nil, &out)
+	if !out.Listening || out.Address != "localhost:"+port || len(out.Warnings) != 1 || !strings.Contains(out.Warnings[0], "[::1]:"+port) {
+		t.Errorf("listen = %+v, want localhost:%s with a warning about [::1]", out, port)
 	}
 }
