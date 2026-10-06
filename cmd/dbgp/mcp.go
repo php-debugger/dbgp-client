@@ -24,6 +24,8 @@ const mcpInstructions = `dbgp debugs PHP scripts and requests through PHP Debugg
 It does not listen for PHP connections until the listen tool is called, so
 PHP runs at full speed until you want to debug. Call status to see what is
 going on, listen before starting the PHP code to debug, and unlisten when done.
+Remove each breakpoint with remove_breakpoint as soon as you no longer need it:
+breakpoints apply to every later session and slow it down.
 
 Before starting PHP, check which debugger it has with php -v: it prints
 "with PHP Debugger" or "with Xdebug". PHP Debugger is always in debug mode and
@@ -33,7 +35,7 @@ xdebug.start_with_request=yes.
 
 PHP finds dbgp through xdebug.client_host and xdebug.client_port, which
 default to localhost and 9003 in both debuggers. When PHP runs on this machine
-and the listen tool's address is 127.0.0.1:9003, dbgp's default, those
+and the listen tool's address is localhost:9003, dbgp's default, those
 defaults already reach dbgp and neither needs to be set. Otherwise set them to
 the port from that address and a host PHP can reach this machine on.`
 
@@ -103,7 +105,8 @@ func newMCPServer(srv *dbgp.Server) *mcp.Server {
 		Name: "listen",
 		Description: "Start listening for PHP connections, so the next PHP script or request with " +
 			"debugging enabled connects and becomes a session. The result gives the address PHP must connect to.",
-		Annotations: &mcp.ToolAnnotations{IdempotentHint: true},
+		Annotations:  &mcp.ToolAnnotations{IdempotentHint: true},
+		OutputSchema: outputSchema[listenOutput]("warnings"),
 	}, t.listen)
 	mcp.AddTool(server, &mcp.Tool{
 		Name: "unlisten",
@@ -116,7 +119,8 @@ func newMCPServer(srv *dbgp.Server) *mcp.Server {
 	mcp.AddTool(server, &mcp.Tool{
 		Name: "add_breakpoint",
 		Description: "Add a breakpoint. It applies to every debugging session, including ones that connect later. " +
-			"A line breakpoint with a condition stops only when the condition is true.",
+			"A line breakpoint with a condition stops only when the condition is true. " +
+			"Remove it with remove_breakpoint once you no longer need it: breakpoints slow down later sessions.",
 		Annotations:  &mcp.ToolAnnotations{DestructiveHint: &notDestructive},
 		InputSchema:  addBreakpointSchema(),
 		OutputSchema: outputSchema[addBreakpointOutput](),
@@ -146,6 +150,7 @@ func newMCPServer(srv *dbgp.Server) *mcp.Server {
 		Annotations:  &mcp.ToolAnnotations{ReadOnlyHint: true},
 		OutputSchema: outputSchema[pathMappingListOutput]("pathMappings"),
 	}, t.pathMappings)
+	t.addSessionTools(server)
 	return server
 }
 
@@ -206,17 +211,7 @@ func (t *tools) status(context.Context, *mcp.CallToolRequest, noInput) (*mcp.Cal
 	out := statusOutput{
 		Listening: t.srv.Listening(),
 		Address:   t.srv.Addr(),
-		Sessions:  []sessionInfo{},
-	}
-	for _, s := range t.srv.Sessions() {
-		st := s.State()
-		info := sessionInfo{ID: s.ID(), Script: s.Script(), Status: st.Status}
-		if ended(st) {
-			info.Status = "ended"
-		} else if st.Status == dbgp.StatusBreak {
-			info.File, info.Line = st.File, st.Line
-		}
-		out.Sessions = append(out.Sessions, info)
+		Sessions:  t.sessionList(),
 	}
 	out.Breakpoints = t.breakpointList()
 	out.PathMappings = t.pathMappingList()
@@ -249,15 +244,16 @@ func (t *tools) pathMappingList() []pathMapping {
 }
 
 type listenOutput struct {
-	Listening bool   `json:"listening" jsonschema:"whether PHP connections are accepted"`
-	Address   string `json:"address" jsonschema:"the address PHP must connect to (host and port)"`
+	Listening bool     `json:"listening" jsonschema:"whether PHP connections are accepted"`
+	Address   string   `json:"address" jsonschema:"the address PHP must connect to (host and port)"`
+	Warnings  []string `json:"warnings,omitempty" jsonschema:"addresses dbgp could not listen on, although it listens on others; PHP connecting there may reach another program instead"`
 }
 
 func (t *tools) listen(context.Context, *mcp.CallToolRequest, noInput) (*mcp.CallToolResult, listenOutput, error) {
 	if err := t.srv.StartListening(); err != nil {
 		return nil, listenOutput{}, err
 	}
-	return nil, listenOutput{Listening: true, Address: t.srv.Addr()}, nil
+	return nil, listenOutput{Listening: true, Address: t.srv.Addr(), Warnings: t.srv.ListenWarnings()}, nil
 }
 
 type unlistenOutput struct {

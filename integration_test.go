@@ -3,7 +3,9 @@ package dbgp
 import (
 	"context"
 	"errors"
+	"net"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -415,5 +417,35 @@ func TestEngineOwnPathMapping(t *testing.T) {
 	stack, err := sess.GetStack()
 	if err != nil || stack[0].Filename != script || stack[0].Facet != "mapped" {
 		t.Errorf("GetStack = %+v, %v; want mapped frames in %s", stack, err, script)
+	}
+}
+
+// PHP's default client_host, localhost, reaches dbgp listening on its
+// default host, even when another program holds the IPv6 wildcard address
+// on the port (Docker Desktop does this for a published port): localhost
+// may resolve to ::1, and dbgp then listens on [::1] itself.
+func TestEngineDefaultHostWithIPv6WildcardTaken(t *testing.T) {
+	requireDebugEngine(t)
+	requireIPv6(t)
+	port := freePort(t)
+	other, err := net.Listen("tcp6", "[::]:"+port)
+	if err != nil {
+		t.Skipf("cannot take [::]:%s: %v", port, err)
+	}
+	defer other.Close()
+
+	srv := newTestServer(t, Config{Addr: "localhost:" + port})
+	if w := srv.ListenWarnings(); len(w) > 0 {
+		t.Skipf("this OS does not allow [::1] alongside another program's [::]: %v", w)
+	}
+	// No client_host: PHP uses its default, localhost.
+	php := exec.Command("php", "-dxdebug.mode=debug", "-dxdebug.start_with_request=yes",
+		"-dxdebug.client_port="+port, "-ddisplay_errors=0", debuggeePath(t))
+	if err := php.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = php.Process.Kill(); _ = php.Wait() })
+	if sess := waitSession(t, srv); sess.Script() != debuggeePath(t) {
+		t.Errorf("session for %q", sess.Script())
 	}
 }

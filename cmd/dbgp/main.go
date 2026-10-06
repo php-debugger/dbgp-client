@@ -81,6 +81,7 @@ func main() {
 	}
 	r.printf("Listening on %s. Sessions are announced when PHP connects, and commands\n"+
 		"that need one wait for it. Type help for commands.\n", srv.Addr())
+	r.printListenWarnings()
 
 	interrupts := make(chan os.Signal, 1)
 	signal.Notify(interrupts, os.Interrupt)
