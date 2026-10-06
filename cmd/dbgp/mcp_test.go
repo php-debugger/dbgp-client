@@ -96,7 +96,7 @@ func TestMCPTools(t *testing.T) {
 	}
 	names := []string{"status", "listen", "unlisten", "add_breakpoint", "remove_breakpoint", "breakpoints",
 		"add_path_mapping", "path_mappings", "sessions", "wait_for_session", "continue", "wait_for_stop", "stop", "detach",
-		"stack", "variables", "variable", "variable_value"}
+		"stack", "variables", "variable", "variable_value", "source", "output", "warnings"}
 	for _, name := range names {
 		if got[name] == nil {
 			t.Errorf("tool %s missing", name)
@@ -106,7 +106,7 @@ func TestMCPTools(t *testing.T) {
 		t.Errorf("got %d tools, want %d", len(got), len(names))
 	}
 	for _, name := range []string{"status", "breakpoints", "path_mappings", "sessions", "wait_for_session", "wait_for_stop",
-		"stack", "variables", "variable", "variable_value"} {
+		"stack", "variables", "variable", "variable_value", "source", "output", "warnings"} {
 		if a := got[name].Annotations; a == nil || !a.ReadOnlyHint {
 			t.Errorf("%s is not marked read-only", name)
 		}

@@ -9,6 +9,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"strings"
+	"sync"
 	"syscall"
 
 	"github.com/google/jsonschema-go/jsonschema"
@@ -152,6 +153,7 @@ func newMCPServer(srv *dbgp.Server) *mcp.Server {
 	}, t.pathMappings)
 	t.addSessionTools(server)
 	t.addInspectTools(server)
+	t.addOutputTools(server)
 	return server
 }
 
@@ -173,6 +175,12 @@ func outputSchema[T any](lists ...string) *jsonschema.Schema {
 // tools implements the MCP tools on a dbgp server.
 type tools struct {
 	srv *dbgp.Server
+
+	// mu guards the read positions of output and warnings, per session id:
+	// those tools return only what is new since their last call.
+	mu           sync.Mutex
+	outputFrom   map[int]int
+	warningsFrom map[int]int
 }
 
 type noInput struct{}
