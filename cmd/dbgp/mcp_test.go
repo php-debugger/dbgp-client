@@ -20,11 +20,12 @@ import (
 // is not listening yet.
 func newTestMCP(t *testing.T) (*mcp.ClientSession, *dbgp.Server) {
 	t.Helper()
-	return newTestMCPOn(t, "127.0.0.1:0")
+	return newTestMCPOn(t, "127.0.0.1:0", true)
 }
 
-// newTestMCPOn is newTestMCP with the server on addr.
-func newTestMCPOn(t *testing.T, addr string) (*mcp.ClientSession, *dbgp.Server) {
+// newTestMCPOn is newTestMCP with the server on addr, and the code tools
+// only if allowCode.
+func newTestMCPOn(t *testing.T, addr string, allowCode bool) (*mcp.ClientSession, *dbgp.Server) {
 	t.Helper()
 	srv, err := dbgp.NewServer(dbgp.Config{Addr: addr})
 	if err != nil {
@@ -34,7 +35,7 @@ func newTestMCPOn(t *testing.T, addr string) (*mcp.ClientSession, *dbgp.Server) 
 
 	ctx := context.Background()
 	clientTransport, serverTransport := mcp.NewInMemoryTransports()
-	ss, err := newMCPServer(srv).Connect(ctx, serverTransport, nil)
+	ss, err := newMCPServer(srv, allowCode).Connect(ctx, serverTransport, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -96,7 +97,7 @@ func TestMCPTools(t *testing.T) {
 	}
 	names := []string{"status", "listen", "unlisten", "add_breakpoint", "remove_breakpoint", "breakpoints",
 		"add_path_mapping", "path_mappings", "sessions", "wait_for_session", "continue", "wait_for_stop", "stop", "detach",
-		"stack", "variables", "variable", "variable_value", "source", "output", "warnings"}
+		"stack", "variables", "variable", "variable_value", "source", "output", "warnings", "eval", "set_variable"}
 	for _, name := range names {
 		if got[name] == nil {
 			t.Errorf("tool %s missing", name)
@@ -259,6 +260,7 @@ func TestMCPBinary(t *testing.T) {
 	}{
 		{[]string{"mcp", "-addr", "127.0.0.1:0"}, false},
 		{[]string{"mcp", "-addr", "127.0.0.1:0", "-listen"}, true},
+		{[]string{"mcp", "-addr", "127.0.0.1:0", "-no-eval"}, false},
 	} {
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		transport := &mcp.CommandTransport{Command: exec.CommandContext(ctx, bin, tc.args...)}
@@ -271,6 +273,17 @@ func TestMCPBinary(t *testing.T) {
 		callTool(t, cs, "status", nil, &status)
 		if status.Listening != tc.listening {
 			t.Errorf("%v: listening = %v, want %v", tc.args, status.Listening, tc.listening)
+		}
+		list, err := cs.ListTools(ctx, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		hasEval := false
+		for _, tool := range list.Tools {
+			hasEval = hasEval || tool.Name == "eval"
+		}
+		if wantEval := !strings.Contains(strings.Join(tc.args, " "), "-no-eval"); hasEval != wantEval {
+			t.Errorf("%v: has eval = %v, want %v", tc.args, hasEval, wantEval)
 		}
 		if err := cs.Close(); err != nil {
 			t.Errorf("%v: close: %v", tc.args, err)
@@ -487,7 +500,7 @@ func TestMCPListenWarnings(t *testing.T) {
 	}
 	defer other.Close()
 
-	cs, _ := newTestMCPOn(t, "localhost:"+port)
+	cs, _ := newTestMCPOn(t, "localhost:"+port, true)
 	var out listenOutput
 	callTool(t, cs, "listen", nil, &out)
 	if !out.Listening || out.Address != "localhost:"+port || len(out.Warnings) != 1 || !strings.Contains(out.Warnings[0], "[::1]:"+port) {
