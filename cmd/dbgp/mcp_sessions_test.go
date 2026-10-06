@@ -99,6 +99,14 @@ func TestMCPDebuggingRun(t *testing.T) {
 	if stopped.Status != "ended" {
 		t.Errorf("stop = %+v, want ended", stopped)
 	}
+	// Removing breakpoints right after stop: the ended session is skipped.
+	for _, id := range []int{1, 2} {
+		var removed breakpointsOutput
+		callTool(t, cs, "remove_breakpoint", map[string]any{"id": id}, &removed)
+		if removed.Warning != "" {
+			t.Errorf("remove_breakpoint %d after stop warned: %s", id, removed.Warning)
+		}
+	}
 	if msg := callToolError(t, cs, "continue", map[string]any{"session": 1}); !strings.Contains(msg, "session 1 has ended") {
 		t.Errorf("continue after stop: %q", msg)
 	}

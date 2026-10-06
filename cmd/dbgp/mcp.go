@@ -151,6 +151,7 @@ func newMCPServer(srv *dbgp.Server) *mcp.Server {
 		OutputSchema: outputSchema[pathMappingListOutput]("pathMappings"),
 	}, t.pathMappings)
 	t.addSessionTools(server)
+	t.addInspectTools(server)
 	return server
 }
 

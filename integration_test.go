@@ -449,3 +449,29 @@ func TestEngineDefaultHostWithIPv6WildcardTaken(t *testing.T) {
 		t.Errorf("session for %q", sess.Script())
 	}
 }
+
+// Stopped at a breakpoint, PHP Debugger waits for dbgp to close the
+// connection before PHP exits.
+func TestEngineStopMidScript(t *testing.T) {
+	requireDebugEngine(t)
+	srv := newTestServer(t, Config{})
+	php := startDebuggee(t, srv.Port())
+	sess := waitSession(t, srv)
+	if _, err := sess.SetBreakpoint(debuggeePath(t), lineAddBody); err != nil {
+		t.Fatal(err)
+	}
+	if st := mustContinue(t, sess, ContinueRun); st.Line != lineAddBody {
+		t.Fatalf("stopped at %+v", st)
+	}
+	if err := sess.Stop(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-php.exited:
+	case <-time.After(5 * time.Second):
+		t.Fatal("PHP is still running 5s after stop")
+	}
+	if strings.Contains(php.out.String(), "done") {
+		t.Errorf("the script ran on after stop: %q", php.out.String())
+	}
+}

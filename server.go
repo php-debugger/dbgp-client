@@ -506,8 +506,7 @@ func (s *Server) Breakpoints() []Breakpoint {
 func (s *Server) syncStoppedSessions() error {
 	var errs []error
 	for _, sess := range s.Sessions() {
-		st := sess.State()
-		if st.Closed || st.Status == StatusRunning {
+		if sess.State().Status == StatusRunning {
 			continue
 		}
 		if err := sess.syncBreakpoints(); err != nil {
