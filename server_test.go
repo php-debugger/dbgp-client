@@ -217,6 +217,33 @@ func TestServerTracksSessions(t *testing.T) {
 	}
 }
 
+func TestServerForgetsOldEndedSessions(t *testing.T) {
+	srv := newTestServer(t, Config{})
+	dialFakeEngine(t, srv, fixture(t, "init"), standardHandlers())
+	open := waitSession(t, srv)
+	for range maxEndedSessions + 1 {
+		e := dialFakeEngine(t, srv, fixture(t, "init"), standardHandlers())
+		sess := waitSession(t, srv)
+		e.Close()
+		<-sess.Done()
+	}
+	// Ended sessions are pruned when the next one connects.
+	dialFakeEngine(t, srv, fixture(t, "init"), standardHandlers())
+	last := waitSession(t, srv)
+
+	sessions := srv.Sessions()
+	if len(sessions) != maxEndedSessions+2 {
+		t.Fatalf("%d sessions kept, want %d", len(sessions), maxEndedSessions+2)
+	}
+	// The oldest ended session, id 2, is forgotten; the open one is kept.
+	if sessions[0] != open || sessions[1].ID() != 3 || sessions[len(sessions)-1] != last {
+		t.Errorf("kept sessions %d, %d … %d", sessions[0].ID(), sessions[1].ID(), sessions[len(sessions)-1].ID())
+	}
+	if srv.Session(2) != nil {
+		t.Error("session 2 still found")
+	}
+}
+
 func TestServerCloseEndsSessions(t *testing.T) {
 	srv := newTestServer(t, Config{})
 	e := dialFakeEngine(t, srv, fixture(t, "init"), standardHandlers())

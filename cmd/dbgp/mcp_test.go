@@ -118,7 +118,8 @@ func TestMCPTools(t *testing.T) {
 	if got["status"].OutputSchema == nil {
 		t.Error("status has no output schema")
 	}
-	for _, want := range []string{"listen", "php -v", "with PHP Debugger", "do not set xdebug.mode", "remove_breakpoint"} {
+	for _, want := range []string{"listen", "php -v", "with PHP Debugger", "do not set xdebug.mode", "remove_breakpoint",
+		"in the background", "stop or detach", "in parts"} {
 		if !strings.Contains(cs.InitializeResult().Instructions, want) {
 			t.Errorf("instructions lack %q: %s", want, cs.InitializeResult().Instructions)
 		}
@@ -237,7 +238,9 @@ func TestMCPStatusShowsSession(t *testing.T) {
 }
 
 // The built binary in MCP mode, driven over stdin and stdout.
-func TestMCPBinary(t *testing.T) {
+// buildBinary builds dbgp into a temporary directory and returns its path.
+func buildBinary(t *testing.T) string {
+	t.Helper()
 	if testing.Short() {
 		t.Skip("builds the binary")
 	}
@@ -245,6 +248,11 @@ func TestMCPBinary(t *testing.T) {
 	if out, err := exec.Command("go", "build", "-o", bin, ".").CombinedOutput(); err != nil {
 		t.Fatalf("go build: %v\n%s", err, out)
 	}
+	return bin
+}
+
+func TestMCPBinary(t *testing.T) {
+	bin := buildBinary(t)
 
 	if out, _ := exec.Command(bin, "mcp", "-h").CombinedOutput(); !strings.Contains(string(out), "Usage: dbgp mcp [options]") {
 		t.Errorf("mcp -h output:\n%s", out)

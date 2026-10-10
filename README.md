@@ -51,7 +51,9 @@ claude mcp add dbgp -- dbgp mcp
 
 Unlike the interactive mode, it does not listen for PHP connections until the agent calls the `listen` tool, so PHP runs at full speed until there is something to debug; `-listen` starts listening right away. `-addr`, `-idekey` and `-map LOCAL=REMOTE` work as in the interactive mode.
 
-Tools so far: `status` (listening state, sessions, breakpoints and path mappings), `listen` and `unlisten`; `add_breakpoint`, `remove_breakpoint` and `breakpoints`; `add_path_mapping` and `path_mappings`; `sessions`, `wait_for_session`, `continue` (run or step), `wait_for_stop`, `stop` and `detach`; `stack`, `variables`, `variable` (one variable, a page of its contents at a time) and `variable_value`; `source`, `output` and `warnings` (what the script printed and the PHP warnings it raised, each read incrementally); `eval` and `set_variable`, which run PHP code in the debugged script and can be left out with `-no-eval`.
+Tools: `status` (listening state, sessions, breakpoints and path mappings), `listen` and `unlisten`; `add_breakpoint`, `remove_breakpoint` and `breakpoints`; `add_path_mapping` and `path_mappings`; `sessions`, `wait_for_session`, `continue` (run or step), `wait_for_stop`, `stop` and `detach`; `stack`, `variables`, `variable` (one variable, a page of its contents at a time) and `variable_value`; `source`, `output` and `warnings` (what the script printed and the PHP warnings it raised, each read incrementally); `eval` and `set_variable`, which run PHP code in the debugged script and can be left out with `-no-eval`.
+
+Results are kept small enough for an agent's context: stack frames and variables come in pages of 50, output and long values in parts of 32 KB, warnings 50 at a time with repeats counted once, and long source lines are cut at 500 bytes. The 50 most recent ended sessions are kept, with their output.
 
 ## Testing
 
