@@ -14,13 +14,13 @@ import (
 func (t *tools) addInspectTools(server *mcp.Server) {
 	mcp.AddTool(server, &mcp.Tool{
 		Name:         "stack",
-		Description:  "Show the call stack of a stopped session, innermost first.",
+		Description:  "Show the call stack of a stopped session, innermost first, 50 frames per page.",
 		Annotations:  &mcp.ToolAnnotations{ReadOnlyHint: true},
 		OutputSchema: outputSchema[stackOutput]("frames"),
 	}, t.stack)
 	mcp.AddTool(server, &mcp.Tool{
 		Name: "variables",
-		Description: "List the variables of a stack frame of a stopped session. Arrays and objects are " +
+		Description: "List the variables of a stack frame of a stopped session, 50 per page. Arrays and objects are " +
 			"listed without their contents, with their size or class: use variable to look inside one.",
 		Annotations:  &mcp.ToolAnnotations{ReadOnlyHint: true},
 		OutputSchema: outputSchema[variablesOutput]("variables"),
@@ -35,7 +35,7 @@ func (t *tools) addInspectTools(server *mcp.Server) {
 	mcp.AddTool(server, &mcp.Tool{
 		Name: "variable_value",
 		Description: "Show the whole value of a variable whose value variables or variable returned truncated, " +
-			"such as a long string.",
+			"such as a long string. A value longer than 32 KB is returned in parts: call again with offset set to next.",
 		Annotations: &mcp.ToolAnnotations{ReadOnlyHint: true},
 	}, t.variableValue)
 }
@@ -47,12 +47,19 @@ type frameInfo struct {
 	Line     int    `json:"line" jsonschema:"the line being executed in this frame"`
 }
 
-type stackOutput struct {
-	Session int         `json:"session" jsonschema:"the session id"`
-	Frames  []frameInfo `json:"frames" jsonschema:"innermost first: depth 0 is where execution stopped"`
+type stackInput struct {
+	Session int `json:"session,omitempty" jsonschema:"the session id; defaults to the newest session that has not ended"`
+	Page    int `json:"page,omitempty" jsonschema:"the page of frames, from 0 (the default); see pages"`
 }
 
-func (t *tools) stack(_ context.Context, _ *mcp.CallToolRequest, in sessionInput) (*mcp.CallToolResult, stackOutput, error) {
+type stackOutput struct {
+	Session int         `json:"session" jsonschema:"the session id"`
+	Frames  []frameInfo `json:"frames" jsonschema:"one page of frames, innermost first: depth 0 is where execution stopped"`
+	Page    int         `json:"page" jsonschema:"this page, from 0"`
+	Pages   int         `json:"pages" jsonschema:"how many pages of frames there are; call stack with page for the others"`
+}
+
+func (t *tools) stack(_ context.Context, _ *mcp.CallToolRequest, in stackInput) (*mcp.CallToolResult, stackOutput, error) {
 	s, err := t.session(in.Session)
 	if err != nil {
 		return nil, stackOutput{}, err
@@ -61,7 +68,11 @@ func (t *tools) stack(_ context.Context, _ *mcp.CallToolRequest, in sessionInput
 	if err != nil {
 		return nil, stackOutput{}, sessionError(s, err)
 	}
-	out := stackOutput{Session: s.ID(), Frames: []frameInfo{}}
+	frames, pages, err := pageOf(frames, in.Page)
+	if err != nil {
+		return nil, stackOutput{}, err
+	}
+	out := stackOutput{Session: s.ID(), Frames: []frameInfo{}, Page: in.Page, Pages: pages}
 	for _, f := range frames {
 		out.Frames = append(out.Frames, frameInfo{Depth: f.Level, Function: f.Where, File: f.Filename, Line: f.Lineno})
 	}
@@ -73,6 +84,7 @@ type frameInput struct {
 	Session int `json:"session,omitempty" jsonschema:"the session id; defaults to the newest session that has not ended"`
 	Depth   int `json:"depth,omitempty" jsonschema:"the stack frame: 0 (the default) is where execution stopped, 1 its caller, and so on; see stack"`
 	Context int `json:"context,omitempty" jsonschema:"0 (the default) local variables, 1 superglobals such as $_SERVER and $_GET, 2 user-defined constants"`
+	Page    int `json:"page,omitempty" jsonschema:"the page of variables, from 0 (the default); see pages"`
 }
 
 type variableInfo struct {
@@ -126,7 +138,9 @@ type variablesOutput struct {
 	Session   int            `json:"session" jsonschema:"the session id"`
 	Depth     int            `json:"depth" jsonschema:"the stack frame"`
 	Context   int            `json:"context" jsonschema:"0 local variables, 1 superglobals, 2 user-defined constants"`
-	Variables []variableInfo `json:"variables" jsonschema:"the variables, without the contents of arrays and objects"`
+	Variables []variableInfo `json:"variables" jsonschema:"one page of the variables, without the contents of arrays and objects"`
+	Page      int            `json:"page" jsonschema:"this page, from 0"`
+	Pages     int            `json:"pages" jsonschema:"how many pages of variables there are; call variables with page for the others"`
 }
 
 func (t *tools) variables(_ context.Context, _ *mcp.CallToolRequest, in frameInput) (*mcp.CallToolResult, variablesOutput, error) {
@@ -138,7 +152,11 @@ func (t *tools) variables(_ context.Context, _ *mcp.CallToolRequest, in frameInp
 	if err != nil {
 		return nil, variablesOutput{}, sessionError(s, err)
 	}
-	out := variablesOutput{Session: s.ID(), Depth: in.Depth, Context: in.Context, Variables: []variableInfo{}}
+	props, pages, err := pageOf(props, in.Page)
+	if err != nil {
+		return nil, variablesOutput{}, err
+	}
+	out := variablesOutput{Session: s.ID(), Depth: in.Depth, Context: in.Context, Variables: []variableInfo{}, Page: in.Page, Pages: pages}
 	for _, p := range props {
 		out.Variables = append(out.Variables, toVariable(p))
 	}
@@ -190,11 +208,14 @@ type variableValueInput struct {
 	Name    string `json:"name" jsonschema:"the variable, or a path into one, e.g. $html or $page[\"body\"]"`
 	Depth   int    `json:"depth,omitempty" jsonschema:"the stack frame: 0 (the default) is where execution stopped, 1 its caller, and so on; see stack"`
 	Context int    `json:"context,omitempty" jsonschema:"0 (the default) local variables, 1 superglobals such as $_SERVER and $_GET, 2 user-defined constants"`
+	Offset  int    `json:"offset,omitempty" jsonschema:"the byte of the value to start from, 0 by default; see next"`
 }
 
 type variableValueOutput struct {
 	Name  string `json:"name" jsonschema:"the variable"`
-	Value string `json:"value" jsonschema:"its whole value"`
+	Value string `json:"value" jsonschema:"its value from offset, at most 32 KB of it"`
+	Size  int    `json:"size" jsonschema:"the length of the whole value, in bytes"`
+	Next  int    `json:"next,omitempty" jsonschema:"where the rest of the value starts: call variable_value again with this offset; absent when the value is complete"`
 }
 
 func (t *tools) variableValue(_ context.Context, _ *mcp.CallToolRequest, in variableValueInput) (*mcp.CallToolResult, variableValueOutput, error) {
@@ -209,5 +230,12 @@ func (t *tools) variableValue(_ context.Context, _ *mcp.CallToolRequest, in vari
 	if err != nil {
 		return nil, variableValueOutput{}, inspectError(s, in.Name, in.Depth, err)
 	}
-	return nil, variableValueOutput{Name: in.Name, Value: value}, nil
+	if in.Offset < 0 || in.Offset > len(value) {
+		return nil, variableValueOutput{}, fmt.Errorf("offset must be from 0 to %d, the size of %s", len(value), in.Name)
+	}
+	out := variableValueOutput{Name: in.Name, Value: cutText(value[in.Offset:], maxTextBytes), Size: len(value)}
+	if end := in.Offset + len(out.Value); end < len(value) {
+		out.Next = end
+	}
+	return nil, out, nil
 }

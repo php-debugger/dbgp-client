@@ -80,7 +80,7 @@ func TestMCPOutputAndWarnings(t *testing.T) {
 
 	var raised warningsOutput
 	callTool(t, cs, "warnings", nil, &raised)
-	want := warningInfo{Type: "Warning", Message: "Undefined variable $undefinedVariable", File: script, Line: 42}
+	want := warningInfo{Type: "Warning", Message: "Undefined variable $undefinedVariable", File: script, Line: 42, Count: 1}
 	if len(raised.Warnings) != 1 || raised.Warnings[0] != want {
 		t.Errorf("warnings = %+v, want %+v", raised.Warnings, want)
 	}

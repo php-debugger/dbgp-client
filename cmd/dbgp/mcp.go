@@ -11,6 +11,7 @@ import (
 	"strings"
 	"sync"
 	"syscall"
+	"unicode/utf8"
 
 	"github.com/google/jsonschema-go/jsonschema"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
@@ -27,6 +28,18 @@ PHP runs at full speed until you want to debug. Call status to see what is
 going on, listen before starting the PHP code to debug, and unlisten when done.
 Remove each breakpoint with remove_breakpoint as soon as you no longer need it:
 breakpoints apply to every later session and slow it down.
+
+A typical run: add_breakpoint, listen, start the PHP code, wait_for_session,
+then continue to run to the breakpoint. Start PHP in the background, or send
+the web request without waiting for its answer: PHP waits for dbgp at every
+stop, so it does not finish while you are debugging it. Once stopped, look
+around with stack, variables, variable and source, and step or run on with
+continue. output and warnings show what the script printed and the PHP
+warnings it raised. End every session with stop or detach when you are done
+with it: until then its PHP process or web server worker is held.
+
+Long results come in parts: lists in pages, see page and pages, and long text
+when more or next is set. Ask only for the parts you need.
 
 Before starting PHP, check which debugger it has with php -v: it prints
 "with PHP Debugger" or "with Xdebug". PHP Debugger is always in debug mode and
@@ -189,6 +202,35 @@ func outputSchema[T any](lists ...string) *jsonschema.Schema {
 		prop.Types, prop.Type = nil, "array"
 	}
 	return schema
+}
+
+// Tool results are kept small enough for an agent's context: longer text
+// and lists are returned in parts, which the agent asks for one at a time.
+const (
+	maxTextBytes = 32 << 10 // output, and values from variable_value
+	maxLineBytes = 500      // each line from source
+	maxListItems = 50       // stack frames, variables and warnings
+)
+
+// cutText returns at most limit bytes of s, cut at a character boundary.
+func cutText(s string, limit int) string {
+	if len(s) <= limit {
+		return s
+	}
+	for limit > 0 && !utf8.RuneStart(s[limit]) {
+		limit--
+	}
+	return s[:limit]
+}
+
+// pageOf returns page n of items, maxListItems per page, and how many pages
+// there are; there is always at least one, maybe empty.
+func pageOf[T any](items []T, n int) ([]T, int, error) {
+	pages := max(1, (len(items)+maxListItems-1)/maxListItems)
+	if n < 0 || n >= pages {
+		return nil, pages, fmt.Errorf("page must be from 0 to %d", pages-1)
+	}
+	return items[n*maxListItems : min(len(items), (n+1)*maxListItems)], pages, nil
 }
 
 // tools implements the MCP tools on a dbgp server.

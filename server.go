@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -339,6 +340,7 @@ func (s *Server) handshake(conn net.Conn) {
 	}
 	s.sessions = append(s.sessions, sess)
 	s.queue = append(s.queue, sess)
+	s.pruneSessions()
 	close(s.arrived)
 	s.arrived = make(chan struct{})
 }
@@ -416,7 +418,33 @@ func (s *Server) AddPathMapping(m PathMapping) error {
 	return s.syncStoppedSessions()
 }
 
-// Sessions returns all sessions in connection order, including ended ones.
+// pruneSessions forgets the oldest ended sessions beyond maxEndedSessions,
+// with their output, so a server debugging many requests does not keep
+// them all. Sessions WaitForSession has not returned yet are kept.
+func (s *Server) pruneSessions() {
+	ended := 0
+	for _, sess := range s.sessions {
+		if sess.ended() {
+			ended++
+		}
+	}
+	if ended <= maxEndedSessions {
+		return
+	}
+	kept := s.sessions[:0]
+	for _, sess := range s.sessions {
+		if ended > maxEndedSessions && sess.ended() && !slices.Contains(s.queue, sess) {
+			ended--
+			continue
+		}
+		kept = append(kept, sess)
+	}
+	clear(s.sessions[len(kept):])
+	s.sessions = kept
+}
+
+// Sessions returns the sessions in connection order, including the most
+// recent ended ones.
 func (s *Server) Sessions() []*Session {
 	s.mu.Lock()
 	defer s.mu.Unlock()

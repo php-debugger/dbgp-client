@@ -13,13 +13,20 @@ import (
 // breakpoint in add(), at line 24.
 func stoppedInAdd(t *testing.T) (*mcp.ClientSession, *dbgp.Server, string) {
 	t.Helper()
+	return stoppedAt(t, "basic.php", 24)
+}
+
+// stoppedAt starts a script from testdata/php through MCP and runs it to a
+// breakpoint on line.
+func stoppedAt(t *testing.T, name string, line int) (*mcp.ClientSession, *dbgp.Server, string) {
+	t.Helper()
 	requireEngine(t)
 	cs, srv := newTestMCP(t)
-	script, err := filepath.Abs("../../testdata/php/basic.php")
+	script, err := filepath.Abs("../../testdata/php/" + name)
 	if err != nil {
 		t.Fatal(err)
 	}
-	callTool(t, cs, "add_breakpoint", map[string]any{"file": script, "line": 24}, &addBreakpointOutput{})
+	callTool(t, cs, "add_breakpoint", map[string]any{"file": script, "line": line}, &addBreakpointOutput{})
 	callTool(t, cs, "listen", nil, &listenOutput{})
 	startPHP(t, srv.Port(), script)
 	var waited waitForSessionOutput
@@ -29,8 +36,8 @@ func stoppedInAdd(t *testing.T) (*mcp.ClientSession, *dbgp.Server, string) {
 	}
 	var st stateOutput
 	callTool(t, cs, "continue", nil, &st)
-	if st.Status != "break" || st.Line != 24 {
-		t.Fatalf("continue = %+v, want break at line 24", st)
+	if st.Status != "break" || st.Line != line {
+		t.Fatalf("continue = %+v, want break at line %d", st, line)
 	}
 	return cs, srv, script
 }

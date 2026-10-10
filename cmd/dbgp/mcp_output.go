@@ -30,13 +30,15 @@ func (t *tools) addOutputTools(server *mcp.Server) {
 	mcp.AddTool(server, &mcp.Tool{
 		Name: "output",
 		Description: "Show what a session's script has printed since the last call, so nothing is shown twice; " +
-			"all returns everything kept so far. Works after the session has ended.",
+			"all returns everything kept so far. At most 32 KB is returned at a time: when more is set, call again for the rest. " +
+			"Works after the session has ended.",
 		Annotations: &mcp.ToolAnnotations{ReadOnlyHint: true},
 	}, t.output)
 	mcp.AddTool(server, &mcp.Tool{
 		Name: "warnings",
 		Description: "Show the PHP warnings, notices and other errors a session's script has raised since the last call; " +
-			"all returns every one kept so far. Works after the session has ended.",
+			"all returns every one kept so far. The same warning raised again from the same line is listed once, with a count. " +
+			"At most 50 are returned at a time: when more is set, call again for the rest. Works after the session has ended.",
 		Annotations:  &mcp.ToolAnnotations{ReadOnlyHint: true},
 		OutputSchema: outputSchema[warningsOutput]("warnings"),
 	}, t.warnings)
@@ -63,9 +65,10 @@ type sourceInput struct {
 }
 
 type sourceLine struct {
-	Line    int    `json:"line" jsonschema:"the line number"`
-	Text    string `json:"text" jsonschema:"the line's code"`
-	Current bool   `json:"current,omitempty" jsonschema:"set on the line where execution is stopped"`
+	Line      int    `json:"line" jsonschema:"the line number"`
+	Text      string `json:"text" jsonschema:"the line's code"`
+	Current   bool   `json:"current,omitempty" jsonschema:"set on the line where execution is stopped"`
+	Truncated bool   `json:"truncated,omitempty" jsonschema:"the line is longer than 500 bytes and only its start is shown"`
 }
 
 type sourceOutput struct {
@@ -118,8 +121,9 @@ func (t *tools) source(_ context.Context, _ *mcp.CallToolRequest, in sourceInput
 	}
 	for i, code := range strings.Split(strings.TrimSuffix(text, "\n"), "\n") {
 		n := begin + i
+		short := cutText(code, maxLineBytes)
 		out.Lines = append(out.Lines, sourceLine{
-			Line: n, Text: code,
+			Line: n, Text: short, Truncated: len(short) < len(code),
 			Current: st.Status == dbgp.StatusBreak && st.File == file && st.Line == n,
 		})
 	}
@@ -150,6 +154,7 @@ type outputOutput struct {
 	Session   int    `json:"session" jsonschema:"the session id"`
 	Output    string `json:"output" jsonschema:"what the script printed; empty if nothing new"`
 	Truncated bool   `json:"truncated,omitempty" jsonschema:"earlier output was dropped: only the most recent 1 MB is kept"`
+	More      bool   `json:"more,omitempty" jsonschema:"there is more output after this: call output again for it"`
 }
 
 func (t *tools) output(_ context.Context, _ *mcp.CallToolRequest, in readInput) (*mcp.CallToolResult, outputOutput, error) {
@@ -160,8 +165,9 @@ func (t *tools) output(_ context.Context, _ *mcp.CallToolRequest, in readInput) 
 	out := outputOutput{Session: s.ID()}
 	t.readFrom(&t.outputFrom, s.ID(), in.All, func(from int) int {
 		text, next, truncated := s.Output(from)
-		out.Output, out.Truncated = text, truncated
-		return next
+		out.Output, out.Truncated = cutText(text, maxTextBytes), truncated
+		out.More = len(out.Output) < len(text)
+		return next - (len(text) - len(out.Output))
 	})
 	return nil, out, nil
 }
@@ -171,11 +177,13 @@ type warningInfo struct {
 	Message string `json:"message" jsonschema:"PHP's message"`
 	File    string `json:"file" jsonschema:"local path of the file where it was raised"`
 	Line    int    `json:"line" jsonschema:"the line where it was raised"`
+	Count   int    `json:"count" jsonschema:"how many times it was raised"`
 }
 
 type warningsOutput struct {
 	Session  int           `json:"session" jsonschema:"the session id"`
-	Warnings []warningInfo `json:"warnings" jsonschema:"the warnings, notices and errors, oldest first; empty if nothing new"`
+	Warnings []warningInfo `json:"warnings" jsonschema:"the warnings, notices and errors, in the order first raised; empty if nothing new"`
+	More     bool          `json:"more,omitempty" jsonschema:"there are more after these: call warnings again for them"`
 }
 
 func (t *tools) warnings(_ context.Context, _ *mcp.CallToolRequest, in readInput) (*mcp.CallToolResult, warningsOutput, error) {
@@ -186,14 +194,28 @@ func (t *tools) warnings(_ context.Context, _ *mcp.CallToolRequest, in readInput
 	out := warningsOutput{Session: s.ID(), Warnings: []warningInfo{}}
 	t.readFrom(&t.warningsFrom, s.ID(), in.All, func(from int) int {
 		notes, next := s.Notifications(from)
-		for _, n := range notes {
+		seen := map[warningInfo]int{} // index in out.Warnings, by warning with no count
+		for i, n := range notes {
 			// Other notifications, such as breakpoint_resolved, are routine.
-			if n.Name == "error" && n.Message != nil {
-				out.Warnings = append(out.Warnings, warningInfo{
-					Type: n.Message.Type, Message: strings.TrimSpace(n.Message.Text),
-					File: n.Message.Filename, Line: n.Message.Lineno,
-				})
+			if n.Name != "error" || n.Message == nil {
+				continue
 			}
+			w := warningInfo{
+				Type: n.Message.Type, Message: strings.TrimSpace(n.Message.Text),
+				File: n.Message.Filename, Line: n.Message.Lineno,
+			}
+			if j, ok := seen[w]; ok {
+				out.Warnings[j].Count++
+				continue
+			}
+			if len(out.Warnings) == maxListItems {
+				// The next call starts at this one.
+				out.More = true
+				return next - (len(notes) - i)
+			}
+			seen[w] = len(out.Warnings)
+			w.Count = 1
+			out.Warnings = append(out.Warnings, w)
 		}
 		return next
 	})

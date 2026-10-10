@@ -36,6 +36,10 @@ const (
 	maxNotifications = 1000
 )
 
+// maxEndedSessions is how many ended sessions a Server keeps; older ones
+// are forgotten.
+const maxEndedSessions = 50
+
 var (
 	// ErrRunning is returned for commands sent while the script runs: the
 	// engine only reads commands while it is stopped.
@@ -210,6 +214,16 @@ func (s *Session) State() State {
 
 // Done is closed when the connection has ended.
 func (s *Session) Done() <-chan struct{} { return s.closed }
+
+// ended reports whether the connection has ended.
+func (s *Session) ended() bool {
+	select {
+	case <-s.closed:
+		return true
+	default:
+		return false
+	}
+}
 
 // SetupError reports features from Config.Features the engine rejected.
 func (s *Session) SetupError() error {
