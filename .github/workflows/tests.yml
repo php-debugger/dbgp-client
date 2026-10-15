@@ -64,3 +64,38 @@ jobs:
         env:
           DBGP_REQUIRE_ENGINE: '1'
         run: go test -race -count=1 -v ./...
+
+  # The install scripts, run as users run them, against the latest release.
+  install:
+    name: install script (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v7
+      - name: install.sh
+        if: runner.os != 'Windows'
+        run: |
+          cat scripts/install.sh | sh
+          dbgp -version
+          # A chosen release, to a directory of its own.
+          INSTALL_DIR="$RUNNER_TEMP/dbgp" VERSION=0.1.0 sh scripts/install.sh
+          test "$("$RUNNER_TEMP/dbgp/dbgp" -version)" = "dbgp 0.1.0"
+      - name: install.ps1
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          Get-Content -Raw scripts/install.ps1 | Invoke-Expression
+          $dir = Join-Path $env:ProgramFiles "dbgp"
+          & (Join-Path $dir "dbgp.exe") -version
+          if (-not (([Environment]::GetEnvironmentVariable("Path", "Machine") -split ';') -contains $dir)) {
+            throw "$dir is not on the system PATH"
+          }
+          # A chosen release, to a directory of its own.
+          $env:INSTALL_DIR = Join-Path $env:RUNNER_TEMP "dbgp"
+          $env:VERSION = "0.1.0"
+          ./scripts/install.ps1
+          $got = & (Join-Path $env:INSTALL_DIR "dbgp.exe") -version
+          if ($got -ne "dbgp 0.1.0") { throw "installed $got, want dbgp 0.1.0" }

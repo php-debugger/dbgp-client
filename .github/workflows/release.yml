@@ -48,6 +48,9 @@ jobs:
             fi
             rm -f "build/$bin"
           done
+          # Attach the install scripts too, so releases/latest/download/install.sh
+          # is a stable URL that serves the released version of the script.
+          cp scripts/install.sh scripts/install.ps1 dist/
           ls -la dist
 
       - name: Attach binaries to the release
