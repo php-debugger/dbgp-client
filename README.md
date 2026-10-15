@@ -32,14 +32,14 @@ notes, _ := sess.Notifications(0)   // PHP warnings and other notifications
 
 ## Command-line debugger
 
-`cmd/dbgp` is an interactive debugger built on the library:
+`cmd/dbgp` is an interactive debugger built on the library. Each [release](https://github.com/php-debugger/dbgp-client/releases) has it built for Linux and macOS (amd64 and arm64) and Windows (amd64); or install it with Go:
 
 ```sh
 go install github.com/php-debugger/dbgp-client/cmd/dbgp@latest
 dbgp -break src/Controller/HomeController.php:25
 ```
 
-Then start PHP with debugging enabled (e.g. `php -dxdebug.mode=debug -dxdebug.start_with_request=yes app.php`). Sessions are announced as they connect, and commands that need one wait for it, as `run` and the step commands wait for the script to stop (Ctrl-C cancels a wait). It listens from the start; `unlisten` refuses new PHP connections, so scripts run undebugged, and `listen` accepts them again. `map LOCAL=REMOTE` adds a path mapping while debugging (also applied to connected sessions) and `maps` lists them. Type `help` for commands such as `run`, `next`, `step`, `stack`, `vars`, `print $user["name"]`, `eval`, `output` and `notes`. On a terminal it has line editing, tab completion and history (kept in `~/.dbgp_history`; change it with `-history`, or pass `-history ""` to disable it). Other options: `-addr`, `-idekey`, `-map LOCAL=REMOTE` for PHP in a container or on a server, and `-break FILE:LINE`. Commands can also be piped in on stdin.
+Then start PHP with debugging enabled (e.g. `php -dxdebug.mode=debug -dxdebug.start_with_request=yes app.php`). Sessions are announced as they connect, and commands that need one wait for it, as `run` and the step commands wait for the script to stop (Ctrl-C cancels a wait). It listens from the start; `unlisten` refuses new PHP connections, so scripts run undebugged, and `listen` accepts them again. `map LOCAL=REMOTE` adds a path mapping while debugging (also applied to connected sessions) and `maps` lists them. Type `help` for commands such as `run`, `next`, `step`, `stack`, `vars`, `print $user["name"]`, `eval`, `output` and `notes`. On a terminal it has line editing, tab completion and history (kept in `~/.dbgp_history`; change it with `-history`, or pass `-history ""` to disable it). Other options: `-version`, `-addr`, `-idekey`, `-map LOCAL=REMOTE` for PHP in a container or on a server, and `-break FILE:LINE`. Commands can also be piped in on stdin.
 
 ## MCP server for AI agents
 

@@ -239,16 +239,32 @@ func TestMCPStatusShowsSession(t *testing.T) {
 
 // The built binary in MCP mode, driven over stdin and stdout.
 // buildBinary builds dbgp into a temporary directory and returns its path.
-func buildBinary(t *testing.T) string {
+func buildBinary(t *testing.T, args ...string) string {
 	t.Helper()
 	if testing.Short() {
 		t.Skip("builds the binary")
 	}
 	bin := filepath.Join(t.TempDir(), "dbgp")
-	if out, err := exec.Command("go", "build", "-o", bin, ".").CombinedOutput(); err != nil {
+	if out, err := exec.Command("go", append(append([]string{"build", "-o", bin}, args...), ".")...).CombinedOutput(); err != nil {
 		t.Fatalf("go build: %v\n%s", err, out)
 	}
 	return bin
+}
+
+// Release builds set the version as the release workflow does.
+func TestVersion(t *testing.T) {
+	for _, tc := range []struct {
+		args []string
+		want string
+	}{
+		{nil, "dbgp dev\n"},
+		{[]string{"-ldflags", "-X main.version=1.2.3"}, "dbgp 1.2.3\n"},
+	} {
+		out, err := exec.Command(buildBinary(t, tc.args...), "-version").CombinedOutput()
+		if err != nil || string(out) != tc.want {
+			t.Errorf("%v: -version = %q, %v; want %q", tc.args, out, err, tc.want)
+		}
+	}
 }
 
 func TestMCPBinary(t *testing.T) {
