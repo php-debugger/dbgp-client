@@ -18,6 +18,10 @@ import (
 	dbgp "github.com/php-debugger/dbgp-client"
 )
 
+// version is "dev" for local builds; release builds set it to the release
+// tag with -ldflags "-X main.version=<tag>".
+var version = "dev"
+
 // listFlag collects a repeatable string flag.
 type listFlag []string
 
@@ -32,6 +36,7 @@ func main() {
 	addr := flag.String("addr", dbgp.DefaultAddr, "address to listen on for PHP connections")
 	idekey := flag.String("idekey", "", "accept only sessions with this IDE key")
 	history := flag.String("history", defaultHistoryFile(), "`file` to keep command history in; empty disables it")
+	showVersion := flag.Bool("version", false, "print the version and exit")
 	var maps, breaks listFlag
 	flag.Var(&maps, "map", "path mapping `LOCAL=REMOTE` for PHP in a container or on a server (repeatable)")
 	flag.Var(&breaks, "break", "breakpoint at `FILE:LINE` (repeatable)")
@@ -43,6 +48,10 @@ func main() {
 		flag.PrintDefaults()
 	}
 	flag.Parse()
+	if *showVersion {
+		fmt.Println("dbgp", version)
+		return
+	}
 
 	pathMap, err := parsePathMap(maps)
 	if err != nil {

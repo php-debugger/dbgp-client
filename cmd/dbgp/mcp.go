@@ -18,9 +18,6 @@ import (
 	dbgp "github.com/php-debugger/dbgp-client"
 )
 
-// version identifies this build to MCP clients.
-const version = "dev"
-
 // mcpInstructions are sent to MCP clients when they connect.
 const mcpInstructions = `dbgp debugs PHP scripts and requests through PHP Debugger or Xdebug.
 It does not listen for PHP connections until the listen tool is called, so
