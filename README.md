@@ -43,11 +43,13 @@ Then start PHP with debugging enabled (e.g. `php -dxdebug.mode=debug -dxdebug.st
 
 ## MCP server for AI agents
 
-`dbgp mcp` runs the debugger as an [MCP](https://modelcontextprotocol.io) server on stdin and stdout, so an AI agent can debug PHP. To add it to Claude Code:
+`dbgp mcp` runs the debugger as an [MCP](https://modelcontextprotocol.io) server on stdin and stdout, so an AI agent can debug PHP. Agents start it themselves; to add it to Claude Code:
 
 ```sh
 claude mcp add dbgp -- dbgp mcp
 ```
+
+It can also run in the background, so that it keeps its state between agent sessions and agents share it: `dbgp mcp start` starts it and returns, `dbgp mcp status` shows whether it is running and `dbgp mcp stop` stops it. While it runs, `dbgp mcp` started by an agent passes the agent on to it, and the options given to `dbgp mcp start` apply. The background server serves MCP over HTTP on `127.0.0.1:9004` (change it with `-http`); its log is `mcp.log` in dbgp's cache directory (e.g. `~/.cache/dbgp` on Linux, `~/Library/Caches/dbgp` on macOS).
 
 Unlike the interactive mode, it does not listen for PHP connections until the agent calls the `listen` tool, so PHP runs at full speed until there is something to debug; `-listen` starts listening right away. `-addr`, `-idekey` and `-map LOCAL=REMOTE` work as in the interactive mode.
 

@@ -253,6 +253,7 @@ func buildBinary(t *testing.T) string {
 
 func TestMCPBinary(t *testing.T) {
 	bin := buildBinary(t)
+	daemonEnv(t)
 
 	if out, _ := exec.Command(bin, "mcp", "-h").CombinedOutput(); !strings.Contains(string(out), "Usage: dbgp mcp [options]") {
 		t.Errorf("mcp -h output:\n%s", out)
