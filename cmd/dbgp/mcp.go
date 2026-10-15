@@ -63,20 +63,47 @@ This is the user's choice, not a missing feature or an outdated build: do not
 suggest rebuilding or restarting dbgp to get them. Read values with variables,
 variable and variable_value instead, and work out results from them.`
 
-// runMCP runs dbgp as an MCP server on stdin and stdout until the client
-// disconnects. stdout carries the protocol, so diagnostics go to stderr.
+// runMCP runs dbgp as an MCP server. Agents start it as dbgp mcp and talk
+// to it on stdin and stdout: it serves them itself, or passes them on to the
+// background server when one is running, so they share it. dbgp mcp start,
+// stop and status manage the background server, which serves MCP over HTTP.
 func runMCP(args []string) int {
+	command := ""
+	if len(args) > 0 && !strings.HasPrefix(args[0], "-") {
+		command, args = args[0], args[1:]
+	}
+	switch command {
+	case "", "start", serveCommand:
+	case "stop", "status":
+		if len(args) > 0 {
+			fmt.Fprintf(os.Stderr, "dbgp mcp %s takes no options\n", command)
+			return 2
+		}
+		if command == "stop" {
+			return stopDaemon()
+		}
+		return daemonStatus()
+	default:
+		fmt.Fprintf(os.Stderr, "unknown command %q: use dbgp mcp, dbgp mcp start, stop or status\n", command)
+		return 2
+	}
+
 	fs := flag.NewFlagSet("dbgp mcp", flag.ContinueOnError)
 	addr := fs.String("addr", dbgp.DefaultAddr, "address to listen on for PHP connections")
 	idekey := fs.String("idekey", "", "accept only sessions with this IDE key")
 	listen := fs.Bool("listen", false, "listen for PHP connections from the start, instead of waiting for the listen tool")
 	noEval := fs.Bool("no-eval", false, "leave out the eval and set_variable tools, which run PHP code in the debugged script")
+	httpAddr := fs.String("http", defaultHTTPAddr, "with start: the address agents connect to over HTTP")
 	var maps listFlag
 	fs.Var(&maps, "map", "path mapping `LOCAL=REMOTE` for PHP in a container or on a server (repeatable)")
 	fs.Usage = func() {
-		fmt.Fprintf(fs.Output(), "Usage: dbgp mcp [options]\n\n"+
-			"Runs dbgp as an MCP server on stdin and stdout, for AI agents.\n"+
-			"It does not listen for PHP connections until asked to.\n\nOptions:\n")
+		fmt.Fprintf(fs.Output(), "Usage: dbgp mcp [options]\n       dbgp mcp start [options]\n       dbgp mcp stop\n       dbgp mcp status\n\n"+
+			"dbgp mcp runs dbgp as an MCP server for AI agents, on stdin and stdout:\n"+
+			"agents start it themselves. When the background server is running, it\n"+
+			"connects the agent to that instead, and the background server's options apply.\n"+
+			"dbgp mcp start starts the background server, which agents share, and returns;\n"+
+			"dbgp mcp stop stops it and dbgp mcp status shows whether it is running.\n"+
+			"dbgp does not listen for PHP connections until asked to.\n\nOptions:\n")
 		fs.PrintDefaults()
 	}
 	if err := fs.Parse(args); err != nil {
@@ -85,12 +112,35 @@ func runMCP(args []string) int {
 		}
 		return 2
 	}
-
+	if fs.NArg() > 0 {
+		fmt.Fprintf(os.Stderr, "unexpected argument %q\n", fs.Arg(0))
+		return 2
+	}
 	pathMap, err := parsePathMap(maps)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		return 2
 	}
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	switch command {
+	case "start":
+		return startDaemon(args)
+	case "":
+		if st, err := running(); err == nil && st != nil {
+			if len(args) > 0 {
+				fmt.Fprintf(os.Stderr, "dbgp: using the background server at %s, with its own options: %s ignored\n",
+					st.URL, strings.Join(args, " "))
+			}
+			if err := bridge(ctx, st.URL); err != nil && ctx.Err() == nil {
+				fmt.Fprintln(os.Stderr, err)
+				return 1
+			}
+			return 0
+		}
+	}
+
 	srv, err := dbgp.NewServer(dbgp.Config{Addr: *addr, IDEKey: *idekey, PathMap: pathMap})
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
@@ -103,10 +153,13 @@ func runMCP(args []string) int {
 			return 1
 		}
 	}
-
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
-	if err := newMCPServer(srv, !*noEval).Run(ctx, &mcp.StdioTransport{}); err != nil && ctx.Err() == nil {
+	server := newMCPServer(srv, !*noEval)
+	if command == serveCommand {
+		err = serveHTTP(ctx, server, *httpAddr)
+	} else {
+		err = server.Run(ctx, &mcp.StdioTransport{})
+	}
+	if err != nil && ctx.Err() == nil {
 		fmt.Fprintln(os.Stderr, err)
 		return 1
 	}

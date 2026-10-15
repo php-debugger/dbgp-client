@@ -11,8 +11,9 @@ import (
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
-// A whole debugging run through the dbgp binary over stdio, as an agent
-// does it: from listening to a finished script and nothing left behind.
+// A whole debugging run as an agent does it, through dbgp mcp passing it on
+// to the background server: from listening to a finished script and nothing
+// left behind.
 func TestMCPEndToEnd(t *testing.T) {
 	requireEngine(t)
 	bin := buildBinary(t)
@@ -22,7 +23,9 @@ func TestMCPEndToEnd(t *testing.T) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
-	transport := &mcp.CommandTransport{Command: exec.CommandContext(ctx, bin, "mcp", "-addr", "127.0.0.1:0")}
+	daemonEnv(t)
+	startTestDaemon(t, bin, "-addr", "127.0.0.1:0")
+	transport := &mcp.CommandTransport{Command: exec.CommandContext(ctx, bin, "mcp")}
 	cs, err := mcp.NewClient(&mcp.Implementation{Name: "test", Version: "0"}, nil).Connect(ctx, transport, nil)
 	if err != nil {
 		t.Fatal(err)
