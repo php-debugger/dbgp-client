@@ -1,38 +1,15 @@
-# dbgp-client
-CLI DBGP client
+# DBGP Client
 
-Code imported from `cli/dbgp` in https://github.com/php-debugger/php-debugger/pull/12 (authored by @Haehnchen).
+DBGP Client is a debugger client for PHP. Its `dbgp` command speaks DBGp, the protocol of [PHP Debugger](https://php-debugger.dev) and Xdebug, and can be used in two ways:
 
-## Usage
+- **As a debugging tool for AI agents.** `dbgp mcp` is an [MCP](https://modelcontextprotocol.io) server that lets an agent such as Claude Code debug PHP the way you would: set breakpoints, run the code, step through it, and look at the stack, variables, output and warnings.
+- **As a command-line DBGp client.** `dbgp` on its own is an interactive debugger in your terminal, for when you want to debug PHP yourself without an IDE.
 
-A `Server` listens for [PHP Debugger](https://php-debugger.dev) or Xdebug connections. Each PHP request or script run becomes a `Session`, which waits at the start of the script until it is continued. `NewServer` creates a server that is not listening yet: until `StartListening`, its port is closed, so PHP's connection is refused at once and scripts run undebugged at full speed. `StopListening` refuses new connections again without affecting connected sessions; `Listen` is `NewServer` plus `StartListening`. `AddPathMapping` adds a path mapping at any time; connected sessions use it at once.
-
-```go
-srv, err := dbgp.Listen(dbgp.Config{
-	Addr: "0.0.0.0:9003",
-	// For PHP in a container or on a remote server: sessions take and
-	// return local paths, and the engine sees its own. Not needed when the
-	// server has its own .xdebug map files; Session.EngineMapping reports that.
-	PathMap: []dbgp.PathMapping{{Local: "/home/me/project", Remote: "/var/www/html"}},
-})
-// Server breakpoints apply to every session, including ones that connect later.
-srv.AddBreakpoint(dbgp.Breakpoint{File: "/home/me/project/index.php", Line: 12})
-
-sess, err := srv.WaitForSession(ctx)
-// Continue waits up to the given time; if the script is still running then,
-// the state says so and Wait can be called later.
-st, err := sess.Continue(ctx, dbgp.ContinueRun, 30*time.Second)
-if st.Status == dbgp.StatusBreak {
-	stack, _ := sess.GetStack()
-	vars, _ := sess.GetContext(0, 0)
-}
-out, next, _ := sess.Output(0)      // program output, read incrementally
-notes, _ := sess.Notifications(0)   // PHP warnings and other notifications
-```
+Both work with PHP scripts and web requests, on your local machine or in a container or on a server.
 
 ## Installation
 
-The `dbgp` command, both the command-line debugger and the MCP server, installs system-wide with a script that downloads the latest [release](https://github.com/php-debugger/dbgp-client/releases) for your OS and architecture.
+The install script downloads the latest [release](https://github.com/php-debugger/dbgp-client/releases) for your OS and architecture and installs `dbgp` system-wide.
 
 macOS / Linux (installs to `/usr/local/bin`, using `sudo` if needed):
 
@@ -46,7 +23,7 @@ Windows (PowerShell as administrator; installs to `%ProgramFiles%\dbgp` and adds
 powershell -c "irm https://github.com/php-debugger/dbgp-client/releases/latest/download/install.ps1 | iex"
 ```
 
-Set `INSTALL_DIR` to install elsewhere, and `VERSION` (e.g. `0.1.0`) to install a release other than the latest. Run the script again to update; if the background MCP server is running, restart it afterwards with `dbgp mcp stop` and `dbgp mcp start`. Builds are published for Linux and macOS (amd64 and arm64) and Windows (amd64, which also runs on ARM); elsewhere, install with Go:
+Set `INSTALL_DIR` to install elsewhere, and `VERSION` (e.g. `0.1.1`) to install a release other than the latest. Run the script again to update. Builds are published for Linux and macOS (amd64 and arm64) and Windows (amd64); elsewhere, install with Go:
 
 ```sh
 go install github.com/php-debugger/dbgp-client/cmd/dbgp@latest
@@ -54,40 +31,49 @@ go install github.com/php-debugger/dbgp-client/cmd/dbgp@latest
 
 `dbgp -version` shows the installed version.
 
-## Command-line debugger
+To be debugged, PHP needs [PHP Debugger](https://php-debugger.dev) or Xdebug: `php -v` shows which one it has.
 
-`cmd/dbgp` is an interactive debugger built on the library:
+## Debugging with AI agents
 
-```sh
-dbgp -break src/Controller/HomeController.php:25
-```
-
-Then start PHP with debugging enabled (e.g. `php -dxdebug.mode=debug -dxdebug.start_with_request=yes app.php`). Sessions are announced as they connect, and commands that need one wait for it, as `run` and the step commands wait for the script to stop (Ctrl-C cancels a wait). It listens from the start; `unlisten` refuses new PHP connections, so scripts run undebugged, and `listen` accepts them again. `map LOCAL=REMOTE` adds a path mapping while debugging (also applied to connected sessions) and `maps` lists them. Type `help` for commands such as `run`, `next`, `step`, `stack`, `vars`, `print $user["name"]`, `eval`, `output` and `notes`. On a terminal it has line editing, tab completion and history (kept in `~/.dbgp_history`; change it with `-history`, or pass `-history ""` to disable it). Other options: `-version`, `-addr`, `-idekey`, `-map LOCAL=REMOTE` for PHP in a container or on a server, and `-break FILE:LINE`. Commands can also be piped in on stdin.
-
-## MCP server for AI agents
-
-`dbgp mcp` runs the debugger as an [MCP](https://modelcontextprotocol.io) server on stdin and stdout, so an AI agent can debug PHP. Agents start it themselves; to add it to Claude Code:
+Add `dbgp mcp` to your agent as an MCP server. For example, for Claude Code:
 
 ```sh
 claude mcp add dbgp -- dbgp mcp
 ```
 
-It can also run in the background, so that it keeps its state between agent sessions and agents share it: `dbgp mcp start` starts it and returns, `dbgp mcp status` shows whether it is running and `dbgp mcp stop` stops it. While it runs, `dbgp mcp` started by an agent passes the agent on to it, and the options given to `dbgp mcp start` apply. The background server serves MCP over HTTP on `127.0.0.1:9004` (change it with `-http`); its log is `mcp.log` in dbgp's cache directory (e.g. `~/.cache/dbgp` on Linux, `~/Library/Caches/dbgp` on macOS).
+Other agents take the same command, `dbgp mcp`, in their MCP settings. Then ask the agent to debug something, for example:
 
-Unlike the interactive mode, it does not listen for PHP connections until the agent calls the `listen` tool, so PHP runs at full speed until there is something to debug; `-listen` starts listening right away. `-addr`, `-idekey` and `-map LOCAL=REMOTE` work as in the interactive mode.
+> Find out why the total on the checkout page is wrong: debug the request to /checkout with a breakpoint in CartService::total().
 
-Tools: `status` (listening state, sessions, breakpoints and path mappings), `listen` and `unlisten`; `add_breakpoint`, `remove_breakpoint` and `breakpoints`; `add_path_mapping` and `path_mappings`; `sessions`, `wait_for_session`, `continue` (run or step), `wait_for_stop`, `stop` and `detach`; `stack`, `variables`, `variable` (one variable, a page of its contents at a time) and `variable_value`; `source`, `output` and `warnings` (what the script printed and the PHP warnings it raised, each read incrementally); `eval` and `set_variable`, which run PHP code in the debugged script and can be left out with `-no-eval`.
+The agent starts the PHP code itself, as a script or a web request, and debugs it with dbgp's tools: breakpoints, running and stepping, the call stack and variables, the source, what the script printed and the PHP warnings it raised, and evaluating PHP code. dbgp only listens for PHP connections while the agent is debugging, so PHP runs at full speed the rest of the time.
 
-Results are kept small enough for an agent's context: stack frames and variables come in pages of 50, output and long values in parts of 32 KB, warnings 50 at a time with repeats counted once, and long source lines are cut at 500 bytes. The 50 most recent ended sessions are kept, with their output.
+You can optionally add some options after `dbgp mcp`:
 
-## Testing
+- `-no-eval` leaves out the tools that run PHP code in the debugged script (evaluating expressions and changing variables), so the agent can only look.
+- `-map LOCAL=REMOTE` maps a directory on this machine to where PHP sees it, for PHP in a container or on a server. The agent can also add mappings itself.
+- `-addr` changes the address dbgp listens on for PHP, `localhost:9003` by default.
+
+By default each agent session starts its own dbgp. To keep breakpoints and sessions between agent sessions, and share them between agents, run dbgp in the background:
 
 ```sh
-go test -race ./...
+dbgp mcp start     # start it, with any of the options above
+dbgp mcp status    # is it running?
+dbgp mcp stop      # stop it
 ```
 
-- **Unit tests** run the client against a fake debug engine (`fakeengine_test.go`) that parses commands the way Xdebug and PHP Debugger do and replays packets recorded from a real PHP Debugger session (`testdata/dbgp/`).
-- **Integration tests** (`integration_test.go`) debug `testdata/php/basic.php` with a real PHP and a DBGp engine: [PHP Debugger](https://php-debugger.dev) (used in CI) or Xdebug. They are skipped when `php` has neither loaded, or with `-short`; set `DBGP_REQUIRE_ENGINE=1` to make that a failure instead.
-- **Known bugs** are documented by tests that call `knownBug(...)` and are skipped by default. Run them with `DBGP_KNOWN_BUGS=1 go test -race ./...`; remove the call when the bug is fixed.
-- **CI** (`.github/workflows/tests.yml`) runs on pull requests and pushes to `main`: gofmt and `go vet`, then the full suite against the latest PHP Debugger release for PHP 8.2–8.5.
-- **Re-recording fixtures**: `DBGP_CAPTURE=1 go test -run TestCaptureFixtures` (records from whichever engine `php` has loaded; CI uses PHP Debugger). Paths and process ids are normalised so recordings are stable.
+While it runs, agents that start `dbgp mcp` use it instead, with the options it was started with. After updating dbgp, restart it to use the new version.
+
+`dbgp mcp -h` lists all the options.
+
+## Debugging from the command line
+
+Run `dbgp`, optionally with breakpoints, then run the PHP code, for example in another terminal:
+
+```sh
+dbgp -break src/Controller/HomeController.php:25
+php app.php
+```
+
+Each script or request that connects becomes a session, stopped at its start. At the prompt, `run` runs to the next breakpoint, `next`, `step` and `out` step through the code, and `stack`, `vars` and `print $user["name"]` show where it stopped. On a terminal it has line editing, tab completion and history.
+
+Type `help` at the prompt for all the commands, and see `dbgp -h` for the options, such as `-map` for PHP in a container or on a server.
