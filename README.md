@@ -30,12 +30,35 @@ out, next, _ := sess.Output(0)      // program output, read incrementally
 notes, _ := sess.Notifications(0)   // PHP warnings and other notifications
 ```
 
-## Command-line debugger
+## Installation
 
-`cmd/dbgp` is an interactive debugger built on the library. Each [release](https://github.com/php-debugger/dbgp-client/releases) has it built for Linux and macOS (amd64 and arm64) and Windows (amd64); or install it with Go:
+The `dbgp` command, both the command-line debugger and the MCP server, installs system-wide with a script that downloads the latest [release](https://github.com/php-debugger/dbgp-client/releases) for your OS and architecture.
+
+macOS / Linux (installs to `/usr/local/bin`, using `sudo` if needed):
+
+```sh
+curl -fsSL https://github.com/php-debugger/dbgp-client/releases/latest/download/install.sh | sh
+```
+
+Windows (PowerShell as administrator; installs to `%ProgramFiles%\dbgp` and adds it to the system PATH):
+
+```powershell
+powershell -c "irm https://github.com/php-debugger/dbgp-client/releases/latest/download/install.ps1 | iex"
+```
+
+Set `INSTALL_DIR` to install elsewhere, and `VERSION` (e.g. `0.1.0`) to install a release other than the latest. Run the script again to update; if the background MCP server is running, restart it afterwards with `dbgp mcp stop` and `dbgp mcp start`. Builds are published for Linux and macOS (amd64 and arm64) and Windows (amd64, which also runs on ARM); elsewhere, install with Go:
 
 ```sh
 go install github.com/php-debugger/dbgp-client/cmd/dbgp@latest
+```
+
+`dbgp -version` shows the installed version.
+
+## Command-line debugger
+
+`cmd/dbgp` is an interactive debugger built on the library:
+
+```sh
 dbgp -break src/Controller/HomeController.php:25
 ```
 
