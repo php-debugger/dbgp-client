@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
@@ -143,7 +144,7 @@ func TestMCPRunningSession(t *testing.T) {
 	if msg := callToolError(t, cs, "continue", nil); !strings.Contains(msg, "session 1 is still running: call wait_for_stop first") {
 		t.Errorf("continue while running: %q", msg)
 	}
-	if msg := callToolError(t, cs, "stop", nil); !strings.Contains(msg, "still running") {
+	if msg := callToolError(t, cs, "stop", nil); !strings.Contains(msg, "dbgp cannot stop it: call wait_for_stop") {
 		t.Errorf("stop while running: %q", msg)
 	}
 	callTool(t, cs, "wait_for_stop", map[string]any{"wait": 10}, &st)
@@ -153,6 +154,41 @@ func TestMCPRunningSession(t *testing.T) {
 	callTool(t, cs, "detach", nil, &st)
 	if st.Status != "stopping" && st.Status != "ended" {
 		t.Errorf("detach = %+v", st)
+	}
+}
+
+// A script stuck in a loop never stops, so it cannot be stopped, but
+// detach lets it go: the session ends, and the script runs on without the
+// debugger.
+func TestMCPDetachRunawayScript(t *testing.T) {
+	requireEngine(t)
+	cs, srv := newTestMCP(t)
+	callTool(t, cs, "listen", nil, &listenOutput{})
+	counter := filepath.Join(t.TempDir(), "counter")
+	startPHP(t, srv.Port(), "-r", fmt.Sprintf(`for ($i = 0; ; $i++) { file_put_contents(%q, $i); usleep(10000); }`, counter))
+	var waited waitForSessionOutput
+	callTool(t, cs, "wait_for_session", map[string]any{"wait": 10}, &waited)
+	if !waited.Connected {
+		t.Fatal("PHP did not connect")
+	}
+	var st stateOutput
+	callTool(t, cs, "continue", map[string]any{"wait": 0.2}, &st)
+	if st.Status != "running" {
+		t.Fatalf("continue = %+v, want running", st)
+	}
+	if msg := callToolError(t, cs, "stop", nil); !strings.Contains(msg, "detach to let it run on") {
+		t.Errorf("stop while running: %q", msg)
+	}
+
+	callTool(t, cs, "detach", nil, &st)
+	if st.Session != 1 || st.Status != "ended" {
+		t.Errorf("detach while running = %+v, want session 1 ended", st)
+	}
+	count := func() string { data, _ := os.ReadFile(counter); return string(data) }
+	before := count()
+	time.Sleep(300 * time.Millisecond)
+	if after := count(); after == before {
+		t.Errorf("the script stopped counting at %q after detach, want it to run on", before)
 	}
 }
 

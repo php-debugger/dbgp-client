@@ -830,7 +830,9 @@ func (s *Session) ListBreakpoints() ([]BreakpointInfo, error) {
 
 // Stop ends the script and the session. Stopped mid-script, the engine
 // waits for the IDE to close the connection before PHP exits, so Stop closes
-// it, and returns once the session has ended.
+// it, and returns once the session has ended. A running script reads no
+// commands, so Stop cannot end it and returns ErrRunning; Detach can let it
+// go.
 func (s *Session) Stop() error {
 	if _, err := s.sendCommand("stop", nil, nil); err != nil {
 		return err
@@ -840,9 +842,17 @@ func (s *Session) Stop() error {
 	return nil
 }
 
-// Detach stops debugging and lets the script run to completion.
+// Detach stops debugging and lets the script run to completion. The engine
+// reads commands only while the script is stopped, so a running script, e.g.
+// one stuck in a loop, is detached by closing the connection instead: the
+// engine then carries on without the debugger.
 func (s *Session) Detach() error {
 	_, err := s.sendCommand("detach", nil, nil)
+	if errors.Is(err, ErrRunning) {
+		_ = s.conn.Close()
+		<-s.closed
+		return nil
+	}
 	return err
 }
 

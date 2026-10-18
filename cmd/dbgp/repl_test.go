@@ -217,6 +217,41 @@ func TestCommandsWaitForSessionUntilInterrupted(t *testing.T) {
 	}
 }
 
+// A script stuck in a loop: after Ctrl-C, detach lets it go at once
+// rather than waiting for it to stop, as other commands do.
+func TestDetachRunawayScript(t *testing.T) {
+	requireEngine(t)
+	r, srv, output := newTestREPL(t)
+	go r.announceSessions()
+	startPHP(t, srv.Port(), "-r", `for (;;) { usleep(10000); }`)
+	interrupts := make(chan os.Signal, 1)
+	go r.cancelOnInterrupt(interrupts)
+	go func() {
+		time.Sleep(500 * time.Millisecond)
+		interrupts <- os.Interrupt
+	}()
+	r.execLine("run")
+	if out := output(); !strings.Contains(out, "except detach, which lets it run on without the debugger") {
+		t.Fatalf("run, then Ctrl-C:\n%s", out)
+	}
+
+	done := make(chan struct{})
+	go func() { r.execLine("detach"); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		interrupts <- os.Interrupt
+		<-done
+		t.Fatalf("detach waited for the script to stop:\n%s", output())
+	}
+	if out := output(); !strings.Contains(out, "Detached session 1; the script runs on.") {
+		t.Errorf("detach:\n%s", out)
+	}
+	if st := srv.Session(1).State(); !st.Closed {
+		t.Errorf("session 1 after detach = %+v, want closed", st)
+	}
+}
+
 // requireEngine skips unless php has PHP Debugger or Xdebug, like the
 // library's integration tests.
 func requireEngine(t *testing.T) {

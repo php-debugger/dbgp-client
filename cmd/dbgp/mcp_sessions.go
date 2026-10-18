@@ -52,12 +52,15 @@ func (t *tools) addSessionTools(server *mcp.Server) {
 		Annotations: &mcp.ToolAnnotations{ReadOnlyHint: true},
 	}, t.waitForStop)
 	mcp.AddTool(server, &mcp.Tool{
-		Name:        "stop",
-		Description: "End a session: the script stops where it is.",
+		Name: "stop",
+		Description: "End a session: the script stops where it is. Only while it is stopped: PHP takes no commands " +
+			"while the script runs, so a running script, e.g. one stuck in a loop, cannot be stopped; detach it instead.",
 	}, t.stopSession)
 	mcp.AddTool(server, &mcp.Tool{
-		Name:        "detach",
-		Description: "Stop debugging a session and let the script run on to its end without the debugger.",
+		Name: "detach",
+		Description: "Stop debugging a session and let the script run on to its end without the debugger. " +
+			"Also works while the script is running, e.g. stuck in a loop: dbgp disconnects from it, " +
+			"which frees the session, but the script keeps running until it ends or you end its PHP process.",
 	}, t.detachSession)
 }
 
@@ -278,7 +281,11 @@ func (t *tools) stopSession(_ context.Context, req *mcp.CallToolRequest, in sess
 	if err != nil {
 		return nil, stateOutput{}, err
 	}
-	if err := s.Stop(); err != nil {
+	if err := s.Stop(); errors.Is(err, dbgp.ErrRunning) {
+		return nil, stateOutput{}, fmt.Errorf("session %d is running, and PHP takes no commands while the script runs, "+
+			"so dbgp cannot stop it: call wait_for_stop to wait for it to stop, or detach to let it run on "+
+			"without the debugger, then end its PHP process if it does not finish", s.ID())
+	} else if err != nil {
 		return nil, stateOutput{}, sessionError(s, err)
 	}
 	return nil, toState(s, s.State()), nil

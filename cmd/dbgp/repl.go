@@ -444,7 +444,8 @@ func continueWith(command string) func(r *repl, ctx context.Context, args string
 		}
 		st, err := s.Continue(ctx, command, forever)
 		if errors.Is(err, context.Canceled) {
-			r.printf("Interrupted; the script is still running. The next command waits for it to stop.\n")
+			r.printf("Interrupted; the script is still running. The next command waits for it to stop,\n" +
+				"except detach, which lets it run on without the debugger.\n")
 			return nil
 		}
 		if err != nil {
@@ -969,9 +970,14 @@ func (r *repl) cmdStop(ctx context.Context, _ string) error {
 }
 
 func (r *repl) cmdDetach(ctx context.Context, _ string) error {
-	s, err := r.live(ctx)
-	if err != nil {
-		return err
+	// A running script is detached at once, not waited for: it may never
+	// stop, e.g. stuck in a loop.
+	s := r.session()
+	if s == nil || s.State().Status != dbgp.StatusRunning {
+		var err error
+		if s, err = r.live(ctx); err != nil {
+			return err
+		}
 	}
 	if err := s.Detach(); err != nil {
 		return err

@@ -873,6 +873,34 @@ func TestStopEndsTheSession(t *testing.T) {
 	}
 }
 
+// A running script reads no commands, e.g. one stuck in a loop: Stop
+// cannot end it, but Detach lets it go by closing the connection, so the
+// engine carries on without the debugger.
+func TestDetachRunningScript(t *testing.T) {
+	handlers := standardHandlers()
+	handlers["run"] = func(*fakeEngine, fakeCommand) []string { return nil } // never stops
+	s, e := startFakeSession(t, handlers)
+	if st, err := s.Continue(context.Background(), ContinueRun, 50*time.Millisecond); err != nil || st.Status != StatusRunning {
+		t.Fatalf("Continue = %+v, %v; want running", st, err)
+	}
+	if err := s.Stop(); !errors.Is(err, ErrRunning) {
+		t.Errorf("Stop while running = %v, want ErrRunning", err)
+	}
+	e.ClearReceived()
+	if err := s.Detach(); err != nil {
+		t.Fatalf("Detach while running: %v", err)
+	}
+	if st := s.State(); !st.Closed {
+		t.Errorf("State after Detach = %+v, want closed", st)
+	}
+	if !e.WaitClosed(3 * time.Second) {
+		t.Error("the engine's connection is still open after Detach")
+	}
+	if got := e.Received(); len(got) != 0 {
+		t.Errorf("Detach sent %v to an engine that reads no commands", got)
+	}
+}
+
 func TestOutputIsCaptured(t *testing.T) {
 	s, e := startFakeSession(t, standardHandlers())
 	stream := func(text string) string {
