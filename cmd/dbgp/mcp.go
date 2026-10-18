@@ -142,7 +142,12 @@ func runMCP(args []string) int {
 	case "start":
 		return startDaemon(args)
 	case "":
-		if st, err := running(); err == nil && st != nil {
+		st, err := running()
+		if err != nil {
+			// Serve the agent here instead.
+			fmt.Fprintln(os.Stderr, "dbgp:", err)
+		}
+		if st != nil {
 			if len(args) > 0 {
 				fmt.Fprintf(os.Stderr, "dbgp: using the background server at %s, with its own options: %s ignored\n",
 					st.URL, strings.Join(args, " "))

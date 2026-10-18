@@ -2,8 +2,11 @@ package main
 
 import (
 	"context"
+	"crypto/hmac"
 	"crypto/rand"
+	"crypto/sha256"
 	"crypto/subtle"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -26,6 +29,8 @@ import (
 // find it; there is one per user. The state file also holds a token that
 // every request must carry: only the user can read the file, so other users
 // on the machine cannot use the server, which runs PHP code for its agents.
+// The token also proves the server is the one the file records, before
+// anything is sent to it: see verify.
 
 // serveCommand runs the background server in this process. dbgp mcp start
 // runs it; it is not meant to be typed.
@@ -134,8 +139,14 @@ func removeState(pid int) {
 	}
 }
 
+// errNotOurs is returned by running when something other than the
+// recorded server answers at its URL: the server died, and another
+// program, perhaps another user's, took its port.
+var errNotOurs = errors.New("something other than the dbgp MCP server answers")
+
 // running returns the recorded server if it is answering, removing a state
-// file left behind by one that is not.
+// file left behind by one that is not. It fails with errNotOurs when
+// something else answers in its place.
 func running() (*daemonState, error) {
 	st, err := readState()
 	if err != nil || st == nil {
@@ -145,7 +156,70 @@ func running() (*daemonState, error) {
 		removeState(st.PID)
 		return nil, nil
 	}
+	if !verify(st) {
+		removeState(st.PID)
+		return nil, fmt.Errorf("%w at %s, where it ran: ignoring it", errNotOurs, st.URL)
+	}
 	return st, nil
+}
+
+// identifyPath is where the server proves who it is; see verify.
+const identifyPath = "/identify"
+
+// identity is the server's answer to a challenge.
+type identity struct {
+	PID   int    `json:"pid"`
+	Proof string `json:"proof"`
+}
+
+// identityProof answers challenge nonce for the server with pid: an HMAC
+// keyed with the token, which only the user can read.
+func identityProof(token, nonce string, pid int) string {
+	mac := hmac.New(sha256.New, []byte(token))
+	fmt.Fprintf(mac, "dbgp identify\x00%s\x00%d", nonce, pid)
+	return hex.EncodeToString(mac.Sum(nil))
+}
+
+// verify reports whether the server at st.URL is the one st records, with
+// its pid: it must answer a fresh challenge with a proof only a holder of
+// st's token can give. The token itself is not sent, so a program that took
+// the port of a server that died learns nothing from being asked.
+func verify(st *daemonState) bool {
+	u, err := url.Parse(st.URL)
+	if err != nil || st.Token == "" {
+		return false
+	}
+	nonce := rand.Text()
+	u.Path, u.RawQuery = identifyPath, url.Values{"nonce": {nonce}}.Encode()
+	client := &http.Client{
+		Timeout: 2 * time.Second,
+		// Only the recorded server may answer.
+		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
+	}
+	resp, err := client.Get(u.String())
+	if err != nil {
+		return false
+	}
+	defer resp.Body.Close()
+	var id identity
+	if resp.StatusCode != http.StatusOK || json.NewDecoder(io.LimitReader(resp.Body, 4<<10)).Decode(&id) != nil {
+		return false
+	}
+	want := identityProof(st.Token, nonce, st.PID)
+	return id.PID == st.PID && hmac.Equal([]byte(id.Proof), []byte(want))
+}
+
+// identify answers verify's challenges for the server st.
+func identify(st daemonState) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		nonce := req.URL.Query().Get("nonce")
+		if len(nonce) < 16 || len(nonce) > 256 {
+			http.Error(w, "nonce must be 16 to 256 characters", http.StatusBadRequest)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(identity{PID: st.PID, Proof: identityProof(st.Token, nonce, st.PID)})
+	})
 }
 
 // answering reports whether something accepts connections at rawURL.
@@ -165,7 +239,10 @@ func answering(rawURL string) bool {
 // startDaemon starts the server in the background, running this program
 // with serveCommand and args, and waits for it to answer.
 func startDaemon(args []string) int {
-	if st, err := running(); err != nil {
+	if st, err := running(); errors.Is(err, errNotOurs) {
+		// Its state is gone: start a new one.
+		fmt.Fprintln(os.Stderr, err)
+	} else if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		return 1
 	} else if st != nil {
@@ -198,7 +275,7 @@ func startDaemon(args []string) int {
 
 	deadline := time.After(startTimeout)
 	for {
-		if st, _ := readState(); st != nil && st.PID == cmd.Process.Pid && answering(st.URL) {
+		if st, _ := readState(); st != nil && st.PID == cmd.Process.Pid && verify(st) {
 			fmt.Printf("dbgp MCP server running at %s (pid %d)\n"+
 				"Agents that start dbgp mcp now use it. Stop it with: dbgp mcp stop\n", st.URL, st.PID)
 			return 0
@@ -379,6 +456,7 @@ func serveHTTP(ctx context.Context, server *mcp.Server, port int) error {
 		&mcp.StreamableHTTPOptions{CrossOriginProtection: http.NewCrossOriginProtection()})
 	mux := http.NewServeMux()
 	mux.Handle("/mcp", requireToken(st.Token, handler))
+	mux.Handle(identifyPath, identify(st))
 	hs := &http.Server{Handler: mux, ReadHeaderTimeout: 10 * time.Second}
 	go func() {
 		<-ctx.Done()
