@@ -66,6 +66,8 @@ func TestServerDropsBadInit(t *testing.T) {
 		"missing nul":     "7\x00<init/>X",
 		"wrong root":      "11\x00<response/>\x00",
 		"closed too soon": "100\x00<init",
+		"huge length":     "9223372036854775807\x00",
+		"over the limit":  strconv.Itoa(maxInitPacketBytes+1) + "\x00",
 	} {
 		t.Run(name, func(t *testing.T) {
 			srv := newTestServer(t, Config{})

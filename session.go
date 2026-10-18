@@ -2,6 +2,7 @@ package dbgp
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/json"
@@ -263,32 +264,37 @@ func (s *Session) Notifications(from int) ([]Notification, int) {
 	return append([]Notification(nil), s.notes[from-s.notesBase:]...), next
 }
 
-// readPacket reads a single DBGp packet (length + NULL + data + NULL)
-func readPacket(reader *bufio.Reader) ([]byte, error) {
-	// Read length until NULL
-	line, err := reader.ReadString('\x00')
+// Packet size limits. The length comes from whoever connected, so a bad one
+// must not crash dbgp or make it allocate more than the data that arrives.
+const (
+	// maxPacketBytes bounds every packet. Responses can be large, such as a
+	// long string from property_value, but not this large.
+	maxPacketBytes = 256 << 20
+	// maxInitPacketBytes bounds the init packet, which a connection sends
+	// before it is known to be an engine. Real ones are well under 1 KB.
+	maxInitPacketBytes = 64 << 10
+	// packetChunk is how much of a packet is allocated ahead of the data.
+	packetChunk = 64 << 10
+)
+
+// readPacket reads a single DBGp packet, length NUL data NUL, of at most
+// limit bytes of data.
+func readPacket(reader *bufio.Reader, limit int) ([]byte, error) {
+	length, err := readPacketLength(reader, limit)
 	if err != nil {
 		return nil, err
 	}
 
-	// Parse length
-	line = strings.TrimSuffix(line, "\x00")
-	length, err := strconv.Atoi(line)
-	if err != nil {
-		return nil, fmt.Errorf("parse packet length: %w", err)
-	}
-	if length < 0 {
-		return nil, fmt.Errorf("negative packet length %d", length)
-	}
-
-	// Read exact number of bytes
-	data := make([]byte, length)
-	_, err = io.ReadFull(reader, data)
-	if err != nil {
+	// Grow the buffer as the data arrives rather than trusting the length.
+	var data bytes.Buffer
+	data.Grow(min(length, packetChunk))
+	if _, err := io.CopyN(&data, reader, int64(length)); err != nil {
+		if errors.Is(err, io.EOF) {
+			err = io.ErrUnexpectedEOF
+		}
 		return nil, err
 	}
 
-	// Read trailing NULL
 	b, err := reader.ReadByte()
 	if err != nil {
 		return nil, err
@@ -296,8 +302,33 @@ func readPacket(reader *bufio.Reader) ([]byte, error) {
 	if b != '\x00' {
 		return nil, fmt.Errorf("expected NULL terminator, got %x", b)
 	}
+	return data.Bytes(), nil
+}
 
-	return data, nil
+// readPacketLength reads the decimal length that starts a packet and its
+// NUL terminator. It stops at the first byte that cannot be part of a valid
+// length, so a sender cannot make it read an endless prefix.
+func readPacketLength(reader *bufio.Reader, limit int) (int, error) {
+	maxDigits := len(strconv.Itoa(limit))
+	var length int64
+	for digits := 0; ; digits++ {
+		b, err := reader.ReadByte()
+		if err != nil {
+			return 0, err
+		}
+		switch {
+		case b == '\x00' && digits > 0:
+			return int(length), nil
+		case b < '0' || b > '9':
+			return 0, fmt.Errorf("invalid packet length: unexpected byte %q", b)
+		case digits == maxDigits:
+			return 0, fmt.Errorf("invalid packet length: more than %d digits", maxDigits)
+		}
+		length = length*10 + int64(b-'0')
+		if length > int64(limit) {
+			return 0, fmt.Errorf("packet length exceeds the limit of %d bytes", limit)
+		}
+	}
 }
 
 // readLoop reads packets until the connection ends, then marks the session
@@ -305,7 +336,7 @@ func readPacket(reader *bufio.Reader) ([]byte, error) {
 func (s *Session) readLoop(reader *bufio.Reader) {
 	defer s.finish()
 	for {
-		data, err := readPacket(reader)
+		data, err := readPacket(reader, maxPacketBytes)
 		if err != nil {
 			return
 		}

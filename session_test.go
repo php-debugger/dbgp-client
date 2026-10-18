@@ -1,9 +1,11 @@
 package dbgp
 
 import (
+	"bufio"
 	"context"
 	"encoding/base64"
 	"errors"
+	"io"
 	"reflect"
 	"strconv"
 	"strings"
@@ -489,10 +491,61 @@ func TestCommandAfterDisconnectFailsFast(t *testing.T) {
 	}
 }
 
+func TestReadPacket(t *testing.T) {
+	const limit = 100
+	tests := []struct {
+		name, raw string
+		want      string // the data; empty when an error is expected
+	}{
+		{"packet", "5\x00hello\x00", "hello"},
+		{"at the limit", "100\x00" + strings.Repeat("x", 100) + "\x00", strings.Repeat("x", 100)},
+		{"leading zero", "05\x00hello\x00", "hello"},
+		{"over the limit", "101\x00" + strings.Repeat("x", 101) + "\x00", ""},
+		{"huge length", "9223372036854775807\x00", ""},
+		{"overflowing length", "99999999999999999999999\x00", ""},
+		{"endless zeros", strings.Repeat("0", 1000), ""},
+		{"no digits", "\x00hello\x00", ""},
+		{"negative", "-5\x00hello\x00", ""},
+		{"plus sign", "+5\x00hello\x00", ""},
+		{"space", " 5\x00hello\x00", ""},
+		{"short data", "10\x00hello", ""},
+		{"missing nul", "5\x00helloX", ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			data, err := readPacket(bufio.NewReader(strings.NewReader(tt.raw)), limit)
+			if tt.want == "" {
+				if err == nil {
+					t.Errorf("readPacket = %q, want an error", data)
+				}
+				return
+			}
+			if err != nil || string(data) != tt.want {
+				t.Errorf("readPacket = %q, %v; want %q", data, err, tt.want)
+			}
+		})
+	}
+}
+
+// A packet that claims a huge length is rejected at once, without reading
+// on: what follows its length is never read.
+func TestReadPacketStopsAtBadLength(t *testing.T) {
+	r := bufio.NewReader(strings.NewReader("9999999999999\x00rest"))
+	if _, err := readPacket(r, 100); err == nil {
+		t.Fatal("readPacket accepted a huge length")
+	}
+	if rest, _ := io.ReadAll(r); !strings.HasSuffix(string(rest), "\x00rest") {
+		t.Errorf("readPacket read on past the length: left %q", rest)
+	}
+}
+
 func TestMalformedPacketClosesSession(t *testing.T) {
 	for name, raw := range map[string]string{
-		"bad length":  "xyz\x00<response/>\x00",
-		"missing nul": "10\x00<response>X",
+		"bad length":     "xyz\x00<response/>\x00",
+		"missing nul":    "10\x00<response>X",
+		"huge length":    "9223372036854775807\x00",
+		"over the limit": strconv.Itoa(maxPacketBytes+1) + "\x00",
+		"endless length": strings.Repeat("0", 100),
 	} {
 		t.Run(name, func(t *testing.T) {
 			s, _ := startFakeSession(t, map[string]fakeHandler{

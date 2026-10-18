@@ -303,7 +303,7 @@ func (s *Server) handshake(conn net.Conn) {
 
 	_ = conn.SetReadDeadline(time.Now().Add(s.cfg.InitTimeout))
 	reader := bufio.NewReader(conn)
-	data, err := readPacket(reader)
+	data, err := readPacket(reader, maxInitPacketBytes)
 	if err != nil {
 		_ = conn.Close()
 		return
