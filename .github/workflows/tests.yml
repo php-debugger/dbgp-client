@@ -99,9 +99,21 @@ jobs:
           if (-not (([Environment]::GetEnvironmentVariable("Path", "Machine") -split ';') -contains $dir)) {
             throw "$dir is not on the system PATH"
           }
-          # A chosen release, to a directory of its own.
+          # A chosen release, to a directory of its own: it goes on the
+          # user PATH, not the system one, although this runs as admin.
           $env:INSTALL_DIR = Join-Path $env:RUNNER_TEMP "dbgp"
           $env:VERSION = "0.1.0"
           ./scripts/install.ps1
           $got = & (Join-Path $env:INSTALL_DIR "dbgp.exe") -version
           if ($got -ne "dbgp 0.1.0") { throw "installed $got, want dbgp 0.1.0" }
+          function OnPath($scope, $dir) { ([Environment]::GetEnvironmentVariable("Path", $scope) -split ';') -contains $dir }
+          if (-not (OnPath "User" $env:INSTALL_DIR)) { throw "$env:INSTALL_DIR is not on the user PATH" }
+          if (OnPath "Machine" $env:INSTALL_DIR) { throw "$env:INSTALL_DIR is on the system PATH" }
+          # A relative directory goes on the PATH as a full path.
+          Push-Location $env:RUNNER_TEMP
+          $env:INSTALL_DIR = "relative-dbgp"
+          & (Join-Path $env:GITHUB_WORKSPACE "scripts/install.ps1")
+          Pop-Location
+          $full = Join-Path $env:RUNNER_TEMP "relative-dbgp"
+          if (-not (OnPath "User" $full)) { throw "$full is not on the user PATH" }
+          if (OnPath "User" "relative-dbgp") { throw "the relative directory is on the user PATH" }

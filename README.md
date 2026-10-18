@@ -23,7 +23,7 @@ Windows (PowerShell as administrator; installs to `%ProgramFiles%\dbgp` and adds
 powershell -c "irm https://github.com/php-debugger/dbgp-client/releases/latest/download/install.ps1 | iex"
 ```
 
-Set `INSTALL_DIR` to install elsewhere, and `VERSION` (e.g. `0.1.1`) to install a release other than the latest. Run the script again to update. Builds are published for Linux and macOS (amd64 and arm64) and Windows (amd64); elsewhere, install with Go:
+Set `INSTALL_DIR` to install elsewhere (on Windows, it is then added to your own PATH rather than the system one), and `VERSION` (e.g. `0.1.1`) to install a release other than the latest. Run the script again to update. Builds are published for Linux and macOS (amd64 and arm64) and Windows (amd64); elsewhere, install with Go:
 
 ```sh
 go install github.com/php-debugger/dbgp-client/cmd/dbgp@latest
