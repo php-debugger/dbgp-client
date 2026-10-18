@@ -8,6 +8,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"reflect"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -134,7 +135,7 @@ func TestMCPStatusBeforeListening(t *testing.T) {
 	}
 	// Empty lists are [], not null, so agents need not special-case them.
 	text := resultText(res)
-	for _, want := range []string{`"listening":false`, `"address":"127.0.0.1:0"`, `"sessions":[]`, `"breakpoints":[]`, `"pathMappings":[]`} {
+	for _, want := range []string{`"listening":false`, `"port":0`, `"sessions":[]`, `"breakpoints":[]`, `"pathMappings":[]`} {
 		if !strings.Contains(text, want) {
 			t.Errorf("status text lacks %s: %s", want, text)
 		}
@@ -153,7 +154,8 @@ func TestMCPListenAndUnlisten(t *testing.T) {
 
 	var listened listenOutput
 	callTool(t, cs, "listen", nil, &listened)
-	if !listened.Listening || listened.Address != srv.Addr() || refused(listened.Address) {
+	addr := net.JoinHostPort("127.0.0.1", strconv.Itoa(listened.Port))
+	if !listened.Listening || listened.Port == 0 || listened.Port != srv.Port() || refused(addr) {
 		t.Fatalf("listen = %+v; server listening %v", listened, srv.Listening())
 	}
 	callTool(t, cs, "listen", nil, &listened)
@@ -163,13 +165,13 @@ func TestMCPListenAndUnlisten(t *testing.T) {
 
 	var status statusOutput
 	callTool(t, cs, "status", nil, &status)
-	if !status.Listening || status.Address != listened.Address {
+	if !status.Listening || status.Port != listened.Port {
 		t.Errorf("status after listen = %+v", status)
 	}
 
 	var unlistened unlistenOutput
 	callTool(t, cs, "unlisten", nil, &unlistened)
-	if unlistened.Listening || srv.Listening() || !refused(listened.Address) {
+	if unlistened.Listening || srv.Listening() || !refused(addr) {
 		t.Errorf("after unlisten: %+v, server listening %v", unlistened, srv.Listening())
 	}
 	callTool(t, cs, "status", nil, &status)
@@ -283,9 +285,9 @@ func TestMCPBinary(t *testing.T) {
 		args      []string
 		listening bool
 	}{
-		{[]string{"mcp", "-addr", "127.0.0.1:0"}, false},
-		{[]string{"mcp", "-addr", "127.0.0.1:0", "-listen"}, true},
-		{[]string{"mcp", "-addr", "127.0.0.1:0", "-no-eval"}, false},
+		{[]string{"mcp", "-php-port", "0"}, false},
+		{[]string{"mcp", "-php-port", "0", "-listen"}, true},
+		{[]string{"mcp", "-php-port", "0", "-no-eval"}, false},
 	} {
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		transport := &mcp.CommandTransport{Command: exec.CommandContext(ctx, bin, tc.args...)}
@@ -528,7 +530,7 @@ func TestMCPListenWarnings(t *testing.T) {
 	cs, _ := newTestMCPOn(t, "localhost:"+port, true)
 	var out listenOutput
 	callTool(t, cs, "listen", nil, &out)
-	if !out.Listening || out.Address != "localhost:"+port || len(out.Warnings) != 1 || !strings.Contains(out.Warnings[0], "[::1]:"+port) {
-		t.Errorf("listen = %+v, want localhost:%s with a warning about [::1]", out, port)
+	if !out.Listening || strconv.Itoa(out.Port) != port || len(out.Warnings) != 1 || !strings.Contains(out.Warnings[0], "[::1]:"+port) {
+		t.Errorf("listen = %+v, want port %s with a warning about [::1]", out, port)
 	}
 }

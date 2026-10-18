@@ -10,9 +10,11 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"net"
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strconv"
 	"strings"
 
 	dbgp "github.com/php-debugger/dbgp-client"
@@ -33,7 +35,7 @@ func main() {
 		os.Exit(runMCP(os.Args[2:]))
 	}
 
-	addr := flag.String("addr", dbgp.DefaultAddr, "address to listen on for PHP connections")
+	phpPort := flag.Int("php-port", defaultPHPPort, "port to listen on for PHP connections, on every address of this machine")
 	idekey := flag.String("idekey", "", "accept only sessions with this IDE key")
 	history := flag.String("history", defaultHistoryFile(), "`file` to keep command history in; empty disables it")
 	showVersion := flag.Bool("version", false, "print the version and exit")
@@ -43,7 +45,7 @@ func main() {
 	flag.Usage = func() {
 		fmt.Fprintf(flag.CommandLine.Output(), "Usage: dbgp [options]\n       dbgp mcp [options]\n\n"+
 			"Interactive debugger for PHP Debugger and Xdebug. Start PHP with debugging\n"+
-			"enabled and pointed at -addr; type help at the prompt for commands.\n"+
+			"enabled and pointed at -php-port; type help at the prompt for commands.\n"+
 			"dbgp mcp runs it as an MCP server for AI agents instead (dbgp mcp -h).\n\nOptions:\n")
 		flag.PrintDefaults()
 	}
@@ -58,7 +60,11 @@ func main() {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(2)
 	}
-	srv, err := dbgp.Listen(dbgp.Config{Addr: *addr, IDEKey: *idekey, PathMap: pathMap})
+	if err := checkPort("-php-port", *phpPort); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(2)
+	}
+	srv, err := dbgp.Listen(dbgp.Config{Addr: phpAddr(*phpPort), IDEKey: *idekey, PathMap: pathMap})
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
@@ -88,8 +94,8 @@ func main() {
 	for _, b := range breaks {
 		r.execLine("break " + b)
 	}
-	r.printf("Listening on %s. Sessions are announced when PHP connects, and commands\n"+
-		"that need one wait for it. Type help for commands.\n", srv.Addr())
+	r.printf("Listening for PHP on port %d. Sessions are announced when PHP connects,\n"+
+		"and commands that need one wait for it. Type help for commands.\n", srv.Port())
 	r.printListenWarnings()
 
 	interrupts := make(chan os.Signal, 1)
@@ -97,6 +103,25 @@ func main() {
 	go r.cancelOnInterrupt(interrupts)
 	go r.announceSessions()
 	r.run(lines)
+}
+
+// defaultPHPPort is where PHP Debugger and Xdebug connect by default.
+const defaultPHPPort = 9003
+
+// phpAddr is the address to listen on for PHP: every address of this
+// machine, so that PHP in a container, a VM or on another machine can
+// connect as well as PHP on this one.
+func phpAddr(port int) string {
+	return net.JoinHostPort("", strconv.Itoa(port))
+}
+
+// checkPort reports an error unless port, the value of the named flag, is
+// a TCP port or 0 for any free one.
+func checkPort(name string, port int) error {
+	if port < 0 || port > 65535 {
+		return fmt.Errorf("invalid %s %d: want 1 to 65535, or 0 for any free port", name, port)
+	}
+	return nil
 }
 
 // parsePathMap parses LOCAL=REMOTE flags.

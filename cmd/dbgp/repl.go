@@ -335,13 +335,13 @@ func (r *repl) cmdMaps(context.Context, string) error {
 
 func (r *repl) cmdListen(context.Context, string) error {
 	if r.srv.Listening() {
-		r.printf("Already listening on %s.\n", r.srv.Addr())
+		r.printf("Already listening for PHP on port %d.\n", r.srv.Port())
 		return nil
 	}
 	if err := r.srv.StartListening(); err != nil {
 		return err
 	}
-	r.printf("Listening on %s.\n", r.srv.Addr())
+	r.printf("Listening for PHP on port %d.\n", r.srv.Port())
 	r.printListenWarnings()
 	return nil
 }
@@ -367,7 +367,7 @@ func (r *repl) cmdUnlisten(context.Context, string) error {
 
 func (r *repl) cmdSessions(context.Context, string) error {
 	if r.srv.Listening() {
-		r.printf("Listening on %s.\n", r.srv.Addr())
+		r.printf("Listening for PHP on port %d.\n", r.srv.Port())
 	} else {
 		r.printf("Not listening: PHP connections are refused (use listen).\n")
 	}

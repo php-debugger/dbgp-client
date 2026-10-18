@@ -45,10 +45,12 @@ xdebug.start_with_request for it. Xdebug needs xdebug.mode=debug and
 xdebug.start_with_request=yes.
 
 PHP finds dbgp through xdebug.client_host and xdebug.client_port, which
-default to localhost and 9003 in both debuggers. When PHP runs on this machine
-and the listen tool's address is localhost:9003, dbgp's default, those
-defaults already reach dbgp and neither needs to be set. Otherwise set them to
-the port from that address and a host PHP can reach this machine on.`
+default to localhost and 9003 in both debuggers. dbgp listens on every address
+of this machine, on the port the listen tool returns, 9003 by default. When PHP
+runs on this machine and the port is 9003, those defaults already reach dbgp
+and neither needs to be set. Otherwise set client_port to that port, and
+client_host to an address PHP can reach this machine on, such as
+host.docker.internal from a Docker container.`
 
 // noCodeInstructions are added to mcpInstructions when dbgp mcp runs with
 // -no-eval, so agents know the code tools were left out on purpose.
@@ -86,11 +88,11 @@ func runMCP(args []string) int {
 	}
 
 	fs := flag.NewFlagSet("dbgp mcp", flag.ContinueOnError)
-	addr := fs.String("addr", dbgp.DefaultAddr, "address to listen on for PHP connections")
+	phpPort := fs.Int("php-port", defaultPHPPort, "port to listen on for PHP connections, on every address of this machine")
 	idekey := fs.String("idekey", "", "accept only sessions with this IDE key")
 	listen := fs.Bool("listen", false, "listen for PHP connections from the start, instead of waiting for the listen tool")
 	noEval := fs.Bool("no-eval", false, "leave out the eval and set_variable tools, which run PHP code in the debugged script")
-	httpAddr := fs.String("http", defaultHTTPAddr, "with start: the address agents connect to over HTTP")
+	mcpPort := fs.Int("mcp-port", defaultHTTPPort, "with start: the port agents connect to over HTTP, on "+httpHost+" only")
 	var maps listFlag
 	fs.Var(&maps, "map", "path mapping `LOCAL=REMOTE` for PHP in a container or on a server (repeatable)")
 	fs.Usage = func() {
@@ -118,6 +120,12 @@ func runMCP(args []string) int {
 		fmt.Fprintln(os.Stderr, err)
 		return 2
 	}
+	for name, port := range map[string]int{"-php-port": *phpPort, "-mcp-port": *mcpPort} {
+		if err := checkPort(name, port); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			return 2
+		}
+	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -138,7 +146,7 @@ func runMCP(args []string) int {
 		}
 	}
 
-	srv, err := dbgp.NewServer(dbgp.Config{Addr: *addr, IDEKey: *idekey, PathMap: pathMap})
+	srv, err := dbgp.NewServer(dbgp.Config{Addr: phpAddr(*phpPort), IDEKey: *idekey, PathMap: pathMap})
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		return 2
@@ -152,7 +160,7 @@ func runMCP(args []string) int {
 	}
 	server := newMCPServer(srv, !*noEval)
 	if command == serveCommand {
-		err = serveHTTP(ctx, server, *httpAddr)
+		err = serveHTTP(ctx, server, *mcpPort)
 	} else {
 		err = server.Run(ctx, &mcp.StdioTransport{})
 	}
@@ -184,7 +192,7 @@ func newMCPServer(srv *dbgp.Server, allowCode bool) *mcp.Server {
 	mcp.AddTool(server, &mcp.Tool{
 		Name: "listen",
 		Description: "Start listening for PHP connections, so the next PHP script or request with " +
-			"debugging enabled connects and becomes a session. The result gives the address PHP must connect to.",
+			"debugging enabled connects and becomes a session. The result gives the port PHP must connect to.",
 		Annotations:  &mcp.ToolAnnotations{IdempotentHint: true},
 		OutputSchema: outputSchema[listenOutput]("warnings"),
 	}, t.listen)
@@ -298,7 +306,7 @@ type noInput struct{}
 
 type statusOutput struct {
 	Listening    bool             `json:"listening" jsonschema:"whether PHP connections are accepted"`
-	Address      string           `json:"address" jsonschema:"the address PHP connects to when listening"`
+	Port         int              `json:"port" jsonschema:"the port PHP connects to when listening, on any address of this machine"`
 	Sessions     []sessionInfo    `json:"sessions" jsonschema:"debugging sessions, oldest first, including ended ones"`
 	Breakpoints  []breakpointInfo `json:"breakpoints" jsonschema:"breakpoints, applied to every session"`
 	PathMappings []pathMapping    `json:"pathMappings" jsonschema:"local directories mapped to the directories PHP sees"`
@@ -330,7 +338,7 @@ type pathMapping struct {
 func (t *tools) status(context.Context, *mcp.CallToolRequest, noInput) (*mcp.CallToolResult, statusOutput, error) {
 	out := statusOutput{
 		Listening: t.srv.Listening(),
-		Address:   t.srv.Addr(),
+		Port:      t.srv.Port(),
 		Sessions:  t.sessionList(),
 	}
 	out.Breakpoints = t.breakpointList()
@@ -365,7 +373,7 @@ func (t *tools) pathMappingList() []pathMapping {
 
 type listenOutput struct {
 	Listening bool     `json:"listening" jsonschema:"whether PHP connections are accepted"`
-	Address   string   `json:"address" jsonschema:"the address PHP must connect to (host and port)"`
+	Port      int      `json:"port" jsonschema:"the port PHP must connect to (xdebug.client_port), on any address of this machine"`
 	Warnings  []string `json:"warnings,omitempty" jsonschema:"addresses dbgp could not listen on, although it listens on others; PHP connecting there may reach another program instead"`
 }
 
@@ -373,7 +381,7 @@ func (t *tools) listen(context.Context, *mcp.CallToolRequest, noInput) (*mcp.Cal
 	if err := t.srv.StartListening(); err != nil {
 		return nil, listenOutput{}, err
 	}
-	return nil, listenOutput{Listening: true, Address: t.srv.Addr(), Warnings: t.srv.ListenWarnings()}, nil
+	return nil, listenOutput{Listening: true, Port: t.srv.Port(), Warnings: t.srv.ListenWarnings()}, nil
 }
 
 type unlistenOutput struct {

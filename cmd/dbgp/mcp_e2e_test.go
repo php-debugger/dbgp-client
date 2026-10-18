@@ -5,6 +5,7 @@ import (
 	"net"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"testing"
 	"time"
 
@@ -24,7 +25,7 @@ func TestMCPEndToEnd(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 	daemonEnv(t)
-	startTestDaemon(t, bin, "-addr", "127.0.0.1:0")
+	startTestDaemon(t, bin, "-php-port", "0")
 	transport := &mcp.CommandTransport{Command: exec.CommandContext(ctx, bin, "mcp")}
 	cs, err := mcp.NewClient(&mcp.Implementation{Name: "test", Version: "0"}, nil).Connect(ctx, transport, nil)
 	if err != nil {
@@ -36,10 +37,7 @@ func TestMCPEndToEnd(t *testing.T) {
 	callTool(t, cs, "add_breakpoint", map[string]any{"file": script, "line": 24}, &bp)
 	var listening listenOutput
 	callTool(t, cs, "listen", nil, &listening)
-	_, port, err := net.SplitHostPort(listening.Address)
-	if err != nil {
-		t.Fatal(err)
-	}
+	port := strconv.Itoa(listening.Port)
 
 	// The script runs in the background while it is debugged.
 	php := exec.Command("php", "-dxdebug.mode=debug", "-dxdebug.start_with_request=yes",

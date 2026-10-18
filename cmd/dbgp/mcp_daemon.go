@@ -14,6 +14,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
@@ -30,9 +31,14 @@ import (
 // runs it; it is not meant to be typed.
 const serveCommand = "serve"
 
-// defaultHTTPAddr is where agents connect: on this machine only, next to
-// DBGp's 9003.
-const defaultHTTPAddr = "127.0.0.1:9004"
+// The background server listens on httpHost, on this machine only: agents
+// on it read the server's token from the state file, and the token is sent
+// unencrypted. An IP address, not localhost, so no lookup can send it
+// elsewhere. Its port defaults to defaultHTTPPort, next to PHP's 9003.
+const (
+	httpHost        = "127.0.0.1"
+	defaultHTTPPort = 9004
+)
 
 // How long the commands wait for the server to start or stop.
 const (
@@ -355,10 +361,10 @@ func requireToken(token string, next http.Handler) http.Handler {
 	})
 }
 
-// serveHTTP serves MCP over HTTP at addr until ctx is done, recording the
+// serveHTTP serves MCP over HTTP on port until ctx is done, recording the
 // server in the state file meanwhile.
-func serveHTTP(ctx context.Context, server *mcp.Server, addr string) error {
-	ln, err := net.Listen("tcp", addr)
+func serveHTTP(ctx context.Context, server *mcp.Server, port int) error {
+	ln, err := net.Listen("tcp", net.JoinHostPort(httpHost, strconv.Itoa(port)))
 	if err != nil {
 		return err
 	}

@@ -45,7 +45,7 @@ var runningAt = regexp.MustCompile(`running at (\S+) \(pid (\d+)\)`)
 // returns its URL. It is stopped at cleanup.
 func startTestDaemon(t *testing.T, bin string, args ...string) string {
 	t.Helper()
-	code, out := runDbgp(t, bin, append([]string{"mcp", "start", "-http", "127.0.0.1:0"}, args...)...)
+	code, out := runDbgp(t, bin, append([]string{"mcp", "start", "-mcp-port", "0"}, args...)...)
 	m := runningAt.FindStringSubmatch(out)
 	if code != 0 || m == nil {
 		t.Fatalf("dbgp mcp: exit %d\n%s", code, out)
@@ -59,6 +59,9 @@ func TestMCPDaemon(t *testing.T) {
 	daemonEnv(t)
 
 	url := startTestDaemon(t, bin)
+	if !strings.HasPrefix(url, "http://127.0.0.1:") {
+		t.Errorf("URL %s: want the server on 127.0.0.1", url)
+	}
 	if !strings.Contains(runDbgpOut(t, bin, "mcp", "status"), url) {
 		t.Error("dbgp mcp status does not show the URL")
 	}
@@ -117,7 +120,8 @@ func TestMCPDaemonDoesNotStart(t *testing.T) {
 	}
 	defer ln.Close()
 
-	code, out := runDbgp(t, bin, "mcp", "start", "-http", ln.Addr().String())
+	_, port, _ := net.SplitHostPort(ln.Addr().String())
+	code, out := runDbgp(t, bin, "mcp", "start", "-mcp-port", port)
 	if code != 1 || !strings.Contains(out, "did not start") || !strings.Contains(out, ln.Addr().String()) {
 		t.Errorf("start on a taken port: exit %d\n%s", code, out)
 	}
@@ -138,14 +142,26 @@ func TestMCPDaemonStaleState(t *testing.T) {
 }
 
 func TestMCPArguments(t *testing.T) {
+	daemonEnv(t)
 	for _, args := range [][]string{
 		{"restart"},
-		{"stop", "-http", "127.0.0.1:0"},
+		{"stop", "-mcp-port", "0"},
 		{"start", "extra"},
+		{"start", "-mcp-port", "-1"},
+		{"start", "-mcp-port", "65536"},
+		{"start", "-mcp-port", "http"},
+		{"start", "-php-port", "65536"},
+		// Agents connect on 127.0.0.1 only, and PHP on every address.
+		{"start", "-http", "0.0.0.0:9004"},
+		{"start", "-addr", "127.0.0.1:9003"},
+		{serveCommand, "-mcp-port", "-1"},
 	} {
 		if code := runMCP(args); code != 2 {
 			t.Errorf("%v: exit %d, want 2", args, code)
 		}
+	}
+	if st, err := readState(); st != nil || err != nil {
+		t.Errorf("state = %+v, %v; want no server started", st, err)
 	}
 }
 

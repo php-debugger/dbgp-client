@@ -51,7 +51,7 @@ You can optionally add some options after `dbgp mcp`:
 
 - `-no-eval` leaves out the tools that run PHP code in the debugged script (evaluating expressions and changing variables), so the agent can only look.
 - `-map LOCAL=REMOTE` maps a directory on this machine to where PHP sees it, for PHP in a container or on a server. The agent can also add mappings itself.
-- `-addr` changes the address dbgp listens on for PHP, `localhost:9003` by default.
+- `-php-port` changes the port dbgp listens on for PHP, 9003 by default. dbgp listens on every address of this machine, so PHP in a container or on another machine can connect too.
 
 By default each agent session starts its own dbgp. To keep breakpoints and sessions between agent sessions, and share them between agents, run dbgp in the background:
 
@@ -60,6 +60,8 @@ dbgp mcp start     # start it, with any of the options above
 dbgp mcp status    # is it running?
 dbgp mcp stop      # stop it
 ```
+
+`dbgp mcp start` also takes `-mcp-port`, the port agents reach it on, 9004 by default. It listens on this machine only (127.0.0.1).
 
 While it runs, agents that start `dbgp mcp` use it instead, with the options it was started with. Only you can use it: `dbgp mcp` connects with a token kept in a file that other users on the machine cannot read. After updating dbgp, restart it to use the new version.
 
