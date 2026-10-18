@@ -896,16 +896,23 @@ func (s *Session) GetProperty(fullname string, opts PropertyOptions) (*Property,
 	return &resp.Properties[0], nil
 }
 
-// GetPropertyValue returns a property's value. With opts.MaxData 0 it
-// returns the whole value, however long; Page is ignored.
-func (s *Session) GetPropertyValue(fullname string, opts PropertyOptions) (string, error) {
+// GetPropertyValue returns a property's value and the length of all of
+// it. With opts.MaxData 0 it returns the whole value, however long;
+// otherwise only its first MaxData bytes, so a part of a long value can be
+// read without sending all of it. Page is ignored.
+func (s *Session) GetPropertyValue(fullname string, opts PropertyOptions) (value string, size int, err error) {
 	args := []string{"-n", fullname, "-d", strconv.Itoa(opts.Depth), "-c", strconv.Itoa(opts.Context),
 		"-m", strconv.Itoa(opts.MaxData)}
 	resp, err := s.sendCommand("property_value", args, nil)
 	if err != nil {
-		return "", err
+		return "", 0, err
 	}
-	return decodeEncoded(resp.Encoding, resp.Value)
+	if value, err = decodeEncoded(resp.Encoding, resp.Value); err != nil {
+		return "", 0, err
+	}
+	// The engine sends the whole length; one that does not at least sent
+	// this much.
+	return value, max(resp.Size, len(value)), nil
 }
 
 // SetProperty assigns value, a PHP expression, to a variable or a path

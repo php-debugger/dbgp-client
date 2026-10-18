@@ -791,7 +791,7 @@ func (r *repl) cmdValue(ctx context.Context, args string) error {
 	if err != nil {
 		return err
 	}
-	v, err := s.GetPropertyValue(name, opts)
+	v, _, err := s.GetPropertyValue(name, opts)
 	if err != nil {
 		return err
 	}

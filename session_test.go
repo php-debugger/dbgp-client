@@ -175,8 +175,17 @@ func TestCommandWireFormat(t *testing.T) {
 			},
 			args: map[string]string{"n": `$user["first name"]`, "d": "1", "c": "1", "p": "2", "m": "100"}},
 		{name: "GetPropertyValue", command: "property_value",
-			call: func(s *Session) error { _, err := s.GetPropertyValue("$long", PropertyOptions{Depth: 1}); return err },
+			call: func(s *Session) error {
+				_, _, err := s.GetPropertyValue("$long", PropertyOptions{Depth: 1})
+				return err
+			},
 			args: map[string]string{"n": "$long", "d": "1", "c": "0", "m": "0"}},
+		{name: "GetPropertyValue part", command: "property_value",
+			call: func(s *Session) error {
+				_, _, err := s.GetPropertyValue("$long", PropertyOptions{Depth: 1, MaxData: 32772})
+				return err
+			},
+			args: map[string]string{"n": "$long", "d": "1", "c": "0", "m": "32772"}},
 		{name: "SetProperty", command: "property_set",
 			call: func(s *Session) error { return s.SetProperty("$b", "7 * 2", PropertyOptions{}) },
 			args: map[string]string{"n": "$b", "d": "0", "c": "0"},
@@ -973,9 +982,9 @@ func TestInspectionDecoding(t *testing.T) {
 		}
 	})
 	t.Run("GetPropertyValue", func(t *testing.T) {
-		v, err := s.GetPropertyValue("$long", PropertyOptions{Depth: 1})
-		if err != nil || v != strings.Repeat("abcdefghij", 20) {
-			t.Errorf("GetPropertyValue = %q, %v", v, err)
+		v, size, err := s.GetPropertyValue("$long", PropertyOptions{Depth: 1})
+		if err != nil || v != strings.Repeat("abcdefghij", 20) || size != 200 {
+			t.Errorf("GetPropertyValue = %q, size %d, %v", v, size, err)
 		}
 	})
 	t.Run("SetProperty", func(t *testing.T) {

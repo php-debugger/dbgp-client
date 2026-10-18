@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
+	"unicode/utf8"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 	dbgp "github.com/php-debugger/dbgp-client"
@@ -226,15 +228,22 @@ func (t *tools) variableValue(_ context.Context, _ *mcp.CallToolRequest, in vari
 	if in.Name == "" {
 		return nil, variableValueOutput{}, errors.New("name is required, e.g. $html")
 	}
-	value, err := s.GetPropertyValue(in.Name, dbgp.PropertyOptions{Depth: in.Depth, Context: in.Context})
+	if in.Offset < 0 || in.Offset > math.MaxInt32 {
+		return nil, variableValueOutput{}, fmt.Errorf("offset must be from 0 to the size of %s", in.Name)
+	}
+	// The engine sends a value's first bytes, not a range: ask for those up
+	// to the end of this part, not the whole value each time, and a few more
+	// so that the part can end on a whole character.
+	opts := dbgp.PropertyOptions{Depth: in.Depth, Context: in.Context, MaxData: in.Offset + maxTextBytes + utf8.UTFMax}
+	value, size, err := s.GetPropertyValue(in.Name, opts)
 	if err != nil {
 		return nil, variableValueOutput{}, inspectError(s, in.Name, in.Depth, err)
 	}
-	if in.Offset < 0 || in.Offset > len(value) {
-		return nil, variableValueOutput{}, fmt.Errorf("offset must be from 0 to %d, the size of %s", len(value), in.Name)
+	if in.Offset > size || in.Offset > len(value) {
+		return nil, variableValueOutput{}, fmt.Errorf("offset must be from 0 to %d, the size of %s", size, in.Name)
 	}
-	out := variableValueOutput{Name: in.Name, Value: cutText(value[in.Offset:], maxTextBytes), Size: len(value)}
-	if end := in.Offset + len(out.Value); end < len(value) {
+	out := variableValueOutput{Name: in.Name, Value: cutText(value[in.Offset:], maxTextBytes), Size: size}
+	if end := in.Offset + len(out.Value); end < size {
 		out.Next = end
 	}
 	return nil, out, nil
