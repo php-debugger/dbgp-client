@@ -350,8 +350,9 @@ func (s *Server) handshake(conn net.Conn) {
 
 	sess := newSession(id, s, conn, reader, init)
 	sess.setup(s.cfg, s.pathMap())
-	// Failed breakpoints are retried, and reported, by the first Continue.
-	_ = sess.syncBreakpoints()
+	// Nothing reports errors here: the first Continue reports rejected
+	// breakpoints, and retries the others.
+	_ = sess.syncBreakpoints(false)
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -575,7 +576,7 @@ func (s *Server) syncStoppedSessions() error {
 		if sess.State().Status == StatusRunning {
 			continue
 		}
-		if err := sess.syncBreakpoints(); err != nil {
+		if err := sess.syncBreakpoints(true); err != nil {
 			errs = append(errs, fmt.Errorf("session %d: %w", sess.id, err))
 		}
 	}

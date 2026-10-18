@@ -76,9 +76,12 @@ type Session struct {
 	cmdSlot chan struct{}
 
 	// syncMu serializes breakpoint syncs; it guards bpIDs, which maps
-	// server breakpoint ids to this engine's breakpoint ids.
+	// server breakpoint ids to this engine's breakpoint ids, and rejected.
 	syncMu sync.Mutex
 	bpIDs  map[int]int
+	// rejected holds the server breakpoints the engine refused, by server
+	// id, so that syncs do not send them again, and so fail only once.
+	rejected map[int]*rejection
 	// resync asks the next sync to set every breakpoint again, because a
 	// path mapping changed.
 	resync atomic.Bool
@@ -165,6 +168,13 @@ func (s *Session) SetupWarnings() []string {
 	return append([]string(nil), s.warnings...)
 }
 
+// rejection is a breakpoint the engine refused, and whether that has been
+// reported.
+type rejection struct {
+	err      error
+	reported bool
+}
+
 // pendingCommand is a command waiting for its response.
 type pendingCommand struct {
 	id int
@@ -175,15 +185,16 @@ type pendingCommand struct {
 // packet has been read.
 func newSession(id int, server *Server, conn net.Conn, reader *bufio.Reader, init *InitPacket) *Session {
 	s := &Session{
-		id:      id,
-		server:  server,
-		conn:    conn,
-		init:    init,
-		closed:  make(chan struct{}),
-		cmdSlot: make(chan struct{}, 1),
-		bpIDs:   map[int]int{},
-		state:   State{Status: StatusStarting},
-		changed: make(chan struct{}),
+		id:       id,
+		server:   server,
+		conn:     conn,
+		init:     init,
+		closed:   make(chan struct{}),
+		cmdSlot:  make(chan struct{}, 1),
+		bpIDs:    map[int]int{},
+		rejected: map[int]*rejection{},
+		state:    State{Status: StatusStarting},
+		changed:  make(chan struct{}),
 	}
 	go s.readLoop(reader)
 	return s
@@ -600,15 +611,18 @@ func responseResult(resp *Response) (*Response, error) {
 // ContinueStepInto, ContinueStepOver or ContinueStepOut) and waits up to
 // wait for it to stop. If it is still running then, the returned state has
 // Status running: call Wait to keep waiting. Breakpoints added to the server
-// are applied first.
+// are applied first. If that fails, the script is not resumed: a breakpoint
+// the engine rejected is reported once, and the next Continue runs without
+// it.
 func (s *Session) Continue(ctx context.Context, command string, wait time.Duration) (State, error) {
 	switch command {
 	case ContinueRun, ContinueStepInto, ContinueStepOver, ContinueStepOut:
 	default:
 		return s.State(), fmt.Errorf("%q is not a continuation command", command)
 	}
-	if err := s.syncBreakpoints(); err != nil {
-		return s.State(), err
+	if err := s.syncBreakpoints(true); err != nil {
+		return s.State(), fmt.Errorf("%w; the script was not resumed: "+
+			"continue again to run it without the breakpoints the engine rejected", err)
 	}
 	if err := s.startContinuation(command); err != nil {
 		return s.State(), err
@@ -691,8 +705,11 @@ func (s *Session) finished() bool {
 }
 
 // syncBreakpoints makes the engine's breakpoints match the server's: it
-// sets breakpoints added since the last sync and removes deleted ones.
-func (s *Session) syncBreakpoints() error {
+// sets breakpoints added since the last sync and removes deleted ones. A
+// breakpoint the engine rejects is not sent again until a path mapping
+// changes; its error is returned once, by the first sync that reports.
+// Other errors, such as a timeout, are returned until the breakpoint is set.
+func (s *Session) syncBreakpoints(report bool) error {
 	if s.server == nil || s.finished() {
 		return nil
 	}
@@ -701,13 +718,15 @@ func (s *Session) syncBreakpoints() error {
 
 	var errs []error
 	if s.resync.Swap(false) {
-		// A path mapping changed: set every breakpoint again.
+		// A path mapping changed: set every breakpoint again, including
+		// rejected ones, which the new paths may fix.
 		for serverID, engineID := range s.bpIDs {
 			delete(s.bpIDs, serverID)
 			if err := s.RemoveBreakpoint(engineID); err != nil && !errors.Is(err, errConnectionClosed) {
 				errs = append(errs, fmt.Errorf("remove breakpoint %d: %w", serverID, err))
 			}
 		}
+		clear(s.rejected)
 	}
 	want := map[int]bool{}
 	for _, bp := range s.server.Breakpoints() {
@@ -715,12 +734,28 @@ func (s *Session) syncBreakpoints() error {
 		if _, ok := s.bpIDs[bp.ID]; ok {
 			continue
 		}
+		if r, ok := s.rejected[bp.ID]; ok {
+			if report && !r.reported {
+				r.reported = true
+				errs = append(errs, r.err)
+			}
+			continue
+		}
 		id, err := s.SetBreakpointSpec(bp)
 		if err != nil {
-			errs = append(errs, fmt.Errorf("breakpoint %d: %w", bp.ID, err))
+			err = fmt.Errorf("breakpoint %d: %w", bp.ID, err)
+			if engineErr := (*EngineError)(nil); errors.As(err, &engineErr) {
+				s.rejected[bp.ID] = &rejection{err: err, reported: report}
+			}
+			errs = append(errs, err)
 			continue
 		}
 		s.bpIDs[bp.ID] = id
+	}
+	for serverID := range s.rejected {
+		if !want[serverID] {
+			delete(s.rejected, serverID)
+		}
 	}
 	for serverID, engineID := range s.bpIDs {
 		if want[serverID] {

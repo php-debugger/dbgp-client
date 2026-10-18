@@ -9,6 +9,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -387,19 +388,120 @@ func TestServerBreakpointErrors(t *testing.T) {
 		t.Errorf("invalid breakpoints were kept: %+v", srv.Breakpoints())
 	}
 
-	// A breakpoint the engine rejects is reported, and retried on Continue.
-	dialFakeEngine(t, srv, fixture(t, "init"), map[string]fakeHandler{
-		"breakpoint_set": func(e *fakeEngine, cmd fakeCommand) []string {
-			return []string{errorPacket(cmd, 200, "breakpoint could not be set")}
-		},
-		"run": reply("run_break"),
+	// A breakpoint the engine rejects is reported once, here by
+	// AddBreakpoint, and not sent again: Continue runs without it.
+	e := dialFakeEngine(t, srv, fixture(t, "init"), map[string]fakeHandler{
+		"breakpoint_set": rejectBreakpoints,
+		"run":            reply("run_break"),
 	})
 	sess := waitSession(t, srv)
 	if _, err := srv.AddBreakpoint(Breakpoint{File: "/app/basic.php", Line: 3}); err == nil || !strings.Contains(err.Error(), "session 1") {
 		t.Errorf("AddBreakpoint err = %v, want session 1 error", err)
 	}
-	if _, err := sess.Continue(context.Background(), ContinueRun, time.Second); err == nil || !strings.Contains(err.Error(), "200") {
-		t.Errorf("Continue err = %v, want breakpoint error 200", err)
+	e.ClearReceived()
+	if st, err := sess.Continue(context.Background(), ContinueRun, time.Second); err != nil || st.Status != StatusBreak {
+		t.Errorf("Continue after the rejection was reported = %+v, %v; want it to run", st, err)
+	}
+	if got := breakpointCommands(e); len(got) != 0 {
+		t.Errorf("rejected breakpoint sent again: %q", got)
+	}
+}
+
+// rejectBreakpoints answers breakpoint_set as an engine that cannot set it.
+func rejectBreakpoints(e *fakeEngine, cmd fakeCommand) []string {
+	return []string{errorPacket(cmd, 200, "breakpoint could not be set")}
+}
+
+// commandNames returns the names of the commands e received.
+func commandNames(e *fakeEngine) string {
+	var names []string
+	for _, cmd := range e.Received() {
+		names = append(names, cmd.Name)
+	}
+	return strings.Join(names, " ")
+}
+
+// A breakpoint rejected while the session was set up is reported by the
+// first Continue, which does not resume the script; the next one runs
+// without it.
+func TestRejectedBreakpointReportedByFirstContinue(t *testing.T) {
+	srv := newTestServer(t, Config{})
+	if _, err := srv.AddBreakpoint(Breakpoint{File: "/app/basic.php", Line: 3}); err != nil {
+		t.Fatal(err)
+	}
+	e := dialFakeEngine(t, srv, fixture(t, "init"), map[string]fakeHandler{
+		"breakpoint_set": rejectBreakpoints,
+		"run":            reply("run_break"),
+	})
+	sess := waitSession(t, srv)
+	e.ClearReceived()
+
+	_, err := sess.Continue(context.Background(), ContinueRun, time.Second)
+	if err == nil || !strings.Contains(err.Error(), "200") || !strings.Contains(err.Error(), "not resumed") {
+		t.Errorf("first Continue err = %v, want the rejection, not resumed", err)
+	}
+	if got := commandNames(e); got != "" {
+		t.Errorf("first Continue sent %q, want nothing", got)
+	}
+	st, err := sess.Continue(context.Background(), ContinueRun, time.Second)
+	if err != nil || st.Status != StatusBreak {
+		t.Errorf("second Continue = %+v, %v; want it to run", st, err)
+	}
+	if got := commandNames(e); got != "run" {
+		t.Errorf("second Continue sent %q, want only run", got)
+	}
+}
+
+// A path mapping change retries rejected breakpoints, as the new path may
+// be accepted; removing a rejected breakpoint forgets it.
+func TestRejectedBreakpointRetriedAfterPathMapping(t *testing.T) {
+	srv := newTestServer(t, Config{})
+	accept := false
+	var mu sync.Mutex
+	e := dialFakeEngine(t, srv, fixture(t, "init"), map[string]fakeHandler{
+		"breakpoint_set": func(e *fakeEngine, cmd fakeCommand) []string {
+			mu.Lock()
+			defer mu.Unlock()
+			if !accept {
+				return rejectBreakpoints(e, cmd)
+			}
+			return reply("breakpoint_set_line")(e, cmd)
+		},
+		"breakpoint_remove": reply("breakpoint_remove"),
+	})
+	sess := waitSession(t, srv)
+	rejected, err := srv.AddBreakpoint(Breakpoint{File: "/home/me/app/basic.php", Line: 3})
+	if err == nil {
+		t.Fatal("AddBreakpoint: the engine's rejection was not reported")
+	}
+
+	mu.Lock()
+	accept = true
+	mu.Unlock()
+	e.ClearReceived()
+	if err := srv.AddPathMapping(PathMapping{Local: "/home/me/app", Remote: "/app"}); err != nil {
+		t.Fatalf("AddPathMapping: %v", err)
+	}
+	if got := breakpointCommands(e); len(got) != 1 || got[0] != "breakpoint_set -t line -f file:///app/basic.php -n 3" {
+		t.Errorf("after the mapping: %q, want the breakpoint set with its new path", got)
+	}
+
+	// A breakpoint that stays rejected is forgotten once removed.
+	mu.Lock()
+	accept = false
+	mu.Unlock()
+	second, err := srv.AddBreakpoint(Breakpoint{File: "/home/me/app/other.php", Line: 5})
+	if err == nil {
+		t.Fatal("AddBreakpoint: the second rejection was not reported")
+	}
+	if err := srv.RemoveBreakpoint(second.ID); err != nil {
+		t.Fatal(err)
+	}
+	sess.syncMu.Lock()
+	n, wasSet := len(sess.rejected), sess.bpIDs[rejected.ID] != 0
+	sess.syncMu.Unlock()
+	if n != 0 || !wasSet {
+		t.Errorf("rejected = %d entries, first breakpoint set %v; want none, and set", n, wasSet)
 	}
 }
 
