@@ -49,7 +49,7 @@ The agent starts the PHP code itself, as a script or a web request, and debugs i
 
 You can optionally add some options after `dbgp mcp`:
 
-- `-no-eval` leaves out the tools that run PHP code in the debugged script (evaluating expressions and changing variables), so the agent can only look.
+- `-no-eval` turns off everything that runs PHP code in the debugged script: evaluating expressions, changing variables and breakpoint conditions, so the agent can only look.
 - `-map LOCAL=REMOTE` maps a directory on this machine to where PHP sees it, for PHP in a container or on a server. The agent can also add mappings itself.
 - `-php-port` changes the port dbgp listens on for PHP, 9003 by default. dbgp listens on every address of this machine, so PHP in a container or on another machine can connect too.
 

@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"syscall"
@@ -56,11 +57,13 @@ host.docker.internal from a Docker container.`
 // -no-eval, so agents know the code tools were left out on purpose.
 const noCodeInstructions = `
 
-The user started dbgp with -no-eval, which turns off the eval and set_variable
-tools, so you cannot evaluate PHP or change variables in the debugged script.
-This is the user's choice, not a missing feature or an outdated build: do not
-suggest rebuilding or restarting dbgp to get them. Read values with variables,
-variable and variable_value instead, and work out results from them.`
+The user started dbgp with -no-eval, which turns off everything that runs PHP
+code in the debugged script: the eval and set_variable tools, and conditions on
+breakpoints. So you cannot evaluate PHP, change variables or set conditional
+breakpoints. This is the user's choice, not a missing feature or an outdated
+build: do not suggest rebuilding or restarting dbgp to get them. Read values
+with variables, variable and variable_value instead, and work out results from
+them. Instead of a condition, stop at the line and check the values each time.`
 
 // runMCP runs dbgp as an MCP server. Agents start it as dbgp mcp and talk
 // to it on stdin and stdout: it serves them itself, or passes them on to the
@@ -91,7 +94,7 @@ func runMCP(args []string) int {
 	phpPort := fs.Int("php-port", defaultPHPPort, "port to listen on for PHP connections, on every address of this machine")
 	idekey := fs.String("idekey", "", "accept only sessions with this IDE key")
 	listen := fs.Bool("listen", false, "listen for PHP connections from the start, instead of waiting for the listen tool")
-	noEval := fs.Bool("no-eval", false, "leave out the eval and set_variable tools, which run PHP code in the debugged script")
+	noEval := fs.Bool("no-eval", false, "turn off everything that runs PHP code in the debugged script: the eval and set_variable tools, and breakpoint conditions")
 	mcpPort := fs.Int("mcp-port", defaultHTTPPort, "with start: the port agents connect to over HTTP, on "+httpHost+" only")
 	var maps listFlag
 	fs.Var(&maps, "map", "path mapping `LOCAL=REMOTE` for PHP in a container or on a server (repeatable)")
@@ -172,7 +175,8 @@ func runMCP(args []string) int {
 }
 
 // newMCPServer returns an MCP server whose tools drive srv. allowCode adds
-// the tools that run PHP code in the debugged script.
+// what runs PHP code in the debugged script: the code tools, and conditions
+// on breakpoints.
 func newMCPServer(srv *dbgp.Server, allowCode bool) *mcp.Server {
 	instructions := mcpInstructions
 	if !allowCode {
@@ -180,7 +184,7 @@ func newMCPServer(srv *dbgp.Server, allowCode bool) *mcp.Server {
 	}
 	server := mcp.NewServer(&mcp.Implementation{Name: "dbgp", Title: "PHP debugger", Version: version},
 		&mcp.ServerOptions{Instructions: instructions})
-	t := &tools{srv: srv}
+	t := &tools{srv: srv, allowCode: allowCode}
 
 	mcp.AddTool(server, &mcp.Tool{
 		Name: "status",
@@ -204,13 +208,17 @@ func newMCPServer(srv *dbgp.Server, allowCode bool) *mcp.Server {
 	}, t.unlisten)
 
 	notDestructive := false
+	conditions := "A line breakpoint with a condition stops only when the condition is true. "
+	if !allowCode {
+		conditions = "Conditions are turned off (-no-eval), since they run PHP code. "
+	}
 	mcp.AddTool(server, &mcp.Tool{
 		Name: "add_breakpoint",
 		Description: "Add a breakpoint. It applies to every debugging session, including ones that connect later. " +
-			"A line breakpoint with a condition stops only when the condition is true. " +
+			conditions +
 			"Remove it with remove_breakpoint once you no longer need it: breakpoints slow down later sessions.",
 		Annotations:  &mcp.ToolAnnotations{DestructiveHint: &notDestructive},
-		InputSchema:  addBreakpointSchema(),
+		InputSchema:  addBreakpointSchema(allowCode),
 		OutputSchema: outputSchema[addBreakpointOutput](),
 	}, t.addBreakpoint)
 	mcp.AddTool(server, &mcp.Tool{
@@ -294,6 +302,8 @@ func pageOf[T any](items []T, n int) ([]T, int, error) {
 // tools implements the MCP tools on a dbgp server.
 type tools struct {
 	srv *dbgp.Server
+	// allowCode allows what runs PHP code in the debugged script.
+	allowCode bool
 
 	// mu guards the read positions of output and warnings, per session id:
 	// those tools return only what is new since their last call.
@@ -410,12 +420,17 @@ type addBreakpointInput struct {
 }
 
 // addBreakpointSchema is addBreakpointInput's schema, listing the types.
-func addBreakpointSchema() *jsonschema.Schema {
+// Without allowCode it has no condition, which is PHP code.
+func addBreakpointSchema(allowCode bool) *jsonschema.Schema {
 	schema, err := jsonschema.For[addBreakpointInput](nil)
 	if err != nil {
 		panic(fmt.Sprintf("add_breakpoint schema: %v", err))
 	}
 	schema.Properties["type"].Enum = breakpointTypes
+	if !allowCode {
+		delete(schema.Properties, "condition")
+		schema.PropertyOrder = slices.DeleteFunc(schema.PropertyOrder, func(name string) bool { return name == "condition" })
+	}
 	return schema
 }
 
@@ -425,6 +440,10 @@ type addBreakpointOutput struct {
 }
 
 func (t *tools) addBreakpoint(_ context.Context, _ *mcp.CallToolRequest, in addBreakpointInput) (*mcp.CallToolResult, addBreakpointOutput, error) {
+	if in.Condition != "" && !t.allowCode {
+		return nil, addBreakpointOutput{}, errors.New("conditions are turned off (-no-eval), since they run PHP code: " +
+			"add the breakpoint without one and check the values each time it stops")
+	}
 	bp := dbgp.Breakpoint{Type: in.Type, Line: in.Line, Function: in.Function, Exception: in.Exception}
 	if bp.Type == "" {
 		bp.Type = dbgp.BreakpointLine
