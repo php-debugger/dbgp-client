@@ -42,8 +42,10 @@ type repl struct {
 	notesFrom  map[int]int        // per session: notifications already shown
 }
 
+// newREPL returns a REPL that writes to out, through safeText: what it
+// prints comes largely from the debugged script.
 func newREPL(srv *dbgp.Server, out io.Writer) *repl {
-	return &repl{srv: srv, out: out, outputFrom: map[int]int{}, notesFrom: map[int]int{}}
+	return &repl{srv: srv, out: safeWriter{out}, outputFrom: map[int]int{}, notesFrom: map[int]int{}}
 }
 
 func (r *repl) printf(format string, args ...any) {
@@ -70,6 +72,9 @@ func (r *repl) run(lines lineReader) {
 	}
 }
 
+// prompt returns the prompt, which shows the selected session's status.
+// The terminal reader prints it itself, so it is made safe here: the status
+// comes from the engine.
 func (r *repl) prompt() string {
 	s := r.session()
 	if s == nil {
@@ -79,7 +84,7 @@ func (r *repl) prompt() string {
 	if ended(st) {
 		return fmt.Sprintf("(dbgp %d:ended) ", s.ID())
 	}
-	return fmt.Sprintf("(dbgp %d:%s) ", s.ID(), st.Status)
+	return safeText(fmt.Sprintf("(dbgp %d:%s) ", s.ID(), st.Status))
 }
 
 func (r *repl) session() *dbgp.Session {
