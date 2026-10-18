@@ -841,6 +841,71 @@ func TestServerLimitsLiveSessions(t *testing.T) {
 	}
 }
 
+// waitForSessionID waits up to 5s for srv to have session id, without
+// taking it.
+func waitForSessionID(t *testing.T, srv *Server, id int) *Session {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if sess := srv.Session(id); sess != nil {
+			return sess
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("no session %d", id)
+	return nil
+}
+
+// Sessions nobody takes within ClaimTimeout are detached, so their scripts
+// run on; taken ones, by WaitForSession or Claim, are kept.
+func TestServerDetachesUnclaimedSessions(t *testing.T) {
+	const timeout = 200 * time.Millisecond
+	srv := newTestServer(t, Config{ClaimTimeout: timeout})
+
+	unclaimed := dialFakeEngine(t, srv, fixture(t, "init"), standardHandlers())
+	sess := waitForSessionID(t, srv, 1)
+	if !unclaimed.WaitClosed(3 * time.Second) {
+		t.Fatal("unclaimed session was not detached")
+	}
+	if cmd := unclaimed.Received(); cmd[len(cmd)-1].Name != "detach" {
+		t.Errorf("unclaimed session got %v, want detach last", cmd)
+	}
+	<-sess.Done()
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	if got, err := srv.WaitForSession(ctx); err == nil {
+		t.Errorf("WaitForSession returned detached session %d", got.ID())
+	}
+
+	waited := dialFakeEngine(t, srv, fixture(t, "init"), standardHandlers())
+	waitSession(t, srv)
+	claimed := dialFakeEngine(t, srv, fixture(t, "init"), standardHandlers())
+	if !srv.Claim(waitForSessionID(t, srv, 3)) {
+		t.Error("Claim of a new session = false")
+	}
+	if srv.Claim(srv.Session(3)) || srv.Claim(srv.Session(2)) {
+		t.Error("Claim of a taken session = true")
+	}
+	time.Sleep(3 * timeout)
+	for _, e := range []*fakeEngine{waited, claimed} {
+		for _, cmd := range e.Received() {
+			if cmd.Name == "detach" {
+				t.Errorf("taken session was detached")
+			}
+		}
+	}
+	for _, id := range []int{2, 3} {
+		if srv.Session(id).State().Closed {
+			t.Errorf("session %d ended", id)
+		}
+	}
+	ctx, cancel = context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	if got, err := srv.WaitForSession(ctx); err == nil {
+		t.Errorf("WaitForSession returned claimed session %d", got.ID())
+	}
+}
+
 func TestSessionRemoteAddr(t *testing.T) {
 	sess, _ := startFakeSession(t, standardHandlers())
 	if host, _, _ := net.SplitHostPort(sess.RemoteAddr().String()); host != "127.0.0.1" {

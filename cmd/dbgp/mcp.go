@@ -12,12 +12,18 @@ import (
 	"strings"
 	"sync"
 	"syscall"
+	"time"
 	"unicode/utf8"
 
 	"github.com/google/jsonschema-go/jsonschema"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 	dbgp "github.com/php-debugger/dbgp-client"
 )
+
+// claimTimeout is how long a session waits for an agent to take it before
+// it is detached: PHP Debugger debugs every request, so while dbgp listens,
+// requests nobody debugs would otherwise hold their PHP workers.
+const claimTimeout = time.Minute
 
 // mcpInstructions are sent to MCP clients when they connect.
 const mcpInstructions = `dbgp debugs PHP scripts and requests through PHP Debugger or Xdebug.
@@ -34,7 +40,10 @@ stop, so it does not finish while you are debugging it. Once stopped, look
 around with stack, variables, variable and source, and step or run on with
 continue. output and warnings show what the script printed and the PHP
 warnings it raised. End every session with stop or detach when you are done
-with it: until then its PHP process or web server worker is held.
+with it: until then its PHP process or web server worker is held. A session
+that neither wait_for_session nor a tool naming it by id takes within a minute
+of connecting is detached, so its script runs on without the debugger: call
+wait_for_session right after starting the PHP code.
 
 The session tools act on the session wait_for_session last returned, or the
 last one you named by id. Each session shows the address PHP connected from:
@@ -174,7 +183,9 @@ func runMCP(args []string) int {
 		}
 	}
 
-	srv, err := dbgp.NewServer(dbgp.Config{Addr: phpAddr(*phpPort), IDEKey: *idekey, PathMap: pathMap})
+	srv, err := dbgp.NewServer(dbgp.Config{
+		Addr: phpAddr(*phpPort), IDEKey: *idekey, PathMap: pathMap, ClaimTimeout: claimTimeout,
+	})
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		return 2

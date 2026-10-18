@@ -203,6 +203,49 @@ func waitSessions(t *testing.T, srv *dbgp.Server, n int) {
 	}
 }
 
+// A session no agent takes is detached once the claim timeout passes, so
+// its script runs on; one an agent names by id is taken, and kept.
+func TestMCPDetachesUnclaimedSessions(t *testing.T) {
+	requireEngine(t)
+	const timeout = time.Second
+	cs, srv := newTestMCPWith(t, dbgp.Config{Addr: "127.0.0.1:0", ClaimTimeout: timeout}, true)
+	callTool(t, cs, "listen", nil, &listenOutput{})
+	done := filepath.Join(t.TempDir(), "done")
+	startPHP(t, srv.Port(), "-r", fmt.Sprintf(`file_put_contents(%q, "done");`, done))
+	waitSessions(t, srv, 1)
+	startPHP(t, srv.Port(), "-r", `echo "hi\n";`)
+	waitSessions(t, srv, 2)
+	callTool(t, cs, "output", map[string]any{"session": 2}, &outputOutput{})
+
+	select {
+	case <-srv.Session(1).Done():
+	case <-time.After(timeout + 5*time.Second):
+		t.Fatal("the unclaimed session was not detached")
+	}
+	for deadline := time.Now().Add(5 * time.Second); ; time.Sleep(20 * time.Millisecond) {
+		if _, err := os.Stat(done); err == nil {
+			break
+		} else if time.Now().After(deadline) {
+			t.Fatal("the unclaimed session's script did not run on after detach")
+		}
+	}
+
+	time.Sleep(timeout)
+	if srv.Session(2).State().Closed {
+		t.Fatal("the session named by id was detached")
+	}
+	var waited waitForSessionOutput
+	callTool(t, cs, "wait_for_session", map[string]any{"wait": 0.2}, &waited)
+	if waited.Connected {
+		t.Errorf("wait_for_session returned session %d, want none left", waited.Session.ID)
+	}
+	var st stateOutput
+	callTool(t, cs, "continue", nil, &st)
+	if st.Session != 2 || st.Status != "stopping" && st.Status != "ended" {
+		t.Errorf("continue = %+v, want session 2 run to its end", st)
+	}
+}
+
 // The session tools act on the session the agent picked, not the newest:
 // anything that can reach dbgp could connect and become that. Sessions show
 // where they connected from.

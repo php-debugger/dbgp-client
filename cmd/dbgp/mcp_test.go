@@ -28,7 +28,13 @@ func newTestMCP(t *testing.T) (*mcp.ClientSession, *dbgp.Server) {
 // only if allowCode.
 func newTestMCPOn(t *testing.T, addr string, allowCode bool) (*mcp.ClientSession, *dbgp.Server) {
 	t.Helper()
-	srv, err := dbgp.NewServer(dbgp.Config{Addr: addr})
+	return newTestMCPWith(t, dbgp.Config{Addr: addr}, allowCode)
+}
+
+// newTestMCPWith is newTestMCPOn with the server configured by cfg.
+func newTestMCPWith(t *testing.T, cfg dbgp.Config, allowCode bool) (*mcp.ClientSession, *dbgp.Server) {
+	t.Helper()
+	srv, err := dbgp.NewServer(cfg)
 	if err != nil {
 		t.Fatal(err)
 	}

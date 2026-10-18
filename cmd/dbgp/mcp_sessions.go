@@ -36,7 +36,8 @@ func (t *tools) addSessionTools(server *mcp.Server) {
 		Name: "wait_for_session",
 		Description: "Wait for PHP to connect and return the session, stopped at the start of the script. " +
 			"Returns the oldest session this tool has not returned yet, so one that connected earlier is not missed, " +
-			"and makes it the session the other tools act on by default. Call listen first, then start the PHP code.",
+			"and makes it the session the other tools act on by default. Call listen first, then start the PHP code. " +
+			"A session not taken within a minute of connecting is detached, so its script runs on without the debugger.",
 		Annotations: &mcp.ToolAnnotations{ReadOnlyHint: true},
 	}, t.waitForSession)
 	mcp.AddTool(server, &mcp.Tool{
@@ -111,6 +112,9 @@ func (t *tools) session(req *mcp.CallToolRequest, id int) (*dbgp.Session, error)
 	if s == nil {
 		return nil, fmt.Errorf("no session %d", id)
 	}
+	// Named by id, it is taken: wait_for_session will not return it, and it
+	// is not detached for waiting too long.
+	t.srv.Claim(s)
 	a.selected = id
 	return s, nil
 }

@@ -54,6 +54,11 @@ type Config struct {
 	// PathMap maps local directories to the engine's, for PHP running in a
 	// container or on a remote server. Sessions take and return local paths.
 	PathMap []PathMapping
+	// ClaimTimeout, when set, detaches sessions that neither WaitForSession
+	// nor Claim has taken within this time of connecting, so their scripts
+	// run on without the debugger instead of waiting for someone to debug
+	// them. Default: sessions wait until taken.
+	ClaimTimeout time.Duration
 }
 
 // Limits on connections, so that a flood of them, from anything that can
@@ -365,6 +370,21 @@ func (s *Server) handshake(conn net.Conn) {
 	s.pruneSessions()
 	close(s.arrived)
 	s.arrived = make(chan struct{})
+	if s.cfg.ClaimTimeout > 0 {
+		time.AfterFunc(s.cfg.ClaimTimeout, func() { s.detachUnclaimed(sess) })
+	}
+}
+
+// detachUnclaimed detaches sess if nobody has taken it, so its script runs
+// on instead of waiting.
+func (s *Server) detachUnclaimed(sess *Session) {
+	s.mu.Lock()
+	unclaimed := !s.closed && s.unqueueLocked(sess)
+	s.mu.Unlock()
+	if unclaimed {
+		_ = sess.Detach()
+		_ = sess.Close()
+	}
 }
 
 // detachConn lets the script on conn run on without the debugger.
@@ -526,6 +546,26 @@ func (s *Server) WaitForSession(ctx context.Context) (*Session, error) {
 			return nil, ctx.Err()
 		}
 	}
+}
+
+// Claim takes sess as if WaitForSession had returned it, so WaitForSession
+// does not return it and Config.ClaimTimeout no longer applies to it. It
+// reports whether sess was still waiting to be taken.
+func (s *Server) Claim(sess *Session) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.unqueueLocked(sess)
+}
+
+// unqueueLocked removes sess from the sessions WaitForSession has not
+// returned yet, and reports whether it was there.
+func (s *Server) unqueueLocked(sess *Session) bool {
+	i := slices.Index(s.queue, sess)
+	if i < 0 {
+		return false
+	}
+	s.queue = slices.Delete(s.queue, i, i+1)
+	return true
 }
 
 // AddBreakpoint adds a breakpoint to every session: now for sessions that
