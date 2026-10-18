@@ -61,7 +61,7 @@ dbgp mcp status    # is it running?
 dbgp mcp stop      # stop it
 ```
 
-While it runs, agents that start `dbgp mcp` use it instead, with the options it was started with. After updating dbgp, restart it to use the new version.
+While it runs, agents that start `dbgp mcp` use it instead, with the options it was started with. Only you can use it: `dbgp mcp` connects with a token kept in a file that other users on the machine cannot read. After updating dbgp, restart it to use the new version.
 
 `dbgp mcp -h` lists all the options.
 

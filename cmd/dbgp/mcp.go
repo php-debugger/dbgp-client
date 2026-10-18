@@ -130,7 +130,7 @@ func runMCP(args []string) int {
 				fmt.Fprintf(os.Stderr, "dbgp: using the background server at %s, with its own options: %s ignored\n",
 					st.URL, strings.Join(args, " "))
 			}
-			if err := bridge(ctx, st.URL); err != nil && ctx.Err() == nil {
+			if err := bridge(ctx, st); err != nil && ctx.Err() == nil {
 				fmt.Fprintln(os.Stderr, err)
 				return 1
 			}

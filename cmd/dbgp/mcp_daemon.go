@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
+	"crypto/subtle"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -20,7 +22,9 @@ import (
 // The background MCP server, over HTTP: dbgp mcp start starts it and
 // returns, dbgp mcp stop stops it, and dbgp mcp started by an agent passes
 // the agent on to it. Its state file records its process and URL, so they
-// find it; there is one per user.
+// find it; there is one per user. The state file also holds a token that
+// every request must carry: only the user can read the file, so other users
+// on the machine cannot use the server, which runs PHP code for its agents.
 
 // serveCommand runs the background server in this process. dbgp mcp start
 // runs it; it is not meant to be typed.
@@ -40,6 +44,8 @@ const (
 type daemonState struct {
 	PID int    `json:"pid"`
 	URL string `json:"url"`
+	// Token authenticates agents: requests send it as a bearer token.
+	Token string `json:"token"`
 }
 
 // stateDir is where the state file and the background server's log are.
@@ -86,14 +92,31 @@ func writeState(st daemonState) error {
 	if err != nil {
 		return err
 	}
-	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return err
 	}
 	data, err := json.Marshal(st)
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(path, data, 0o600)
+	// A new file, renamed into place: it is readable by the user only even
+	// if an old state file was not, and readers never see half of it.
+	f, err := os.CreateTemp(dir, "mcp-*.json")
+	if err != nil {
+		return err
+	}
+	_, err = f.Write(data)
+	if cerr := f.Close(); err == nil {
+		err = cerr
+	}
+	if err == nil {
+		err = os.Rename(f.Name(), path)
+	}
+	if err != nil {
+		_ = os.Remove(f.Name())
+	}
+	return err
 }
 
 // removeState removes the state file if it still records process pid.
@@ -256,14 +279,18 @@ func daemonStatus() int {
 }
 
 // bridge passes MCP messages between stdin and stdout and the background
-// server at url, until either side closes.
-func bridge(ctx context.Context, url string) error {
+// server st, until either side closes.
+func bridge(ctx context.Context, st *daemonState) error {
 	local, err := (&mcp.StdioTransport{}).Connect(ctx)
 	if err != nil {
 		return err
 	}
 	defer local.Close()
-	remote, err := (&mcp.StreamableClientTransport{Endpoint: url}).Connect(ctx)
+	client, err := tokenClient(st.URL, st.Token)
+	if err != nil {
+		return err
+	}
+	remote, err := (&mcp.StreamableClientTransport{Endpoint: st.URL, HTTPClient: client}).Connect(ctx)
 	if err != nil {
 		return err
 	}
@@ -291,6 +318,43 @@ func bridge(ctx context.Context, url string) error {
 	return nil
 }
 
+// tokenClient returns an HTTP client that sends token to the server at
+// rawURL, and to no other. A state file from before tokens has none: that
+// server takes requests without one.
+func tokenClient(rawURL, token string) (*http.Client, error) {
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return nil, err
+	}
+	return &http.Client{Transport: &bearerTransport{host: u.Host, token: token}}, nil
+}
+
+// bearerTransport adds the token to requests for host.
+type bearerTransport struct {
+	host, token string
+}
+
+func (t *bearerTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	if t.token != "" && req.URL.Host == t.host {
+		req = req.Clone(req.Context())
+		req.Header.Set("Authorization", "Bearer "+t.token)
+	}
+	return http.DefaultTransport.RoundTrip(req)
+}
+
+// requireToken passes on only requests that carry token as a bearer token.
+func requireToken(token string, next http.Handler) http.Handler {
+	want := []byte("Bearer " + token)
+	return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		if subtle.ConstantTimeCompare([]byte(req.Header.Get("Authorization")), want) != 1 {
+			w.Header().Set("WWW-Authenticate", `Bearer realm="dbgp"`)
+			http.Error(w, "unauthorized: connect agents with dbgp mcp, which sends the token", http.StatusUnauthorized)
+			return
+		}
+		next.ServeHTTP(w, req)
+	})
+}
+
 // serveHTTP serves MCP over HTTP at addr until ctx is done, recording the
 // server in the state file meanwhile.
 func serveHTTP(ctx context.Context, server *mcp.Server, addr string) error {
@@ -298,7 +362,7 @@ func serveHTTP(ctx context.Context, server *mcp.Server, addr string) error {
 	if err != nil {
 		return err
 	}
-	st := daemonState{PID: os.Getpid(), URL: "http://" + ln.Addr().String() + "/mcp"}
+	st := daemonState{PID: os.Getpid(), URL: "http://" + ln.Addr().String() + "/mcp", Token: rand.Text()}
 	if err := writeState(st); err != nil {
 		_ = ln.Close()
 		return err
@@ -308,7 +372,7 @@ func serveHTTP(ctx context.Context, server *mcp.Server, addr string) error {
 	handler := mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return server },
 		&mcp.StreamableHTTPOptions{CrossOriginProtection: http.NewCrossOriginProtection()})
 	mux := http.NewServeMux()
-	mux.Handle("/mcp", handler)
+	mux.Handle("/mcp", requireToken(st.Token, handler))
 	hs := &http.Server{Handler: mux, ReadHeaderTimeout: 10 * time.Second}
 	go func() {
 		<-ctx.Done()

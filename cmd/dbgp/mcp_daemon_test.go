@@ -3,9 +3,14 @@ package main
 import (
 	"context"
 	"net"
+	"net/http"
+	"net/http/httptest"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"runtime"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -66,11 +71,7 @@ func TestMCPDaemon(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	for range 2 {
-		cs, err := mcp.NewClient(&mcp.Implementation{Name: "test", Version: "0"}, nil).
-			Connect(ctx, &mcp.StreamableClientTransport{Endpoint: url}, nil)
-		if err != nil {
-			t.Fatal(err)
-		}
+		cs := connectDirect(ctx, t, url)
 		var status statusOutput
 		callTool(t, cs, "status", nil, &status)
 		if status.Listening {
@@ -165,11 +166,7 @@ func TestMCPBridge(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	direct, err := mcp.NewClient(&mcp.Implementation{Name: "test", Version: "0"}, nil).
-		Connect(ctx, &mcp.StreamableClientTransport{Endpoint: url}, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
+	direct := connectDirect(ctx, t, url)
 	defer direct.Close()
 
 	list, err := bridged.ListTools(ctx, nil)
@@ -197,4 +194,142 @@ func TestMCPBridge(t *testing.T) {
 	}
 	// The background server carries on after the agent leaves.
 	callTool(t, direct, "status", nil, &status)
+}
+
+// connectDirect connects to the background server over HTTP, with the token
+// from the state file, as dbgp mcp does.
+func connectDirect(ctx context.Context, t *testing.T, url string) *mcp.ClientSession {
+	t.Helper()
+	st, err := readState()
+	if err != nil || st == nil {
+		t.Fatalf("state = %+v, %v", st, err)
+	}
+	client, err := tokenClient(url, st.Token)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cs, err := mcp.NewClient(&mcp.Implementation{Name: "test", Version: "0"}, nil).
+		Connect(ctx, &mcp.StreamableClientTransport{Endpoint: url, HTTPClient: client}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return cs
+}
+
+// Only requests with the token from the state file reach the server: other
+// users on the machine cannot read the file, so they cannot use it.
+func TestMCPDaemonRequiresToken(t *testing.T) {
+	bin := buildBinary(t)
+	daemonEnv(t)
+	url := startTestDaemon(t, bin)
+	st, err := readState()
+	if err != nil || st == nil || st.Token == "" {
+		t.Fatalf("state = %+v, %v; want a token", st, err)
+	}
+
+	initialize := `{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"test","version":"0"}}}`
+	for name, auth := range map[string]string{
+		"no token":     "",
+		"wrong token":  "Bearer " + strings.Repeat("A", len(st.Token)),
+		"bare token":   st.Token,
+		"other scheme": "Basic " + st.Token,
+	} {
+		req, err := http.NewRequest("POST", url, strings.NewReader(initialize))
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Accept", "application/json, text/event-stream")
+		if auth != "" {
+			req.Header.Set("Authorization", auth)
+		}
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_ = resp.Body.Close()
+		if resp.StatusCode != http.StatusUnauthorized {
+			t.Errorf("%s: status %d, want 401", name, resp.StatusCode)
+		}
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	_, err = mcp.NewClient(&mcp.Implementation{Name: "test", Version: "0"}, nil).
+		Connect(ctx, &mcp.StreamableClientTransport{Endpoint: url, MaxRetries: -1}, nil)
+	if err == nil {
+		t.Error("an agent without the token connected")
+	}
+	cs := connectDirect(ctx, t, url)
+	_ = cs.Close()
+
+	if strings.Contains(readLog(), st.Token) {
+		t.Error("the log shows the token")
+	}
+	if runtime.GOOS != "windows" {
+		path, _ := statePath()
+		if info, err := os.Stat(path); err != nil || info.Mode().Perm() != 0o600 {
+			t.Errorf("state file: %v, %v; want mode 0600", info.Mode().Perm(), err)
+		}
+	}
+}
+
+// A state file left readable by others is replaced by one only the user
+// can read, since it holds the token.
+func TestWriteStateIsPrivate(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Windows has no permission bits; LocalAppData is private to the user")
+	}
+	daemonEnv(t)
+	path, err := statePath()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte("{}"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	want := daemonState{PID: 1, URL: "http://127.0.0.1:1/mcp", Token: "secret"}
+	if err := writeState(want); err != nil {
+		t.Fatal(err)
+	}
+	if info, err := os.Stat(path); err != nil || info.Mode().Perm() != 0o600 {
+		t.Errorf("state file: %v, %v; want mode 0600", info.Mode().Perm(), err)
+	}
+	if got, err := readState(); err != nil || got == nil || *got != want {
+		t.Errorf("readState = %+v, %v; want %+v", got, err, want)
+	}
+	if entries, _ := os.ReadDir(filepath.Dir(path)); len(entries) != 1 {
+		t.Errorf("state directory has %d entries, want only the state file", len(entries))
+	}
+}
+
+// The token goes to the background server only, not to other hosts, e.g.
+// after a redirect.
+func TestTokenClientSendsTokenOnlyToItsServer(t *testing.T) {
+	var got []string
+	record := http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		got = append(got, req.Header.Get("Authorization"))
+	})
+	server := httptest.NewServer(record)
+	defer server.Close()
+	other := httptest.NewServer(record)
+	defer other.Close()
+
+	client, err := tokenClient(server.URL+"/mcp", "secret")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, u := range []string{server.URL + "/mcp", other.URL + "/mcp"} {
+		resp, err := client.Get(u)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_ = resp.Body.Close()
+	}
+	if want := []string{"Bearer secret", ""}; !slices.Equal(got, want) {
+		t.Errorf("Authorization headers = %q, want %q", got, want)
+	}
 }
