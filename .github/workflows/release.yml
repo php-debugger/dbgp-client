@@ -15,15 +15,24 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
+      # The newest Go, not go.mod's minimum: the binaries carry its standard
+      # library, so each release gets every security fix made so far.
       - uses: actions/setup-go@v7
         with:
-          go-version-file: go.mod
+          go-version: stable
+          check-latest: true
+
+      - name: Check for known vulnerabilities
+        run: go run golang.org/x/vuln/cmd/govulncheck@v1.9.0 ./...
 
       - name: Build and package all targets
         env:
           TAG: ${{ github.event.release.tag_name }}
         run: |
-          mkdir -p dist build
+          # Outside the checkout, so the binaries are not stamped as built
+          # from modified sources.
+          dist="$RUNNER_TEMP/dist" build="$RUNNER_TEMP/build"
+          mkdir -p "$dist" "$build"
           ver="${TAG#v}" # strip a leading "v" if present
           ldflags="-s -w -X main.version=${ver}"
           # Windows-on-ARM runs x64 under emulation, so one Windows build suffices.
@@ -35,26 +44,26 @@ jobs:
 
             echo "building $osname/$arch"
             CGO_ENABLED=0 GOOS="$goos" GOARCH="$arch" \
-              go build -trimpath -ldflags "$ldflags" -o "build/$bin" ./cmd/dbgp
-            chmod +x "build/$bin"
+              go build -trimpath -ldflags "$ldflags" -o "$build/$bin" ./cmd/dbgp
+            chmod +x "$build/$bin"
 
             # Package into an archive so the executable bit survives download
             # (raw GitHub release assets lose Unix permissions).
             base="dbgp-${osname}-${arch}"
             if [ "$goos" = "windows" ]; then
-              (cd build && zip -q "../dist/${base}.zip" "$bin")
+              (cd "$build" && zip -q "$dist/${base}.zip" "$bin")
             else
-              tar -C build -czf "dist/${base}.tar.gz" "$bin"
+              tar -C "$build" -czf "$dist/${base}.tar.gz" "$bin"
             fi
-            rm -f "build/$bin"
+            rm -f "$build/$bin"
           done
           # Attach the install scripts too, so releases/latest/download/install.sh
           # is a stable URL that serves the released version of the script.
-          cp scripts/install.sh scripts/install.ps1 dist/
-          ls -la dist
+          cp scripts/install.sh scripts/install.ps1 "$dist/"
+          ls -la "$dist"
 
       - name: Attach binaries to the release
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ github.event.release.tag_name }}
-        run: gh release upload "$TAG" dist/* --clobber
+        run: gh release upload "$TAG" "$RUNNER_TEMP"/dist/* --clobber
