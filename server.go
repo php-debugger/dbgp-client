@@ -56,6 +56,18 @@ type Config struct {
 	PathMap []PathMapping
 }
 
+// Limits on connections, so that a flood of them, from anything that can
+// reach the port, cannot exhaust memory. PHP connects once per script run
+// or request, and holds its connection while it is debugged.
+const (
+	// maxHandshakes bounds connections that have not sent their init
+	// packet yet; each may take Config.InitTimeout to do so.
+	maxHandshakes = 8
+	// maxLiveSessions bounds sessions that have not ended. Beyond it, new
+	// scripts are detached, so they run on without the debugger.
+	maxLiveSessions = 16
+)
+
 // Breakpoint is a breakpoint the server applies to every session, including
 // sessions that connect later.
 type Breakpoint struct {
@@ -98,6 +110,9 @@ type Server struct {
 	arrived     chan struct{}
 	nextBPID    int
 	breakpoints []Breakpoint
+
+	// The connection limits; tests lower them.
+	maxHandshakes, maxLiveSessions int
 }
 
 // Listen creates a server and starts listening for engine connections.
@@ -125,11 +140,13 @@ func NewServer(cfg Config) (*Server, error) {
 		return nil, err
 	}
 	return &Server{
-		cfg:        cfg,
-		paths:      paths,
-		addr:       cfg.Addr,
-		handshakes: map[net.Conn]struct{}{},
-		arrived:    make(chan struct{}),
+		cfg:             cfg,
+		paths:           paths,
+		addr:            cfg.Addr,
+		handshakes:      map[net.Conn]struct{}{},
+		arrived:         make(chan struct{}),
+		maxHandshakes:   maxHandshakes,
+		maxLiveSessions: maxLiveSessions,
 	}, nil
 }
 
@@ -280,7 +297,7 @@ func (s *Server) acceptLoop(listener net.Listener, done chan struct{}) {
 			return
 		}
 		s.mu.Lock()
-		if s.closed {
+		if s.closed || len(s.handshakes) >= s.maxHandshakes {
 			s.mu.Unlock()
 			_ = conn.Close()
 			continue
@@ -317,12 +334,16 @@ func (s *Server) handshake(conn net.Conn) {
 
 	if s.cfg.IDEKey != "" && init.IDEKey != s.cfg.IDEKey {
 		// Not ours: let the script run on without the debugger.
-		_, _ = conn.Write([]byte("detach -i 1\x00"))
-		_ = conn.Close()
+		detachConn(conn)
 		return
 	}
 
 	s.mu.Lock()
+	if s.liveSessionsLocked() >= s.maxLiveSessions {
+		s.mu.Unlock()
+		detachConn(conn)
+		return
+	}
 	s.nextID++
 	id := s.nextID
 	s.mu.Unlock()
@@ -343,6 +364,23 @@ func (s *Server) handshake(conn net.Conn) {
 	s.pruneSessions()
 	close(s.arrived)
 	s.arrived = make(chan struct{})
+}
+
+// detachConn lets the script on conn run on without the debugger.
+func detachConn(conn net.Conn) {
+	_, _ = conn.Write([]byte("detach -i 1\x00"))
+	_ = conn.Close()
+}
+
+// liveSessionsLocked counts the sessions that have not ended.
+func (s *Server) liveSessionsLocked() int {
+	live := 0
+	for _, sess := range s.sessions {
+		if !sess.ended() {
+			live++
+		}
+	}
+	return live
 }
 
 // setup enables notifications and output capture, then applies cfg.Features.

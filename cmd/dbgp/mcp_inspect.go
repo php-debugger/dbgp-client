@@ -48,7 +48,7 @@ type frameInfo struct {
 }
 
 type stackInput struct {
-	Session int `json:"session,omitempty" jsonschema:"the session id; defaults to the newest session that has not ended"`
+	Session int `json:"session,omitempty" jsonschema:"the session id; defaults to the one wait_for_session last returned or you last named"`
 	Page    int `json:"page,omitempty" jsonschema:"the page of frames, from 0 (the default); see pages"`
 }
 
@@ -81,7 +81,7 @@ func (t *tools) stack(_ context.Context, _ *mcp.CallToolRequest, in stackInput) 
 
 // frameInput picks where to look for variables.
 type frameInput struct {
-	Session int `json:"session,omitempty" jsonschema:"the session id; defaults to the newest session that has not ended"`
+	Session int `json:"session,omitempty" jsonschema:"the session id; defaults to the one wait_for_session last returned or you last named"`
 	Depth   int `json:"depth,omitempty" jsonschema:"the stack frame: 0 (the default) is where execution stopped, 1 its caller, and so on; see stack"`
 	Context int `json:"context,omitempty" jsonschema:"0 (the default) local variables, 1 superglobals such as $_SERVER and $_GET, 2 user-defined constants"`
 	Page    int `json:"page,omitempty" jsonschema:"the page of variables, from 0 (the default); see pages"`
@@ -164,7 +164,7 @@ func (t *tools) variables(_ context.Context, _ *mcp.CallToolRequest, in frameInp
 }
 
 type variableInput struct {
-	Session int    `json:"session,omitempty" jsonschema:"the session id; defaults to the newest session that has not ended"`
+	Session int    `json:"session,omitempty" jsonschema:"the session id; defaults to the one wait_for_session last returned or you last named"`
 	Name    string `json:"name" jsonschema:"the variable, or a path into one, e.g. $user, $user[\"name\"] or $obj->cache"`
 	Depth   int    `json:"depth,omitempty" jsonschema:"the stack frame: 0 (the default) is where execution stopped, 1 its caller, and so on; see stack"`
 	Context int    `json:"context,omitempty" jsonschema:"0 (the default) local variables, 1 superglobals such as $_SERVER and $_GET, 2 user-defined constants"`
@@ -204,7 +204,7 @@ func (t *tools) variable(_ context.Context, _ *mcp.CallToolRequest, in variableI
 }
 
 type variableValueInput struct {
-	Session int    `json:"session,omitempty" jsonschema:"the session id; defaults to the newest session that has not ended"`
+	Session int    `json:"session,omitempty" jsonschema:"the session id; defaults to the one wait_for_session last returned or you last named"`
 	Name    string `json:"name" jsonschema:"the variable, or a path into one, e.g. $html or $page[\"body\"]"`
 	Depth   int    `json:"depth,omitempty" jsonschema:"the stack frame: 0 (the default) is where execution stopped, 1 its caller, and so on; see stack"`
 	Context int    `json:"context,omitempty" jsonschema:"0 (the default) local variables, 1 superglobals such as $_SERVER and $_GET, 2 user-defined constants"`

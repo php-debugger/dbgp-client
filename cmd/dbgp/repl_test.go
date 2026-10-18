@@ -572,14 +572,9 @@ func TestPHPAddrIsEveryAddress(t *testing.T) {
 	}
 	defer srv.Close()
 	var hosts []string
-	addrs, _ := net.InterfaceAddrs()
-	for _, a := range addrs {
-		if ipnet, ok := a.(*net.IPNet); ok && ipnet.IP.To4() != nil && !ipnet.IP.IsLoopback() && !ipnet.IP.IsLinkLocalUnicast() {
-			hosts = append(hosts, ipnet.IP.String())
-			break
-		}
-	}
-	if len(hosts) == 0 {
+	if lan := lanAddr(); lan != "" {
+		hosts = append(hosts, lan)
+	} else {
 		t.Log("no network address besides loopback: checking loopback only")
 	}
 	for _, host := range append(hosts, "127.0.0.1", "::1") {
@@ -594,4 +589,16 @@ func TestPHPAddrIsEveryAddress(t *testing.T) {
 		}
 		_ = conn.Close()
 	}
+}
+
+// lanAddr returns an IPv4 address of this machine other than loopback, or
+// "" if it has none.
+func lanAddr() string {
+	addrs, _ := net.InterfaceAddrs()
+	for _, a := range addrs {
+		if ipnet, ok := a.(*net.IPNet); ok && ipnet.IP.To4() != nil && !ipnet.IP.IsLoopback() && !ipnet.IP.IsLinkLocalUnicast() {
+			return ipnet.IP.String()
+		}
+	}
+	return ""
 }

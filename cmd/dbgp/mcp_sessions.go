@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net"
 	"time"
 
 	"github.com/google/jsonschema-go/jsonschema"
@@ -34,8 +35,8 @@ func (t *tools) addSessionTools(server *mcp.Server) {
 	mcp.AddTool(server, &mcp.Tool{
 		Name: "wait_for_session",
 		Description: "Wait for PHP to connect and return the session, stopped at the start of the script. " +
-			"Returns the oldest session this tool has not returned yet, so one that connected earlier is not missed. " +
-			"Call listen first, then start the PHP code.",
+			"Returns the oldest session this tool has not returned yet, so one that connected earlier is not missed, " +
+			"and makes it the session the other tools act on by default. Call listen first, then start the PHP code.",
 		Annotations: &mcp.ToolAnnotations{ReadOnlyHint: true},
 	}, t.waitForSession)
 	mcp.AddTool(server, &mcp.Tool{
@@ -71,7 +72,7 @@ func (t *tools) sessionList() []sessionInfo {
 
 func toSessionInfo(s *dbgp.Session) sessionInfo {
 	st := s.State()
-	info := sessionInfo{ID: s.ID(), Script: s.Script(), Status: st.Status}
+	info := sessionInfo{ID: s.ID(), From: remoteHost(s), Script: s.Script(), Status: st.Status}
 	if ended(st) {
 		info.Status = "ended"
 	} else if st.Status == dbgp.StatusBreak {
@@ -80,22 +81,40 @@ func toSessionInfo(s *dbgp.Session) sessionInfo {
 	return info
 }
 
-// session returns the session with the given id, or by default the newest
-// session that has not ended.
+// remoteHost is the address a session's engine connected from, without
+// the port.
+func remoteHost(s *dbgp.Session) string {
+	addr := s.RemoteAddr().String()
+	if host, _, err := net.SplitHostPort(addr); err == nil {
+		return host
+	}
+	return addr
+}
+
+// session returns the session with the given id, which it selects, or by
+// default the selected session, even one that has ended.
 func (t *tools) session(id int) (*dbgp.Session, error) {
-	if id != 0 {
-		if s := t.srv.Session(id); s != nil {
-			return s, nil
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if id == 0 {
+		if t.selected == 0 {
+			return nil, errors.New("no session: call listen, start the PHP code, then wait_for_session")
 		}
+		id = t.selected
+	}
+	s := t.srv.Session(id)
+	if s == nil {
 		return nil, fmt.Errorf("no session %d", id)
 	}
-	sessions := t.srv.Sessions()
-	for i := len(sessions) - 1; i >= 0; i-- {
-		if !ended(sessions[i].State()) {
-			return sessions[i], nil
-		}
-	}
-	return nil, errors.New("no session: call listen, start the PHP code, then wait_for_session")
+	t.selected = id
+	return s, nil
+}
+
+// selectSession makes s the session the tools act on by default.
+func (t *tools) selectSession(s *dbgp.Session) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.selected = s.ID()
 }
 
 // waitDuration converts a wait in seconds, 0 meaning the default.
@@ -138,6 +157,7 @@ func (t *tools) waitForSession(ctx context.Context, _ *mcp.CallToolRequest, in w
 		done, cancel := context.WithCancel(ctx)
 		cancel()
 		if s, err := t.srv.WaitForSession(done); err == nil {
+			t.selectSession(s)
 			info := toSessionInfo(s)
 			return nil, waitForSessionOutput{Connected: true, Session: &info}, nil
 		}
@@ -152,16 +172,17 @@ func (t *tools) waitForSession(ctx context.Context, _ *mcp.CallToolRequest, in w
 	if err != nil {
 		return nil, waitForSessionOutput{}, err
 	}
+	t.selectSession(s)
 	info := toSessionInfo(s)
 	return nil, waitForSessionOutput{Connected: true, Session: &info}, nil
 }
 
 type sessionInput struct {
-	Session int `json:"session,omitempty" jsonschema:"the session id; defaults to the newest session that has not ended"`
+	Session int `json:"session,omitempty" jsonschema:"the session id; defaults to the one wait_for_session last returned or you last named"`
 }
 
 type continueInput struct {
-	Session int     `json:"session,omitempty" jsonschema:"the session id; defaults to the newest session that has not ended"`
+	Session int     `json:"session,omitempty" jsonschema:"the session id; defaults to the one wait_for_session last returned or you last named"`
 	Command string  `json:"command,omitempty" jsonschema:"run (the default) runs to the next breakpoint or the end of the script; step_into, step_over and step_out step one statement, into, over or out of a function call"`
 	Wait    float64 `json:"wait,omitempty" jsonschema:"seconds to wait for the script to stop, 30 by default and at most 600"`
 }
@@ -203,7 +224,7 @@ func sessionError(s *dbgp.Session, err error) error {
 	case errors.Is(err, dbgp.ErrRunning):
 		return fmt.Errorf("session %d is still running: call wait_for_stop first", s.ID())
 	case ended(s.State()):
-		return fmt.Errorf("session %d has ended", s.ID())
+		return fmt.Errorf("session %d has ended: wait_for_session returns the next one", s.ID())
 	}
 	return err
 }
@@ -229,7 +250,7 @@ func (t *tools) continueSession(ctx context.Context, _ *mcp.CallToolRequest, in 
 }
 
 type waitForStopInput struct {
-	Session int     `json:"session,omitempty" jsonschema:"the session id; defaults to the newest session that has not ended"`
+	Session int     `json:"session,omitempty" jsonschema:"the session id; defaults to the one wait_for_session last returned or you last named"`
 	Wait    float64 `json:"wait,omitempty" jsonschema:"seconds to wait for the script to stop, 30 by default and at most 600"`
 }
 

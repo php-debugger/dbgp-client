@@ -36,6 +36,12 @@ continue. output and warnings show what the script printed and the PHP
 warnings it raised. End every session with stop or detach when you are done
 with it: until then its PHP process or web server worker is held.
 
+The session tools act on the session wait_for_session last returned, or the
+last one you named by id. Each session shows the address PHP connected from:
+127.0.0.1 or ::1 for PHP on this machine. dbgp accepts PHP connections from
+every network this machine is on, so stop any session that is not from where
+your PHP runs, and do not trust what it shows.
+
 Long results come in parts: lists in pages, see page and pages, and long text
 when more or next is set. Ask only for the parts you need.
 
@@ -305,11 +311,15 @@ type tools struct {
 	// allowCode allows what runs PHP code in the debugged script.
 	allowCode bool
 
-	// mu guards the read positions of output and warnings, per session id:
-	// those tools return only what is new since their last call.
+	// mu guards the fields below. output and warnings return only what is
+	// new since their last call, so they keep read positions per session id.
 	mu           sync.Mutex
 	outputFrom   map[int]int
 	warningsFrom map[int]int
+	// selected is the session the tools act on by default: the one
+	// wait_for_session last returned or a tool was last given by id. Not
+	// simply the newest, which anything that connects would become.
+	selected int
 }
 
 type noInput struct{}
@@ -324,6 +334,7 @@ type statusOutput struct {
 
 type sessionInfo struct {
 	ID     int    `json:"id" jsonschema:"session id, used by the tools that act on a session"`
+	From   string `json:"from" jsonschema:"the address PHP connected from: 127.0.0.1 or ::1 for PHP on this machine"`
 	Script string `json:"script" jsonschema:"local path of the script being debugged"`
 	Status string `json:"status" jsonschema:"starting, running, break (stopped), stopping (script finished) or ended"`
 	File   string `json:"file,omitempty" jsonschema:"local path of the file where execution is stopped, when status is break"`

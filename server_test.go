@@ -655,3 +655,93 @@ func TestBreakpointChangesSkipFinishedSessions(t *testing.T) {
 		t.Errorf("removing the first breakpoint: %v", err)
 	}
 }
+
+// setLimits lowers srv's connection limits for a test.
+func setLimits(srv *Server, handshakes, live int) {
+	srv.mu.Lock()
+	defer srv.mu.Unlock()
+	srv.maxHandshakes, srv.maxLiveSessions = handshakes, live
+}
+
+// Connections that have not sent their init packet are limited: beyond
+// the limit, new ones are closed at once.
+func TestServerLimitsHandshakes(t *testing.T) {
+	srv := newTestServer(t, Config{InitTimeout: time.Minute})
+	setLimits(srv, 2, maxLiveSessions)
+	silent := []net.Conn{dialServer(t, srv), dialServer(t, srv)}
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		srv.mu.Lock()
+		n := len(srv.handshakes)
+		srv.mu.Unlock()
+		if n == 2 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("%d handshakes, want 2", n)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	extra := dialServer(t, srv)
+	_ = extra.SetReadDeadline(time.Now().Add(3 * time.Second))
+	if _, err := extra.Read(make([]byte, 1)); err != io.EOF {
+		t.Errorf("connection beyond the limit: read %v, want it closed", err)
+	}
+
+	// Once they go, PHP can connect again.
+	for _, c := range silent {
+		_ = c.Close()
+	}
+	deadline = time.Now().Add(3 * time.Second)
+	for {
+		srv.mu.Lock()
+		n := len(srv.handshakes)
+		srv.mu.Unlock()
+		if n == 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("%d handshakes left after closing them", n)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	dialFakeEngine(t, srv, fixture(t, "init"), standardHandlers())
+	waitSession(t, srv)
+}
+
+// Live sessions are limited: beyond the limit, new scripts are detached
+// so they run on without the debugger.
+func TestServerLimitsLiveSessions(t *testing.T) {
+	srv := newTestServer(t, Config{})
+	setLimits(srv, maxHandshakes, 1)
+	first := dialFakeEngine(t, srv, fixture(t, "init"), standardHandlers())
+	waitSession(t, srv)
+
+	extra := dialFakeEngine(t, srv, fixture(t, "init"), standardHandlers())
+	if !extra.WaitClosed(3 * time.Second) {
+		t.Fatal("server kept a session beyond the limit")
+	}
+	if cmds := extra.Received(); len(cmds) != 1 || cmds[0].Raw != "detach -i 1" {
+		t.Errorf("session beyond the limit got %+v, want a single detach", cmds)
+	}
+
+	// An ended session no longer counts.
+	first.Close()
+	select {
+	case <-srv.Session(1).Done():
+	case <-time.After(3 * time.Second):
+		t.Fatal("session 1 did not end")
+	}
+	dialFakeEngine(t, srv, fixture(t, "init"), standardHandlers())
+	if sess := waitSession(t, srv); sess.ID() != 2 {
+		t.Errorf("session %d, want 2", sess.ID())
+	}
+}
+
+func TestSessionRemoteAddr(t *testing.T) {
+	sess, _ := startFakeSession(t, standardHandlers())
+	if host, _, _ := net.SplitHostPort(sess.RemoteAddr().String()); host != "127.0.0.1" {
+		t.Errorf("RemoteAddr() = %s, want 127.0.0.1", sess.RemoteAddr())
+	}
+}

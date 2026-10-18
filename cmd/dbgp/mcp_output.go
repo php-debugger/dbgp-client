@@ -44,21 +44,8 @@ func (t *tools) addOutputTools(server *mcp.Server) {
 	}, t.warnings)
 }
 
-// latestSession returns the session with the given id, or by default the
-// newest session, even one that has ended: what it printed is still there.
-func (t *tools) latestSession(id int) (*dbgp.Session, error) {
-	if id != 0 {
-		return t.session(id)
-	}
-	sessions := t.srv.Sessions()
-	if len(sessions) == 0 {
-		return nil, errors.New("no session: call listen, start the PHP code, then wait_for_session")
-	}
-	return sessions[len(sessions)-1], nil
-}
-
 type sourceInput struct {
-	Session int    `json:"session,omitempty" jsonschema:"the session id; defaults to the newest session that has not ended"`
+	Session int    `json:"session,omitempty" jsonschema:"the session id; defaults to the one wait_for_session last returned or you last named"`
 	File    string `json:"file,omitempty" jsonschema:"the file, as a path on this machine; defaults to where the session stopped, or its script"`
 	Line    int    `json:"line,omitempty" jsonschema:"the line to show the code around; defaults to where the session stopped, or 1 for another file"`
 	Around  int    `json:"around,omitempty" jsonschema:"how many lines to show before and after the line: 5 by default, at most 100"`
@@ -131,7 +118,7 @@ func (t *tools) source(_ context.Context, _ *mcp.CallToolRequest, in sourceInput
 }
 
 type readInput struct {
-	Session int  `json:"session,omitempty" jsonschema:"the session id; defaults to the newest session, even one that has ended"`
+	Session int  `json:"session,omitempty" jsonschema:"the session id; defaults to the one wait_for_session last returned or you last named, even if it has ended"`
 	All     bool `json:"all,omitempty" jsonschema:"return everything kept so far, not only what is new since the last call"`
 }
 
@@ -158,7 +145,7 @@ type outputOutput struct {
 }
 
 func (t *tools) output(_ context.Context, _ *mcp.CallToolRequest, in readInput) (*mcp.CallToolResult, outputOutput, error) {
-	s, err := t.latestSession(in.Session)
+	s, err := t.session(in.Session)
 	if err != nil {
 		return nil, outputOutput{}, err
 	}
@@ -187,7 +174,7 @@ type warningsOutput struct {
 }
 
 func (t *tools) warnings(_ context.Context, _ *mcp.CallToolRequest, in readInput) (*mcp.CallToolResult, warningsOutput, error) {
-	s, err := t.latestSession(in.Session)
+	s, err := t.session(in.Session)
 	if err != nil {
 		return nil, warningsOutput{}, err
 	}

@@ -195,6 +195,9 @@ func (s *Session) ID() int { return s.id }
 // Init returns the session's init packet.
 func (s *Session) Init() *InitPacket { return s.init }
 
+// RemoteAddr returns the address the engine connected from.
+func (s *Session) RemoteAddr() net.Addr { return s.conn.RemoteAddr() }
+
 // pathMap returns the server's current path map.
 func (s *Session) pathMap() PathMap {
 	if s.server == nil {

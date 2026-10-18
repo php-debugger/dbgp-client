@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"net"
 	"os"
 	"path/filepath"
 	"slices"
@@ -107,11 +108,22 @@ func (r *repl) announceSessions() {
 				r.onPrompt(r.prompt())
 			}
 		}
-		r.printf("\n[session %d connected: %s%s]\n", s.ID(), s.Script(), note)
+		r.printf("\n[session %d connected%s: %s%s]\n", s.ID(), fromElsewhere(s), s.Script(), note)
 		for _, w := range s.SetupWarnings() {
 			r.printf("[session %d warning: %s]\n", s.ID(), w)
 		}
 	}
+}
+
+// fromElsewhere names the address a session connected from, unless it is
+// this machine: dbgp accepts PHP from every network the machine is on, so a
+// session from elsewhere may not be the user's.
+func fromElsewhere(s *dbgp.Session) string {
+	host := remoteHost(s)
+	if ip := net.ParseIP(host); ip != nil && ip.IsLoopback() {
+		return ""
+	}
+	return " from " + host
 }
 
 // cancelOnInterrupt cancels the running command on Ctrl-C.
@@ -382,7 +394,7 @@ func (r *repl) cmdSessions(context.Context, string) error {
 		if s == cur {
 			mark = "*"
 		}
-		r.printf("%s %d  %-9s %s\n", mark, s.ID(), describeStatus(s.State()), s.Script())
+		r.printf("%s %d  %-9s %s%s\n", mark, s.ID(), describeStatus(s.State()), s.Script(), fromElsewhere(s))
 	}
 	return nil
 }

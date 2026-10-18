@@ -7,6 +7,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	dbgp "github.com/php-debugger/dbgp-client"
 )
 
 // startPHP runs php with the debugger pointed at port, killed at cleanup.
@@ -110,8 +112,9 @@ func TestMCPDebuggingRun(t *testing.T) {
 	if msg := callToolError(t, cs, "continue", map[string]any{"session": 1}); !strings.Contains(msg, "session 1 has ended") {
 		t.Errorf("continue after stop: %q", msg)
 	}
-	if msg := callToolError(t, cs, "continue", nil); !strings.Contains(msg, "no session") {
-		t.Errorf("continue with no live session: %q", msg)
+	// The ended session stays selected, rather than whatever connects next.
+	if msg := callToolError(t, cs, "continue", nil); !strings.Contains(msg, "session 1 has ended: wait_for_session returns the next one") {
+		t.Errorf("continue after the selected session ended: %q", msg)
 	}
 }
 
@@ -146,5 +149,73 @@ func TestMCPRunningSession(t *testing.T) {
 	callTool(t, cs, "detach", nil, &st)
 	if st.Status != "stopping" && st.Status != "ended" {
 		t.Errorf("detach = %+v", st)
+	}
+}
+
+// waitSessions waits up to 10s for srv to have n sessions.
+func waitSessions(t *testing.T, srv *dbgp.Server, n int) {
+	t.Helper()
+	for deadline := time.Now().Add(10 * time.Second); len(srv.Sessions()) < n; {
+		if time.Now().After(deadline) {
+			t.Fatalf("%d sessions, want %d", len(srv.Sessions()), n)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+// The session tools act on the session the agent picked, not the newest:
+// anything that can reach dbgp could connect and become that. Sessions show
+// where they connected from.
+func TestMCPSelectedSession(t *testing.T) {
+	requireEngine(t)
+	cs, srv := newTestMCPOn(t, phpAddr(0), true)
+	callTool(t, cs, "listen", nil, &listenOutput{})
+	const script = `echo "hi\n";`
+	startPHP(t, srv.Port(), "-r", script)
+	waitSessions(t, srv, 1)
+
+	// Connected, but not picked yet.
+	if msg := callToolError(t, cs, "continue", nil); !strings.Contains(msg, "no session: call listen") {
+		t.Errorf("continue before wait_for_session: %q", msg)
+	}
+	var waited waitForSessionOutput
+	callTool(t, cs, "wait_for_session", map[string]any{"wait": 10}, &waited)
+	if !waited.Connected || waited.Session.ID != 1 || waited.Session.From != "127.0.0.1" {
+		t.Fatalf("wait_for_session = %+v, session %+v", waited, waited.Session)
+	}
+
+	// Another script connects, from this machine's network address if it
+	// has one, as PHP elsewhere would.
+	host := lanAddr()
+	if host == "" {
+		host = "127.0.0.1"
+	}
+	startPHP(t, srv.Port(), "-dxdebug.client_host="+host, "-r", script)
+	waitSessions(t, srv, 2)
+	var status statusOutput
+	callTool(t, cs, "status", nil, &status)
+	if len(status.Sessions) != 2 || status.Sessions[1].From != host {
+		t.Errorf("sessions = %+v, want the second from %s", status.Sessions, host)
+	}
+	if got := fromElsewhere(srv.Session(1)); got != "" {
+		t.Errorf("fromElsewhere(session 1) = %q, want nothing for this machine", got)
+	}
+	if want := " from " + host; host != "127.0.0.1" && fromElsewhere(srv.Session(2)) != want {
+		t.Errorf("fromElsewhere(session 2) = %q, want %q", fromElsewhere(srv.Session(2)), want)
+	}
+
+	// The newer session does not take over; naming it selects it.
+	var st stateOutput
+	callTool(t, cs, "continue", nil, &st)
+	if st.Session != 1 {
+		t.Errorf("continue acted on session %d, want 1", st.Session)
+	}
+	callTool(t, cs, "continue", map[string]any{"session": 2}, &st)
+	if st.Session != 2 {
+		t.Errorf("continue with session 2 acted on session %d", st.Session)
+	}
+	callTool(t, cs, "stop", nil, &st)
+	if st.Session != 2 || st.Status != "ended" {
+		t.Errorf("stop = %+v, want session 2 ended", st)
 	}
 }
