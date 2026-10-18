@@ -52,8 +52,8 @@ func codeError(s *dbgp.Session, err error) error {
 	return sessionError(s, err)
 }
 
-func (t *tools) eval(_ context.Context, _ *mcp.CallToolRequest, in evalInput) (*mcp.CallToolResult, evalOutput, error) {
-	s, err := t.session(in.Session)
+func (t *tools) eval(_ context.Context, req *mcp.CallToolRequest, in evalInput) (*mcp.CallToolResult, evalOutput, error) {
+	s, err := t.session(req, in.Session)
 	if err != nil {
 		return nil, evalOutput{}, err
 	}
@@ -95,8 +95,8 @@ type setVariableOutput struct {
 	Variable variableInfo `json:"variable" jsonschema:"the variable after it was set"`
 }
 
-func (t *tools) setVariable(_ context.Context, _ *mcp.CallToolRequest, in setVariableInput) (*mcp.CallToolResult, setVariableOutput, error) {
-	s, err := t.session(in.Session)
+func (t *tools) setVariable(_ context.Context, req *mcp.CallToolRequest, in setVariableInput) (*mcp.CallToolResult, setVariableOutput, error) {
+	s, err := t.session(req, in.Session)
 	if err != nil {
 		return nil, setVariableOutput{}, err
 	}

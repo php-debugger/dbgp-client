@@ -71,6 +71,20 @@ build: do not suggest rebuilding or restarting dbgp to get them. Read values
 with variables, variable and variable_value instead, and work out results from
 them. Instead of a condition, stop at the line and check the values each time.`
 
+// sharedInstructions are added to mcpInstructions on the background server,
+// which agents share.
+const sharedInstructions = `
+
+This is the user's background dbgp, which other agents may be using at the
+same time. They share its breakpoints, path mappings and sessions; each has its
+own selected session, and its own place in output and warnings. Remove only the
+breakpoints you added. dbgp keeps listening until every agent that called
+listen has called unlisten, so unlisten when you are done.
+wait_for_session returns the oldest session no agent has taken yet, which may
+be another agent's: if its script is not yours, leave it alone and wait again.
+If the wait ends although your PHP started, another agent may have taken your
+session: find it with sessions and name it by id.`
+
 // runMCP runs dbgp as an MCP server. Agents start it as dbgp mcp and talk
 // to it on stdin and stdout: it serves them itself, or passes them on to the
 // background server when one is running, so they share it. dbgp mcp start,
@@ -172,9 +186,9 @@ func runMCP(args []string) int {
 			return 1
 		}
 	}
-	server := newMCPServer(srv, !*noEval)
+	server, t := newMCPServer(srv, !*noEval, command == serveCommand)
 	if command == serveCommand {
-		err = serveHTTP(ctx, server, *mcpPort)
+		err = serveHTTP(ctx, server, t, *mcpPort)
 	} else {
 		err = server.Run(ctx, &mcp.StdioTransport{})
 	}
@@ -187,11 +201,15 @@ func runMCP(args []string) int {
 
 // newMCPServer returns an MCP server whose tools drive srv. allowCode adds
 // what runs PHP code in the debugged script: the code tools, and conditions
-// on breakpoints.
-func newMCPServer(srv *dbgp.Server, allowCode bool) *mcp.Server {
+// on breakpoints. shared is for the background server, which agents share.
+// The tools are returned too, for what they keep about agents.
+func newMCPServer(srv *dbgp.Server, allowCode, shared bool) (*mcp.Server, *tools) {
 	instructions := mcpInstructions
 	if !allowCode {
 		instructions += noCodeInstructions
+	}
+	if shared {
+		instructions += sharedInstructions
 	}
 	server := mcp.NewServer(&mcp.Implementation{Name: "dbgp", Title: "PHP debugger", Version: version},
 		&mcp.ServerOptions{Instructions: instructions})
@@ -214,7 +232,8 @@ func newMCPServer(srv *dbgp.Server, allowCode bool) *mcp.Server {
 	mcp.AddTool(server, &mcp.Tool{
 		Name: "unlisten",
 		Description: "Stop listening: new PHP connections are refused, so PHP runs at full speed. " +
-			"Sessions already connected are not affected.",
+			"Sessions already connected are not affected. On the background server, dbgp keeps listening " +
+			"while other agents that called listen have not called unlisten.",
 		Annotations: &mcp.ToolAnnotations{IdempotentHint: true},
 	}, t.unlisten)
 
@@ -263,7 +282,7 @@ func newMCPServer(srv *dbgp.Server, allowCode bool) *mcp.Server {
 	if allowCode {
 		t.addCodeTools(server)
 	}
-	return server
+	return server, t
 }
 
 // outputSchema returns the schema for a tool's output type, with the named
@@ -316,15 +335,78 @@ type tools struct {
 	// allowCode allows what runs PHP code in the debugged script.
 	allowCode bool
 
-	// mu guards the fields below. output and warnings return only what is
-	// new since their last call, so they keep read positions per session id.
-	mu           sync.Mutex
-	outputFrom   map[int]int
-	warningsFrom map[int]int
+	// mu guards agents, by agent id: see agentID.
+	mu     sync.Mutex
+	agents map[string]*agentState
+}
+
+// agentState is what the tools keep for one agent. Agents sharing the
+// background server each have their own, so one does not change what the
+// tools do for another.
+type agentState struct {
 	// selected is the session the tools act on by default: the one
 	// wait_for_session last returned or a tool was last given by id. Not
 	// simply the newest, which anything that connects would become.
 	selected int
+	// output and warnings return only what is new since their last call,
+	// so they keep read positions per session id.
+	outputFrom, warningsFrom map[int]int
+	// listening is set from the agent's listen to its unlisten. dbgp keeps
+	// listening while any agent has it set, so one agent does not stop
+	// PHP connections another is waiting for.
+	listening bool
+}
+
+// agent returns the state of the agent that sent req. t.mu must be held.
+func (t *tools) agent(req *mcp.CallToolRequest) *agentState {
+	id := agentID(req)
+	a := t.agents[id]
+	if a == nil {
+		if t.agents == nil {
+			t.agents = map[string]*agentState{}
+		}
+		a = &agentState{outputFrom: map[int]int{}, warningsFrom: map[int]int{}}
+		t.agents[id] = a
+	}
+	return a
+}
+
+// leave forgets the agent with the given id, which has gone: it no longer
+// keeps dbgp listening.
+func (t *tools) leave(id string) error {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	a := t.agents[id]
+	if a == nil {
+		return nil
+	}
+	delete(t.agents, id)
+	if !a.listening || t.listeners() > 0 {
+		return nil
+	}
+	return t.srv.StopListening()
+}
+
+// listeners returns how many agents have called listen and not unlisten.
+// t.mu must be held.
+func (t *tools) listeners() int {
+	n := 0
+	for _, a := range t.agents {
+		if a.listening {
+			n++
+		}
+	}
+	return n
+}
+
+// agentID identifies the agent that sent req: on the background server, by
+// the agentHeader that its dbgp mcp sends. An agent on stdin and stdout is
+// the only one, with no id.
+func agentID(req *mcp.CallToolRequest) string {
+	if req == nil || req.Extra == nil {
+		return ""
+	}
+	return req.Extra.Header.Get(agentHeader)
 }
 
 type noInput struct{}
@@ -403,18 +485,28 @@ type listenOutput struct {
 	Warnings  []string `json:"warnings,omitempty" jsonschema:"addresses dbgp could not listen on, although it listens on others; PHP connecting there may reach another program instead"`
 }
 
-func (t *tools) listen(context.Context, *mcp.CallToolRequest, noInput) (*mcp.CallToolResult, listenOutput, error) {
+func (t *tools) listen(_ context.Context, req *mcp.CallToolRequest, _ noInput) (*mcp.CallToolResult, listenOutput, error) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
 	if err := t.srv.StartListening(); err != nil {
 		return nil, listenOutput{}, err
 	}
+	t.agent(req).listening = true
 	return nil, listenOutput{Listening: true, Port: t.srv.Port(), Warnings: t.srv.ListenWarnings()}, nil
 }
 
 type unlistenOutput struct {
-	Listening bool `json:"listening" jsonschema:"whether PHP connections are accepted"`
+	Listening   bool `json:"listening" jsonschema:"whether PHP connections are accepted"`
+	OtherAgents int  `json:"otherAgents,omitempty" jsonschema:"how many other agents called listen and not unlisten yet: dbgp keeps listening for them"`
 }
 
-func (t *tools) unlisten(context.Context, *mcp.CallToolRequest, noInput) (*mcp.CallToolResult, unlistenOutput, error) {
+func (t *tools) unlisten(_ context.Context, req *mcp.CallToolRequest, _ noInput) (*mcp.CallToolResult, unlistenOutput, error) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.agent(req).listening = false
+	if others := t.listeners(); others > 0 {
+		return nil, unlistenOutput{Listening: t.srv.Listening(), OtherAgents: others}, nil
+	}
 	if err := t.srv.StopListening(); err != nil {
 		return nil, unlistenOutput{Listening: t.srv.Listening()}, err
 	}
@@ -427,7 +519,7 @@ var breakpointTypes = []any{dbgp.BreakpointLine, dbgp.BreakpointCall, dbgp.Break
 
 type addBreakpointInput struct {
 	Type string `json:"type,omitempty" jsonschema:"line (the default) stops at a file and line; call and return stop when a function is called or returns; exception stops when an exception, or a subclass of it, is thrown"`
-	File string `json:"file,omitempty" jsonschema:"for line: the PHP file, as a path on this machine; a relative path is relative to dbgp's working directory"`
+	File string `json:"file,omitempty" jsonschema:"for line: the PHP file, as an absolute path on this machine"`
 	Line int    `json:"line,omitempty" jsonschema:"for line: the line number"`
 	// A condition makes a line breakpoint a conditional one.
 	Condition string `json:"condition,omitempty" jsonschema:"for line, optional: a PHP expression; execution stops only when it is true"`
@@ -468,7 +560,7 @@ func (t *tools) addBreakpoint(_ context.Context, _ *mcp.CallToolRequest, in addB
 		bp.Type, bp.Condition = dbgp.BreakpointConditional, in.Condition
 	}
 	if in.File != "" {
-		file, err := absolutePath(in.File)
+		file, err := filePath("file", in.File)
 		if err != nil {
 			return nil, addBreakpointOutput{}, err
 		}
@@ -485,10 +577,24 @@ func (t *tools) addBreakpoint(_ context.Context, _ *mcp.CallToolRequest, in addB
 	return nil, out, nil
 }
 
-// absolutePath makes a local path absolute; file:// URIs are kept as they are.
-func absolutePath(path string) (string, error) {
-	if filepath.IsAbs(path) || strings.HasPrefix(path, "file://") {
+// filePath is absolutePath for a file, which can also be given as a
+// file:// URI, kept as it is.
+func filePath(name, path string) (string, error) {
+	if strings.HasPrefix(path, "file://") {
 		return path, nil
+	}
+	return absolutePath(name, path)
+}
+
+// absolutePath checks that the path given as the named argument is
+// absolute, and cleans it. Relative paths are refused rather than taken as
+// relative to dbgp's working directory, which is not the agent's: the
+// background server's is wherever dbgp mcp start ran.
+func absolutePath(name, path string) (string, error) {
+	// On Windows, a path from the root such as \app\index.php is not
+	// absolute, but means the current drive; Abs adds it.
+	if !filepath.IsAbs(path) && (path == "" || !os.IsPathSeparator(path[0])) {
+		return "", fmt.Errorf("%s must be an absolute path, not %q", name, path)
 	}
 	return filepath.Abs(path)
 }
@@ -528,7 +634,7 @@ func (t *tools) breakpoints(context.Context, *mcp.CallToolRequest, noInput) (*mc
 }
 
 type addPathMappingInput struct {
-	Local  string `json:"local" jsonschema:"the directory on this machine; a relative path is relative to dbgp's working directory"`
+	Local  string `json:"local" jsonschema:"the directory on this machine, as an absolute path"`
 	Remote string `json:"remote" jsonschema:"the same directory as PHP sees it, e.g. /var/www/html in a container"`
 }
 
@@ -541,7 +647,7 @@ func (t *tools) addPathMapping(_ context.Context, _ *mcp.CallToolRequest, in add
 	if in.Local == "" || in.Remote == "" {
 		return nil, pathMappingsOutput{}, errors.New("local and remote must both be set")
 	}
-	local, err := filepath.Abs(in.Local)
+	local, err := absolutePath("local", in.Local)
 	if err != nil {
 		return nil, pathMappingsOutput{}, err
 	}

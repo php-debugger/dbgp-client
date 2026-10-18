@@ -61,8 +61,8 @@ type stackOutput struct {
 	Pages   int         `json:"pages" jsonschema:"how many pages of frames there are; call stack with page for the others"`
 }
 
-func (t *tools) stack(_ context.Context, _ *mcp.CallToolRequest, in stackInput) (*mcp.CallToolResult, stackOutput, error) {
-	s, err := t.session(in.Session)
+func (t *tools) stack(_ context.Context, req *mcp.CallToolRequest, in stackInput) (*mcp.CallToolResult, stackOutput, error) {
+	s, err := t.session(req, in.Session)
 	if err != nil {
 		return nil, stackOutput{}, err
 	}
@@ -145,8 +145,8 @@ type variablesOutput struct {
 	Pages     int            `json:"pages" jsonschema:"how many pages of variables there are; call variables with page for the others"`
 }
 
-func (t *tools) variables(_ context.Context, _ *mcp.CallToolRequest, in frameInput) (*mcp.CallToolResult, variablesOutput, error) {
-	s, err := t.session(in.Session)
+func (t *tools) variables(_ context.Context, req *mcp.CallToolRequest, in frameInput) (*mcp.CallToolResult, variablesOutput, error) {
+	s, err := t.session(req, in.Session)
 	if err != nil {
 		return nil, variablesOutput{}, err
 	}
@@ -180,8 +180,8 @@ type variableOutput struct {
 	Pages    int            `json:"pages" jsonschema:"how many pages of elements or properties there are; call variable with page for the others"`
 }
 
-func (t *tools) variable(_ context.Context, _ *mcp.CallToolRequest, in variableInput) (*mcp.CallToolResult, variableOutput, error) {
-	s, err := t.session(in.Session)
+func (t *tools) variable(_ context.Context, req *mcp.CallToolRequest, in variableInput) (*mcp.CallToolResult, variableOutput, error) {
+	s, err := t.session(req, in.Session)
 	if err != nil {
 		return nil, variableOutput{}, err
 	}
@@ -220,8 +220,8 @@ type variableValueOutput struct {
 	Next  int    `json:"next,omitempty" jsonschema:"where the rest of the value starts: call variable_value again with this offset; absent when the value is complete"`
 }
 
-func (t *tools) variableValue(_ context.Context, _ *mcp.CallToolRequest, in variableValueInput) (*mcp.CallToolResult, variableValueOutput, error) {
-	s, err := t.session(in.Session)
+func (t *tools) variableValue(_ context.Context, req *mcp.CallToolRequest, in variableValueInput) (*mcp.CallToolResult, variableValueOutput, error) {
+	s, err := t.session(req, in.Session)
 	if err != nil {
 		return nil, variableValueOutput{}, err
 	}

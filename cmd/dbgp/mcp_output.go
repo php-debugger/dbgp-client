@@ -46,7 +46,7 @@ func (t *tools) addOutputTools(server *mcp.Server) {
 
 type sourceInput struct {
 	Session int    `json:"session,omitempty" jsonschema:"the session id; defaults to the one wait_for_session last returned or you last named"`
-	File    string `json:"file,omitempty" jsonschema:"the file, as a path on this machine; defaults to where the session stopped, or its script"`
+	File    string `json:"file,omitempty" jsonschema:"the file, as an absolute path on this machine; defaults to where the session stopped, or its script"`
 	Line    int    `json:"line,omitempty" jsonschema:"the line to show the code around; defaults to where the session stopped, or 1 for another file"`
 	Around  int    `json:"around,omitempty" jsonschema:"how many lines to show before and after the line: 5 by default, at most 100"`
 }
@@ -63,8 +63,8 @@ type sourceOutput struct {
 	Lines []sourceLine `json:"lines" jsonschema:"the source lines, in order"`
 }
 
-func (t *tools) source(_ context.Context, _ *mcp.CallToolRequest, in sourceInput) (*mcp.CallToolResult, sourceOutput, error) {
-	s, err := t.session(in.Session)
+func (t *tools) source(_ context.Context, req *mcp.CallToolRequest, in sourceInput) (*mcp.CallToolResult, sourceOutput, error) {
+	s, err := t.session(req, in.Session)
 	if err != nil {
 		return nil, sourceOutput{}, err
 	}
@@ -86,7 +86,7 @@ func (t *tools) source(_ context.Context, _ *mcp.CallToolRequest, in sourceInput
 		if file == "" {
 			file = s.Script()
 		}
-	} else if file, err = absolutePath(file); err != nil {
+	} else if file, err = filePath("file", file); err != nil {
 		return nil, sourceOutput{}, err
 	}
 	if line <= 0 {
@@ -122,20 +122,22 @@ type readInput struct {
 	All     bool `json:"all,omitempty" jsonschema:"return everything kept so far, not only what is new since the last call"`
 }
 
-// readFrom runs read from where the last read of a session's output or
-// warnings ended, or from the start for all, and records where it ends.
-func (t *tools) readFrom(positions *map[int]int, id int, all bool, read func(from int) int) {
+// readFrom runs read from where the agent that sent req last read session
+// id's output or warnings, as positions picks, or from the start for all,
+// and records where it ends.
+func (t *tools) readFrom(req *mcp.CallToolRequest, positions func(*agentState) map[int]int, id int, all bool, read func(from int) int) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	if *positions == nil {
-		*positions = map[int]int{}
-	}
-	from := (*positions)[id]
+	pos := positions(t.agent(req))
+	from := pos[id]
 	if all {
 		from = 0
 	}
-	(*positions)[id] = read(from)
+	pos[id] = read(from)
 }
+
+func outputPositions(a *agentState) map[int]int   { return a.outputFrom }
+func warningsPositions(a *agentState) map[int]int { return a.warningsFrom }
 
 type outputOutput struct {
 	Session   int    `json:"session" jsonschema:"the session id"`
@@ -144,13 +146,13 @@ type outputOutput struct {
 	More      bool   `json:"more,omitempty" jsonschema:"there is more output after this: call output again for it"`
 }
 
-func (t *tools) output(_ context.Context, _ *mcp.CallToolRequest, in readInput) (*mcp.CallToolResult, outputOutput, error) {
-	s, err := t.session(in.Session)
+func (t *tools) output(_ context.Context, req *mcp.CallToolRequest, in readInput) (*mcp.CallToolResult, outputOutput, error) {
+	s, err := t.session(req, in.Session)
 	if err != nil {
 		return nil, outputOutput{}, err
 	}
 	out := outputOutput{Session: s.ID()}
-	t.readFrom(&t.outputFrom, s.ID(), in.All, func(from int) int {
+	t.readFrom(req, outputPositions, s.ID(), in.All, func(from int) int {
 		text, next, truncated := s.Output(from)
 		out.Output, out.Truncated = cutText(text, maxTextBytes), truncated
 		out.More = len(out.Output) < len(text)
@@ -173,13 +175,13 @@ type warningsOutput struct {
 	More     bool          `json:"more,omitempty" jsonschema:"there are more after these: call warnings again for them"`
 }
 
-func (t *tools) warnings(_ context.Context, _ *mcp.CallToolRequest, in readInput) (*mcp.CallToolResult, warningsOutput, error) {
-	s, err := t.session(in.Session)
+func (t *tools) warnings(_ context.Context, req *mcp.CallToolRequest, in readInput) (*mcp.CallToolResult, warningsOutput, error) {
+	s, err := t.session(req, in.Session)
 	if err != nil {
 		return nil, warningsOutput{}, err
 	}
 	out := warningsOutput{Session: s.ID(), Warnings: []warningInfo{}}
-	t.readFrom(&t.warningsFrom, s.ID(), in.All, func(from int) int {
+	t.readFrom(req, warningsPositions, s.ID(), in.All, func(from int) int {
 		notes, next := s.Notifications(from)
 		seen := map[warningInfo]int{} // index in out.Warnings, by warning with no count
 		for i, n := range notes {

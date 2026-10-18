@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
 	"encoding/json"
 	"errors"
 	"io"
@@ -206,9 +207,15 @@ func TestMCPBridge(t *testing.T) {
 	if len(status.Breakpoints) != 1 || status.Listening {
 		t.Errorf("status seen by another agent = %+v; want the breakpoint, and -listen ignored", status)
 	}
+	callTool(t, bridged, "listen", nil, &listenOutput{})
 
 	if err := bridged.Close(); err != nil {
 		t.Errorf("close: %v", err)
+	}
+	// Its dbgp mcp told the server the agent left, which counts as unlisten.
+	callTool(t, direct, "status", nil, &status)
+	if status.Listening {
+		t.Error("still listening after the only agent that called listen left")
 	}
 	if !strings.Contains(stderr.String(), "using the background server at "+url) || !strings.Contains(stderr.String(), "-listen ignored") {
 		t.Errorf("stderr: %q", stderr.String())
@@ -225,7 +232,7 @@ func connectDirect(ctx context.Context, t *testing.T, url string) *mcp.ClientSes
 	if err != nil || st == nil {
 		t.Fatalf("state = %+v, %v", st, err)
 	}
-	client, err := tokenClient(url, st.Token)
+	client, err := tokenClient(url, st.Token, rand.Text())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -327,19 +334,19 @@ func TestWriteStateIsPrivate(t *testing.T) {
 	}
 }
 
-// The token goes to the background server only, not to other hosts, e.g.
-// after a redirect.
+// The token and agent id go to the background server only, not to other
+// hosts, e.g. after a redirect.
 func TestTokenClientSendsTokenOnlyToItsServer(t *testing.T) {
 	var got []string
 	record := http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
-		got = append(got, req.Header.Get("Authorization"))
+		got = append(got, req.Header.Get("Authorization")+"|"+req.Header.Get(agentHeader))
 	})
 	server := httptest.NewServer(record)
 	defer server.Close()
 	other := httptest.NewServer(record)
 	defer other.Close()
 
-	client, err := tokenClient(server.URL+"/mcp", "secret")
+	client, err := tokenClient(server.URL+"/mcp", "secret", "agent-1")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -350,8 +357,8 @@ func TestTokenClientSendsTokenOnlyToItsServer(t *testing.T) {
 		}
 		_ = resp.Body.Close()
 	}
-	if want := []string{"Bearer secret", ""}; !slices.Equal(got, want) {
-		t.Errorf("Authorization headers = %q, want %q", got, want)
+	if want := []string{"Bearer secret|agent-1", "|"}; !slices.Equal(got, want) {
+		t.Errorf("Authorization|Dbgp-Agent headers = %q, want %q", got, want)
 	}
 }
 
@@ -537,4 +544,40 @@ func TestMCPDaemonIdentify(t *testing.T) {
 	if strings.Contains(string(body), st.Token) {
 		t.Error("identify gave away the token")
 	}
+}
+
+// Each dbgp mcp passing an agent on to the background server identifies
+// it as an agent of its own.
+func TestMCPBridgesAreSeparateAgents(t *testing.T) {
+	requireEngine(t)
+	bin := buildBinary(t)
+	daemonEnv(t)
+	startTestDaemon(t, bin, "-php-port", "0")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	var agents []*mcp.ClientSession
+	for range 2 {
+		cs, err := mcp.NewClient(&mcp.Implementation{Name: "test", Version: "0"}, nil).
+			Connect(ctx, &mcp.CommandTransport{Command: exec.CommandContext(ctx, bin, "mcp")}, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer cs.Close()
+		agents = append(agents, cs)
+	}
+
+	var listening listenOutput
+	callTool(t, agents[0], "listen", nil, &listening)
+	startPHP(t, listening.Port, "-r", `echo "hi\n";`)
+	var waited waitForSessionOutput
+	callTool(t, agents[0], "wait_for_session", map[string]any{"wait": 10}, &waited)
+	if !waited.Connected {
+		t.Fatal("PHP did not connect")
+	}
+	if msg := callToolError(t, agents[1], "continue", nil); !strings.Contains(msg, "no session") {
+		t.Errorf("the second agent's continue acted on the first agent's session: %q", msg)
+	}
+	var st stateOutput
+	callTool(t, agents[0], "stop", nil, &st)
 }

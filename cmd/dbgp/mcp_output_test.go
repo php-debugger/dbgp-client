@@ -36,9 +36,9 @@ func TestMCPSource(t *testing.T) {
 	if len(out.Lines) != 3 || out.Lines[1].Text != "$x = add(2, 3);" || out.Lines[1].Current {
 		t.Errorf("source around line 36 = %+v", out.Lines)
 	}
-	callTool(t, cs, "source", map[string]any{"file": "../../testdata/php/basic.php", "line": 1, "around": 2}, &out)
+	callTool(t, cs, "source", map[string]any{"file": script, "line": 1, "around": 2}, &out)
 	if out.File != script || len(out.Lines) != 3 || out.Lines[0].Line != 1 || out.Lines[0].Text != "<?php" {
-		t.Errorf("source at the start, relative path = %s %+v", out.File, out.Lines)
+		t.Errorf("source at the start of a file = %s %+v", out.File, out.Lines)
 	}
 
 	for _, tc := range []struct {
@@ -48,6 +48,7 @@ func TestMCPSource(t *testing.T) {
 		{map[string]any{"around": 101}, "around must be between 1 and 100"},
 		{map[string]any{"around": -1}, "around must be between 1 and 100"},
 		{map[string]any{"file": "/no/such/file.php"}, "PHP cannot read /no/such/file.php"},
+		{map[string]any{"file": "../../testdata/php/basic.php"}, `file must be an absolute path, not "../../testdata/php/basic.php"`},
 	} {
 		if msg := callToolError(t, cs, "source", tc.args); !strings.Contains(msg, tc.want) {
 			t.Errorf("source(%v): %q, want %q", tc.args, msg, tc.want)

@@ -91,30 +91,33 @@ func remoteHost(s *dbgp.Session) string {
 	return addr
 }
 
-// session returns the session with the given id, which it selects, or by
-// default the selected session, even one that has ended.
-func (t *tools) session(id int) (*dbgp.Session, error) {
+// session returns the session with the given id, which it selects for the
+// agent that sent req, or by default the agent's selected session, even
+// one that has ended.
+func (t *tools) session(req *mcp.CallToolRequest, id int) (*dbgp.Session, error) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
+	a := t.agent(req)
 	if id == 0 {
-		if t.selected == 0 {
+		if a.selected == 0 {
 			return nil, errors.New("no session: call listen, start the PHP code, then wait_for_session")
 		}
-		id = t.selected
+		id = a.selected
 	}
 	s := t.srv.Session(id)
 	if s == nil {
 		return nil, fmt.Errorf("no session %d", id)
 	}
-	t.selected = id
+	a.selected = id
 	return s, nil
 }
 
-// selectSession makes s the session the tools act on by default.
-func (t *tools) selectSession(s *dbgp.Session) {
+// selectSession makes s the session the tools act on by default for the
+// agent that sent req.
+func (t *tools) selectSession(req *mcp.CallToolRequest, s *dbgp.Session) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	t.selected = s.ID()
+	t.agent(req).selected = s.ID()
 }
 
 // waitDuration converts a wait in seconds, 0 meaning the default.
@@ -147,7 +150,7 @@ type waitForSessionOutput struct {
 	Session   *sessionInfo `json:"session,omitempty" jsonschema:"the session, when one connected"`
 }
 
-func (t *tools) waitForSession(ctx context.Context, _ *mcp.CallToolRequest, in waitInput) (*mcp.CallToolResult, waitForSessionOutput, error) {
+func (t *tools) waitForSession(ctx context.Context, req *mcp.CallToolRequest, in waitInput) (*mcp.CallToolResult, waitForSessionOutput, error) {
 	wait, err := waitDuration(in.Wait)
 	if err != nil {
 		return nil, waitForSessionOutput{}, err
@@ -157,7 +160,7 @@ func (t *tools) waitForSession(ctx context.Context, _ *mcp.CallToolRequest, in w
 		done, cancel := context.WithCancel(ctx)
 		cancel()
 		if s, err := t.srv.WaitForSession(done); err == nil {
-			t.selectSession(s)
+			t.selectSession(req, s)
 			info := toSessionInfo(s)
 			return nil, waitForSessionOutput{Connected: true, Session: &info}, nil
 		}
@@ -172,7 +175,7 @@ func (t *tools) waitForSession(ctx context.Context, _ *mcp.CallToolRequest, in w
 	if err != nil {
 		return nil, waitForSessionOutput{}, err
 	}
-	t.selectSession(s)
+	t.selectSession(req, s)
 	info := toSessionInfo(s)
 	return nil, waitForSessionOutput{Connected: true, Session: &info}, nil
 }
@@ -229,8 +232,8 @@ func sessionError(s *dbgp.Session, err error) error {
 	return err
 }
 
-func (t *tools) continueSession(ctx context.Context, _ *mcp.CallToolRequest, in continueInput) (*mcp.CallToolResult, stateOutput, error) {
-	s, err := t.session(in.Session)
+func (t *tools) continueSession(ctx context.Context, req *mcp.CallToolRequest, in continueInput) (*mcp.CallToolResult, stateOutput, error) {
+	s, err := t.session(req, in.Session)
 	if err != nil {
 		return nil, stateOutput{}, err
 	}
@@ -254,8 +257,8 @@ type waitForStopInput struct {
 	Wait    float64 `json:"wait,omitempty" jsonschema:"seconds to wait for the script to stop, 30 by default and at most 600"`
 }
 
-func (t *tools) waitForStop(ctx context.Context, _ *mcp.CallToolRequest, in waitForStopInput) (*mcp.CallToolResult, stateOutput, error) {
-	s, err := t.session(in.Session)
+func (t *tools) waitForStop(ctx context.Context, req *mcp.CallToolRequest, in waitForStopInput) (*mcp.CallToolResult, stateOutput, error) {
+	s, err := t.session(req, in.Session)
 	if err != nil {
 		return nil, stateOutput{}, err
 	}
@@ -270,8 +273,8 @@ func (t *tools) waitForStop(ctx context.Context, _ *mcp.CallToolRequest, in wait
 	return nil, toState(s, st), nil
 }
 
-func (t *tools) stopSession(_ context.Context, _ *mcp.CallToolRequest, in sessionInput) (*mcp.CallToolResult, stateOutput, error) {
-	s, err := t.session(in.Session)
+func (t *tools) stopSession(_ context.Context, req *mcp.CallToolRequest, in sessionInput) (*mcp.CallToolResult, stateOutput, error) {
+	s, err := t.session(req, in.Session)
 	if err != nil {
 		return nil, stateOutput{}, err
 	}
@@ -281,8 +284,8 @@ func (t *tools) stopSession(_ context.Context, _ *mcp.CallToolRequest, in sessio
 	return nil, toState(s, s.State()), nil
 }
 
-func (t *tools) detachSession(_ context.Context, _ *mcp.CallToolRequest, in sessionInput) (*mcp.CallToolResult, stateOutput, error) {
-	s, err := t.session(in.Session)
+func (t *tools) detachSession(_ context.Context, req *mcp.CallToolRequest, in sessionInput) (*mcp.CallToolResult, stateOutput, error) {
+	s, err := t.session(req, in.Session)
 	if err != nil {
 		return nil, stateOutput{}, err
 	}

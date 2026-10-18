@@ -1,13 +1,17 @@
 package main
 
 import (
+	"context"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/modelcontextprotocol/go-sdk/mcp"
 	dbgp "github.com/php-debugger/dbgp-client"
 )
 
@@ -217,5 +221,160 @@ func TestMCPSelectedSession(t *testing.T) {
 	callTool(t, cs, "stop", nil, &st)
 	if st.Session != 2 || st.Status != "ended" {
 		t.Errorf("stop = %+v, want session 2 ended", st)
+	}
+}
+
+// newSharedMCP serves the tools over HTTP as the background server does,
+// with token, on a PHP port that is not listening yet.
+func newSharedMCP(t *testing.T, token string) (string, *dbgp.Server) {
+	t.Helper()
+	srv, err := dbgp.NewServer(dbgp.Config{Addr: phpAddr(0)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = srv.Close() })
+	server, tl := newMCPServer(srv, true, true)
+	hs := httptest.NewServer(httpHandler(server, tl, daemonState{Token: token}))
+	t.Cleanup(hs.Close)
+	return hs.URL + "/mcp", srv
+}
+
+// connectAgent connects to the server at url as dbgp mcp does, as agent.
+func connectAgent(t *testing.T, url, token, agent string) *mcp.ClientSession {
+	t.Helper()
+	client, err := tokenClient(url, token, agent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cs, err := mcp.NewClient(&mcp.Implementation{Name: agent, Version: "0"}, nil).
+		Connect(context.Background(), &mcp.StreamableClientTransport{Endpoint: url, HTTPClient: client}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = cs.Close() })
+	return cs
+}
+
+// Agents on the background server are told they share it; an agent on
+// stdin and stdout has dbgp to itself.
+func TestMCPSharedInstructions(t *testing.T) {
+	url, _ := newSharedMCP(t, "token")
+	shared := connectAgent(t, url, "token", "agent").InitializeResult().Instructions
+	if !strings.HasSuffix(shared, sharedInstructions) {
+		t.Errorf("background server instructions lack the shared ones:\n%s", shared)
+	}
+	own, _ := newTestMCP(t)
+	if strings.Contains(own.InitializeResult().Instructions, "other agents") {
+		t.Error("dbgp mcp on stdin and stdout says other agents may share it")
+	}
+}
+
+// Agents sharing the background server each have their own selected
+// session and place in a session's output, so one does not move the
+// other's.
+func TestMCPAgentsSharingServer(t *testing.T) {
+	requireEngine(t)
+	url, srv := newSharedMCP(t, "token")
+	a := connectAgent(t, url, "token", "agent-a")
+	b := connectAgent(t, url, "token", "agent-b")
+
+	callTool(t, a, "listen", nil, &listenOutput{})
+	startPHP(t, srv.Port(), "-r", `echo "one\n";`)
+	var waited waitForSessionOutput
+	callTool(t, a, "wait_for_session", map[string]any{"wait": 10}, &waited)
+	if !waited.Connected || waited.Session.ID != 1 {
+		t.Fatalf("a: wait_for_session = %+v", waited)
+	}
+	if msg := callToolError(t, b, "continue", nil); !strings.Contains(msg, "no session") {
+		t.Errorf("b: continue acted on a's session: %q", msg)
+	}
+	startPHP(t, srv.Port(), "-r", `echo "two\n";`)
+	callTool(t, b, "wait_for_session", map[string]any{"wait": 10}, &waited)
+	if !waited.Connected || waited.Session.ID != 2 {
+		t.Fatalf("b: wait_for_session = %+v", waited)
+	}
+	var st stateOutput
+	for name, agent := range map[string]*mcp.ClientSession{"a": a, "b": b} {
+		callTool(t, agent, "continue", nil, &st)
+		if want := map[string]int{"a": 1, "b": 2}[name]; st.Session != want || st.Status != "stopping" {
+			t.Errorf("%s: continue = %+v, want session %d stopping", name, st, want)
+		}
+	}
+
+	// a reads session 1's output; b still gets all of it.
+	var printed outputOutput
+	for _, want := range []string{"one\n", ""} {
+		callTool(t, a, "output", nil, &printed)
+		if printed.Session != 1 || printed.Output != want {
+			t.Errorf("a: output = %+v, want session 1 %q", printed, want)
+		}
+	}
+	callTool(t, b, "output", map[string]any{"session": 1}, &printed)
+	if printed.Output != "one\n" {
+		t.Errorf("b: output of session 1 = %q, want all of it", printed.Output)
+	}
+	// Naming a session selects it for that agent only.
+	callTool(t, a, "output", map[string]any{"session": 2}, &printed)
+	callTool(t, b, "output", nil, &printed)
+	if printed.Session != 1 || printed.Output != "" {
+		t.Errorf("b: output = %+v, want session 1, which b named last, with nothing new", printed)
+	}
+}
+
+// On the background server, dbgp listens while any agent that called
+// listen has not called unlisten, or left: one agent does not stop PHP
+// connections that another is waiting for.
+func TestMCPListeningPerAgent(t *testing.T) {
+	url, srv := newSharedMCP(t, "token")
+	a := connectAgent(t, url, "token", "agent-a")
+	b := connectAgent(t, url, "token", "agent-b")
+	unlisten := func(name string, cs *mcp.ClientSession, listening bool, others int) {
+		t.Helper()
+		var out unlistenOutput
+		callTool(t, cs, "unlisten", nil, &out)
+		if out.Listening != listening || out.OtherAgents != others || srv.Listening() != listening {
+			t.Errorf("%s: unlisten = %+v, server listening %v; want listening %v for %d other agents",
+				name, out, srv.Listening(), listening, others)
+		}
+	}
+
+	callTool(t, a, "listen", nil, &listenOutput{})
+	callTool(t, b, "listen", nil, &listenOutput{})
+	unlisten("a", a, true, 1)
+	unlisten("a again", a, true, 1)
+	unlisten("b", b, false, 0)
+
+	// An agent that did not call listen does not stop it either.
+	callTool(t, a, "listen", nil, &listenOutput{})
+	unlisten("b, not listening", b, true, 1)
+
+	// An agent leaving, as its dbgp mcp tells the server when it ends,
+	// counts as unlisten.
+	leaveAs := func(agent string) {
+		t.Helper()
+		client, err := tokenClient(url, "token", agent)
+		if err != nil {
+			t.Fatal(err)
+		}
+		leaveServer(client, url)
+	}
+	leaveAs("agent-b")
+	if !srv.Listening() {
+		t.Error("b leaving stopped a's listening")
+	}
+	leaveAs("agent-a")
+	if srv.Listening() {
+		t.Error("still listening after a, the only agent listening, left")
+	}
+
+	// Only agents with the token can leave.
+	callTool(t, a, "listen", nil, &listenOutput{})
+	resp, err := http.Post(strings.TrimSuffix(url, "/mcp")+leavePath, "", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusUnauthorized || !srv.Listening() {
+		t.Errorf("leave without the token: status %d, listening %v; want 401 and still listening", resp.StatusCode, srv.Listening())
 	}
 }

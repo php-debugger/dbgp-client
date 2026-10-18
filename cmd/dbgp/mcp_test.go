@@ -36,7 +36,8 @@ func newTestMCPOn(t *testing.T, addr string, allowCode bool) (*mcp.ClientSession
 
 	ctx := context.Background()
 	clientTransport, serverTransport := mcp.NewInMemoryTransports()
-	ss, err := newMCPServer(srv, allowCode).Connect(ctx, serverTransport, nil)
+	server, _ := newMCPServer(srv, allowCode, false)
+	ss, err := server.Connect(ctx, serverTransport, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -371,13 +372,12 @@ func callToolError(t *testing.T, cs *mcp.ClientSession, name string, args any) s
 
 func TestMCPAddBreakpoint(t *testing.T) {
 	cs, _ := newTestMCP(t)
-	abs, _ := filepath.Abs("app/a.php")
 	tests := []struct {
 		args map[string]any
 		want breakpointInfo
 	}{
 		{map[string]any{"file": "/app/a.php", "line": 12}, breakpointInfo{ID: 1, Type: "line", File: "/app/a.php", Line: 12}},
-		{map[string]any{"type": "line", "file": "app/a.php", "line": 3}, breakpointInfo{ID: 2, Type: "line", File: abs, Line: 3}},
+		{map[string]any{"type": "line", "file": "/app/../app/b.php", "line": 3}, breakpointInfo{ID: 2, Type: "line", File: "/app/b.php", Line: 3}},
 		{map[string]any{"file": "/app/a.php", "line": 5, "condition": "$i > 2"}, breakpointInfo{ID: 3, Type: "conditional", File: "/app/a.php", Line: 5, Condition: "$i > 2"}},
 		{map[string]any{"type": "call", "function": "add"}, breakpointInfo{ID: 4, Type: "call", Function: "add"}},
 		{map[string]any{"type": "return", "function": "add"}, breakpointInfo{ID: 5, Type: "return", Function: "add"}},
@@ -403,6 +403,8 @@ func TestMCPAddBreakpoint(t *testing.T) {
 		{map[string]any{"type": "exception"}, "needs an exception class"},
 		{map[string]any{"type": "conditional", "file": "/app/a.php", "line": 3}, "type"},
 		{map[string]any{"type": "watch", "file": "/app/a.php", "line": 3}, "type"},
+		// dbgp's working directory is not the agent's.
+		{map[string]any{"file": "app/a.php", "line": 3}, `file must be an absolute path, not "app/a.php"`},
 	} {
 		if msg := callToolError(t, cs, "add_breakpoint", tt.args); !strings.Contains(msg, tt.want) {
 			t.Errorf("add_breakpoint(%v) error = %q, want it to mention %q", tt.args, msg, tt.want)
@@ -437,7 +439,6 @@ func TestMCPRemoveBreakpoint(t *testing.T) {
 
 func TestMCPPathMappings(t *testing.T) {
 	cs, _ := newTestMCP(t)
-	abs, _ := filepath.Abs("testdata/php")
 	var listed pathMappingListOutput
 	callTool(t, cs, "path_mappings", nil, &listed)
 	if listed.PathMappings == nil || len(listed.PathMappings) != 0 {
@@ -445,9 +446,9 @@ func TestMCPPathMappings(t *testing.T) {
 	}
 	var out pathMappingsOutput
 	callTool(t, cs, "add_path_mapping", map[string]any{"local": "/home/me/app", "remote": "/var/www/html"}, &out)
-	callTool(t, cs, "add_path_mapping", map[string]any{"local": "testdata/php", "remote": "/srv/php"}, &out)
+	callTool(t, cs, "add_path_mapping", map[string]any{"local": "/srv/../srv/php", "remote": "/srv/php"}, &out)
 	callTool(t, cs, "add_path_mapping", map[string]any{"local": "/home/me/app/", "remote": "/app"}, &out)
-	want := []pathMapping{{Local: abs, Remote: "/srv/php"}, {Local: "/home/me/app", Remote: "/app"}}
+	want := []pathMapping{{Local: "/srv/php", Remote: "/srv/php"}, {Local: "/home/me/app", Remote: "/app"}}
 	if fmt.Sprint(out.PathMappings) != fmt.Sprint(want) || out.Warning != "" {
 		t.Errorf("add_path_mapping = %+v, want %+v", out, want)
 	}
@@ -457,6 +458,10 @@ func TestMCPPathMappings(t *testing.T) {
 	}
 	for _, args := range []map[string]any{{"local": "/a"}, {"remote": "/b"}, {"local": "", "remote": "/b"}} {
 		callToolError(t, cs, "add_path_mapping", args)
+	}
+	// dbgp's working directory is not the agent's.
+	if msg := callToolError(t, cs, "add_path_mapping", map[string]any{"local": "app", "remote": "/app"}); !strings.Contains(msg, `local must be an absolute path, not "app"`) {
+		t.Errorf("relative local directory: %q", msg)
 	}
 }
 

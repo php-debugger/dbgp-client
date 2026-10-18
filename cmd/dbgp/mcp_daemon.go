@@ -369,10 +369,13 @@ func bridge(ctx context.Context, st *daemonState) error {
 		return err
 	}
 	defer local.Close()
-	client, err := tokenClient(st.URL, st.Token)
+	// Agents share the server, but each has its own selected session and
+	// read positions: the id tells the server which agent a request is from.
+	client, err := tokenClient(st.URL, st.Token, rand.Text())
 	if err != nil {
 		return err
 	}
+	defer leaveServer(client, st.URL)
 	remote, err := (&mcp.StreamableClientTransport{Endpoint: st.URL, HTTPClient: client}).Connect(ctx)
 	if err != nil {
 		return err
@@ -401,26 +404,84 @@ func bridge(ctx context.Context, st *daemonState) error {
 	return nil
 }
 
-// tokenClient returns an HTTP client that sends token to the server at
-// rawURL, and to no other. A state file from before tokens has none: that
-// server takes requests without one.
-func tokenClient(rawURL, token string) (*http.Client, error) {
+// leavePath is where dbgp mcp tells the server its agent has gone, so it
+// no longer keeps dbgp listening.
+const leavePath = "/leave"
+
+// leaveTimeout is how long dbgp mcp waits for the server to hear it has
+// gone.
+const leaveTimeout = 2 * time.Second
+
+// leaveServer tells the server at rawURL, through client, that the agent
+// client sends the id of has gone. It is best effort: the agent has
+// already gone, and so has its dbgp mcp when the server cannot be reached.
+func leaveServer(client *http.Client, rawURL string) {
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return
+	}
+	u.Path = leavePath
+	ctx, cancel := context.WithTimeout(context.Background(), leaveTimeout)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, u.String(), nil)
+	if err != nil {
+		return
+	}
+	if resp, err := client.Do(req); err == nil {
+		_ = resp.Body.Close()
+	}
+}
+
+// leave forgets the agent each request is from, by its agentHeader.
+func leave(t *tools) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		if req.Method != http.MethodPost {
+			w.Header().Set("Allow", http.MethodPost)
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		id := req.Header.Get(agentHeader)
+		if id == "" {
+			http.Error(w, "no "+agentHeader+" header", http.StatusBadRequest)
+			return
+		}
+		if err := t.leave(id); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+	})
+}
+
+// agentHeader carries the id of the agent a request is from, which its
+// dbgp mcp chooses: see agentID.
+const agentHeader = "Dbgp-Agent"
+
+// tokenClient returns an HTTP client that sends token and the agent id to
+// the server at rawURL, and to no other. A state file from before tokens
+// has none: that server takes requests without one.
+func tokenClient(rawURL, token, agent string) (*http.Client, error) {
 	u, err := url.Parse(rawURL)
 	if err != nil {
 		return nil, err
 	}
-	return &http.Client{Transport: &bearerTransport{host: u.Host, token: token}}, nil
+	return &http.Client{Transport: &bearerTransport{host: u.Host, token: token, agent: agent}}, nil
 }
 
-// bearerTransport adds the token to requests for host.
+// bearerTransport adds the token and the agent id to requests for host.
 type bearerTransport struct {
-	host, token string
+	host, token, agent string
 }
 
 func (t *bearerTransport) RoundTrip(req *http.Request) (*http.Response, error) {
-	if t.token != "" && req.URL.Host == t.host {
+	if req.URL.Host == t.host {
 		req = req.Clone(req.Context())
-		req.Header.Set("Authorization", "Bearer "+t.token)
+		if t.token != "" {
+			req.Header.Set("Authorization", "Bearer "+t.token)
+		}
+		if t.agent != "" {
+			req.Header.Set(agentHeader, t.agent)
+		}
 	}
 	return http.DefaultTransport.RoundTrip(req)
 }
@@ -438,9 +499,9 @@ func requireToken(token string, next http.Handler) http.Handler {
 	})
 }
 
-// serveHTTP serves MCP over HTTP on port until ctx is done, recording the
-// server in the state file meanwhile.
-func serveHTTP(ctx context.Context, server *mcp.Server, port int) error {
+// serveHTTP serves MCP with server, whose tools are t, over HTTP on port
+// until ctx is done, recording the server in the state file meanwhile.
+func serveHTTP(ctx context.Context, server *mcp.Server, t *tools, port int) error {
 	ln, err := net.Listen("tcp", net.JoinHostPort(httpHost, strconv.Itoa(port)))
 	if err != nil {
 		return err
@@ -452,12 +513,7 @@ func serveHTTP(ctx context.Context, server *mcp.Server, port int) error {
 	}
 	defer removeState(st.PID)
 
-	handler := mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return server },
-		&mcp.StreamableHTTPOptions{CrossOriginProtection: http.NewCrossOriginProtection()})
-	mux := http.NewServeMux()
-	mux.Handle("/mcp", requireToken(st.Token, handler))
-	mux.Handle(identifyPath, identify(st))
-	hs := &http.Server{Handler: mux, ReadHeaderTimeout: 10 * time.Second}
+	hs := &http.Server{Handler: httpHandler(server, t, st), ReadHeaderTimeout: 10 * time.Second}
 	go func() {
 		<-ctx.Done()
 		// Tools may be waiting for PHP for minutes: do not wait for them.
@@ -468,4 +524,16 @@ func serveHTTP(ctx context.Context, server *mcp.Server, port int) error {
 		return err
 	}
 	return nil
+}
+
+// httpHandler serves MCP at /mcp and agents leaving, to requests with st's
+// token, and the identity check. t are server's tools.
+func httpHandler(server *mcp.Server, t *tools, st daemonState) http.Handler {
+	handler := mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return server },
+		&mcp.StreamableHTTPOptions{CrossOriginProtection: http.NewCrossOriginProtection()})
+	mux := http.NewServeMux()
+	mux.Handle("/mcp", requireToken(st.Token, handler))
+	mux.Handle(leavePath, requireToken(st.Token, leave(t)))
+	mux.Handle(identifyPath, identify(st))
+	return mux
 }
