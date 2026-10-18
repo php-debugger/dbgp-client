@@ -7,17 +7,22 @@ on:
     types: [published]
 
 permissions:
-  contents: write # needed to upload release assets
+  contents: write # to upload release assets
+  id-token: write # to sign the provenance attestations
+  attestations: write # to store them
 
 jobs:
   release:
     name: Build & attach binaries
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      # Actions are pinned by commit, which a tag is not; Dependabot updates them.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       # The newest Go, not go.mod's minimum: the binaries carry its standard
       # library, so each release gets every security fix made so far.
-      - uses: actions/setup-go@v7
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version: stable
           check-latest: true
@@ -60,7 +65,17 @@ jobs:
           # Attach the install scripts too, so releases/latest/download/install.sh
           # is a stable URL that serves the released version of the script.
           cp scripts/install.sh scripts/install.ps1 "$dist/"
-          ls -la "$dist"
+          # The install scripts check downloads against these.
+          (cd "$dist" && sha256sum -- * > "$RUNNER_TEMP/SHA256SUMS")
+          mv "$RUNNER_TEMP/SHA256SUMS" "$dist/"
+          cat "$dist/SHA256SUMS"
+
+      # Records that each file was built here, from this commit: verify one
+      # with gh attestation verify FILE --repo php-debugger/dbgp-client.
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-checksums: ${{ runner.temp }}/dist/SHA256SUMS
 
       - name: Attach binaries to the release
         env:

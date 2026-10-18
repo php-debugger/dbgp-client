@@ -31,6 +31,8 @@ go install github.com/php-debugger/dbgp-client/cmd/dbgp@latest
 
 `dbgp -version` shows the installed version.
 
+The install scripts check the download against the release's `SHA256SUMS` before installing it. Each release file also has a build provenance attestation, which shows it was built by this repository's release workflow; to check one you downloaded yourself, run `gh attestation verify FILE --repo php-debugger/dbgp-client`.
+
 To be debugged, PHP needs [PHP Debugger](https://php-debugger.dev) or Xdebug: `php -v` shows which one it has.
 
 ## Debugging with AI agents

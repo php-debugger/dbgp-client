@@ -1,0 +1,11 @@
+# Keeps the actions, pinned by commit, and the Go modules up to date.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+  - package-ecosystem: gomod
+    directory: /
+    schedule:
+      interval: weekly
