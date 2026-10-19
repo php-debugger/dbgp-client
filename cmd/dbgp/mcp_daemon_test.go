@@ -212,9 +212,9 @@ func TestMCPBridge(t *testing.T) {
 	if err := bridged.Close(); err != nil {
 		t.Errorf("close: %v", err)
 	}
-	// Its dbgp mcp told the server the agent left, which counts as unlisten.
-	callTool(t, direct, "status", nil, &status)
-	if status.Listening {
+	// Its dbgp mcp ending tells the server the agent left, which counts as
+	// unlisten.
+	if !stopsListening(t, direct) {
 		t.Error("still listening after the only agent that called listen left")
 	}
 	if !strings.Contains(stderr.String(), "using the background server at "+url) || !strings.Contains(stderr.String(), "-listen ignored") {
@@ -222,6 +222,48 @@ func TestMCPBridge(t *testing.T) {
 	}
 	// The background server carries on after the agent leaves.
 	callTool(t, direct, "status", nil, &status)
+}
+
+// stopsListening reports whether the server cs is connected to stops
+// listening within 5s.
+func stopsListening(t *testing.T, cs *mcp.ClientSession) bool {
+	t.Helper()
+	for deadline := time.Now().Add(5 * time.Second); time.Now().Before(deadline); time.Sleep(20 * time.Millisecond) {
+		var status statusOutput
+		callTool(t, cs, "status", nil, &status)
+		if !status.Listening {
+			return true
+		}
+	}
+	return false
+}
+
+// An agent's dbgp mcp that is killed, so it cannot say it is leaving,
+// still leaves: the operating system closes its connection to the server.
+func TestMCPBridgeKilled(t *testing.T) {
+	bin := buildBinary(t)
+	daemonEnv(t)
+	url := startTestDaemon(t, bin)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, bin, "mcp")
+	bridged, err := mcp.NewClient(&mcp.Implementation{Name: "test", Version: "0"}, nil).
+		Connect(ctx, &mcp.CommandTransport{Command: cmd}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer bridged.Close()
+	direct := connectDirect(ctx, t, url)
+	defer direct.Close()
+
+	callTool(t, bridged, "listen", nil, &listenOutput{})
+	if err := cmd.Process.Kill(); err != nil {
+		t.Fatal(err)
+	}
+	if !stopsListening(t, direct) {
+		t.Error("still listening after the only agent that called listen was killed")
+	}
 }
 
 // connectDirect connects to the background server over HTTP, with the token

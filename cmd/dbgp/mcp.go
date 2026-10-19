@@ -352,9 +352,12 @@ type tools struct {
 	// allowCode allows what runs the agent's PHP code in the debugged script.
 	allowCode bool
 
-	// mu guards agents, by agent id: see agentID.
+	// mu guards agents, by agent id (see agentID), and detaching.
 	mu     sync.Mutex
 	agents map[string]*agentState
+	// detaching holds the ids of the sessions being detached because the
+	// agents that took them left: no agent can take them meanwhile.
+	detaching map[int]bool
 }
 
 // agentState is what the tools keep for one agent. Agents sharing the
@@ -402,33 +405,53 @@ func (a *agentState) take(id int) {
 // scripts run on instead of holding their PHP workers, unless another agent
 // has taken them too.
 func (t *tools) leave(id string) error {
+	orphans, err := t.release(id)
+	t.detachSessions(orphans)
+	return err
+}
+
+// release forgets the agent with the given id, stops listening if it was
+// the last agent listening, and returns the live sessions only it took,
+// marked as detaching, so no other agent takes one before it is detached.
+func (t *tools) release(id string) ([]*dbgp.Session, error) {
 	t.mu.Lock()
+	defer t.mu.Unlock()
 	a := t.agents[id]
 	if a == nil {
-		t.mu.Unlock()
-		return nil
+		return nil, nil
 	}
 	delete(t.agents, id)
-	var orphans []int
+	var orphans []*dbgp.Session
 	for sid := range a.taken {
-		if !t.taken(sid) {
-			orphans = append(orphans, sid)
+		if t.taken(sid) {
+			continue
 		}
-	}
-	var err error
-	if a.listening && t.listeners() == 0 {
-		err = t.srv.StopListening()
-	}
-	t.mu.Unlock()
-
-	// Outside t.mu: detaching a stopped session waits for PHP's answer.
-	for _, sid := range orphans {
 		if s := t.srv.Session(sid); s != nil && !ended(s.State()) {
-			_ = s.Detach()
-			_ = s.Close()
+			if t.detaching == nil {
+				t.detaching = map[int]bool{}
+			}
+			t.detaching[sid] = true
+			orphans = append(orphans, s)
 		}
 	}
-	return err
+	if a.listening && t.listeners() == 0 {
+		return orphans, t.srv.StopListening()
+	}
+	return orphans, nil
+}
+
+// detachSessions detaches the sessions release returned, outside t.mu:
+// detaching a stopped session waits for PHP's answer. Once they have ended,
+// agents can name them again, to read their output.
+func (t *tools) detachSessions(sessions []*dbgp.Session) {
+	for _, s := range sessions {
+		_ = s.Detach()
+		_ = s.Close()
+		<-s.Done()
+		t.mu.Lock()
+		delete(t.detaching, s.ID())
+		t.mu.Unlock()
+	}
 }
 
 // taken reports whether any agent has taken session id. t.mu must be held.

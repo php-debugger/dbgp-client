@@ -6,6 +6,7 @@ import (
 	"errors"
 	"io"
 	"net"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -880,11 +881,11 @@ func TestServerDetachesUnclaimedSessions(t *testing.T) {
 	waited := dialFakeEngine(t, srv, fixture(t, "init"), standardHandlers())
 	waitSession(t, srv)
 	claimed := dialFakeEngine(t, srv, fixture(t, "init"), standardHandlers())
-	if !srv.Claim(waitForSessionID(t, srv, 3)) {
-		t.Error("Claim of a new session = false")
+	if err := srv.Claim(waitForSessionID(t, srv, 3)); err != nil {
+		t.Errorf("Claim of a new session: %v", err)
 	}
-	if srv.Claim(srv.Session(3)) || srv.Claim(srv.Session(2)) {
-		t.Error("Claim of a taken session = true")
+	if err := errors.Join(srv.Claim(srv.Session(3)), srv.Claim(srv.Session(2))); err != nil {
+		t.Errorf("Claim of a taken session: %v", err)
 	}
 	time.Sleep(3 * timeout)
 	for _, e := range []*fakeEngine{waited, claimed} {
@@ -969,4 +970,35 @@ func TestServerLimitsConcurrentHandshakes(t *testing.T) {
 	if n := len(srv.Sessions()); n != 1 || detached() != 2 {
 		t.Errorf("%d sessions and %d detached, want 1 and 2", n, detached())
 	}
+}
+
+// While a session nobody took is being detached, nobody can claim it, so it
+// is not detached under them; once it has ended, claiming it is harmless.
+func TestClaimWhileDetachingUnclaimed(t *testing.T) {
+	answer := make(chan struct{})
+	var once sync.Once
+	answerDetach := func() { once.Do(func() { close(answer) }) }
+	defer answerDetach()
+	handlers := standardHandlers()
+	handlers["detach"] = func(e *fakeEngine, cmd fakeCommand) []string {
+		<-answer
+		return reply("detach")(e, cmd)
+	}
+	srv := newTestServer(t, Config{ClaimTimeout: 100 * time.Millisecond})
+	e := dialFakeEngine(t, srv, fixture(t, "init"), handlers)
+	sess := waitForSessionID(t, srv, 1)
+	waitFor(t, func() bool {
+		return slices.ContainsFunc(e.Received(), func(c fakeCommand) bool { return c.Name == "detach" })
+	})
+
+	if err := srv.Claim(sess); !errors.Is(err, ErrUnclaimed) {
+		t.Errorf("Claim while detaching = %v, want ErrUnclaimed", err)
+	}
+	answerDetach()
+	select {
+	case <-sess.Done():
+	case <-time.After(3 * time.Second):
+		t.Fatal("the unclaimed session did not end")
+	}
+	waitFor(t, func() bool { return srv.Claim(sess) == nil })
 }

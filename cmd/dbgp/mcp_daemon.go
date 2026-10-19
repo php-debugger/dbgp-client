@@ -375,7 +375,11 @@ func bridge(ctx context.Context, st *daemonState) error {
 	if err != nil {
 		return err
 	}
-	defer leaveServer(client, st.URL)
+	presence, err := attachServer(ctx, client, st.URL)
+	if err != nil {
+		return err
+	}
+	defer presence.Close()
 	remote, err := (&mcp.StreamableClientTransport{Endpoint: st.URL, HTTPClient: client}).Connect(ctx)
 	if err != nil {
 		return err
@@ -404,36 +408,39 @@ func bridge(ctx context.Context, st *daemonState) error {
 	return nil
 }
 
-// leavePath is where dbgp mcp tells the server its agent has gone, so it
-// no longer keeps dbgp listening.
-const leavePath = "/leave"
+// attachPath is where dbgp mcp tells the server its agent is there, for as
+// long as it runs: it keeps the request open, and the server takes the
+// agent as gone when the request ends. The operating system ends it when
+// dbgp mcp ends, even when it crashes or is killed.
+const attachPath = "/attach"
 
-// leaveTimeout is how long dbgp mcp waits for the server to hear it has
-// gone.
-const leaveTimeout = 2 * time.Second
-
-// leaveServer tells the server at rawURL, through client, that the agent
-// client sends the id of has gone. It is best effort: the agent has
-// already gone, and so has its dbgp mcp when the server cannot be reached.
-func leaveServer(client *http.Client, rawURL string) {
+// attachServer tells the server at rawURL, through client, that the agent
+// client sends the id of is there, until the returned body is closed or
+// ctx is done.
+func attachServer(ctx context.Context, client *http.Client, rawURL string) (io.Closer, error) {
 	u, err := url.Parse(rawURL)
 	if err != nil {
-		return
+		return nil, err
 	}
-	u.Path = leavePath
-	ctx, cancel := context.WithTimeout(context.Background(), leaveTimeout)
-	defer cancel()
+	u.Path = attachPath
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, u.String(), nil)
 	if err != nil {
-		return
+		return nil, err
 	}
-	if resp, err := client.Do(req); err == nil {
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("attach to the background server: %w", err)
+	}
+	if resp.StatusCode != http.StatusOK {
 		_ = resp.Body.Close()
+		return nil, fmt.Errorf("attach to the background server: %s", resp.Status)
 	}
+	return resp.Body, nil
 }
 
-// leave forgets the agent each request is from, by its agentHeader.
-func leave(t *tools) http.Handler {
+// attach holds each request open until the agent it is from, by its
+// agentHeader, has gone, then forgets that agent.
+func attach(t *tools) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 		if req.Method != http.MethodPost {
 			w.Header().Set("Allow", http.MethodPost)
@@ -445,11 +452,13 @@ func leave(t *tools) http.Handler {
 			http.Error(w, "no "+agentHeader+" header", http.StatusBadRequest)
 			return
 		}
+		w.WriteHeader(http.StatusOK)
+		_ = http.NewResponseController(w).Flush()
+		// Done when dbgp mcp closes the connection or the server stops.
+		<-req.Context().Done()
 		if err := t.leave(id); err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
+			fmt.Fprintf(os.Stderr, "dbgp: agent left: %v\n", err)
 		}
-		w.WriteHeader(http.StatusNoContent)
 	})
 }
 
@@ -526,14 +535,14 @@ func serveHTTP(ctx context.Context, server *mcp.Server, t *tools, port int) erro
 	return nil
 }
 
-// httpHandler serves MCP at /mcp and agents leaving, to requests with st's
+// httpHandler serves MCP at /mcp and agents' presence, to requests with st's
 // token, and the identity check. t are server's tools.
 func httpHandler(server *mcp.Server, t *tools, st daemonState) http.Handler {
 	handler := mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return server },
 		&mcp.StreamableHTTPOptions{CrossOriginProtection: http.NewCrossOriginProtection()})
 	mux := http.NewServeMux()
 	mux.Handle("/mcp", requireToken(st.Token, handler))
-	mux.Handle(leavePath, requireToken(st.Token, leave(t)))
+	mux.Handle(attachPath, requireToken(st.Token, attach(t)))
 	mux.Handle(identifyPath, identify(st))
 	return mux
 }

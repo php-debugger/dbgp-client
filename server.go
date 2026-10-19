@@ -24,6 +24,10 @@ const DefaultAddr = "localhost:9003"
 // ErrServerClosed is returned by WaitForSession after Close.
 var ErrServerClosed = errors.New("server closed")
 
+// ErrUnclaimed is returned by Claim for a session being detached because
+// nobody took it within Config.ClaimTimeout.
+var ErrUnclaimed = errors.New("session is being detached: nobody took it in time")
+
 // StdoutMode selects what happens to a session's program output.
 type StdoutMode int
 
@@ -413,15 +417,21 @@ func (s *Server) handshake(conn net.Conn) {
 }
 
 // detachUnclaimed detaches sess if nobody has taken it, so its script runs
-// on instead of waiting.
+// on instead of waiting. Meanwhile Claim refuses it.
 func (s *Server) detachUnclaimed(sess *Session) {
 	s.mu.Lock()
 	unclaimed := !s.closed && s.unqueueLocked(sess)
+	sess.unclaimed = unclaimed
 	s.mu.Unlock()
-	if unclaimed {
-		_ = sess.Detach()
-		_ = sess.Close()
+	if !unclaimed {
+		return
 	}
+	_ = sess.Detach()
+	_ = sess.Close()
+	<-sess.Done()
+	s.mu.Lock()
+	sess.unclaimed = false
+	s.mu.Unlock()
 }
 
 // reservePacket waits until the server's sessions are reading few enough
@@ -599,12 +609,18 @@ func (s *Server) WaitForSession(ctx context.Context) (*Session, error) {
 }
 
 // Claim takes sess as if WaitForSession had returned it, so WaitForSession
-// does not return it and Config.ClaimTimeout no longer applies to it. It
-// reports whether sess was still waiting to be taken.
-func (s *Server) Claim(sess *Session) bool {
+// does not return it and Config.ClaimTimeout no longer applies to it.
+// Claiming a session already taken does nothing. It returns ErrUnclaimed
+// while sess is being detached because nobody took it in time; once that
+// is done, the session has ended.
+func (s *Server) Claim(sess *Session) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.unqueueLocked(sess)
+	if sess.unclaimed {
+		return ErrUnclaimed
+	}
+	s.unqueueLocked(sess)
+	return nil
 }
 
 // unqueueLocked removes sess from the sessions WaitForSession has not

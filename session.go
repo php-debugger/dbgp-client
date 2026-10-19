@@ -84,6 +84,9 @@ type Session struct {
 	closed chan struct{} // closed when the read loop exits
 	// connCtx is cancelled when conn is closed.
 	connCtx context.Context
+	// unclaimed is set while the session is being detached because nobody
+	// took it in time. Guarded by server.mu.
+	unclaimed bool
 
 	// cmdSlot serializes commands: at most one is in flight, so an error
 	// response without a transaction_id belongs to it.

@@ -305,7 +305,7 @@ func TestMCPSelectedSession(t *testing.T) {
 
 // newSharedMCP serves the tools over HTTP as the background server does,
 // with token, on a PHP port that is not listening yet.
-func newSharedMCP(t *testing.T, token string) (string, *dbgp.Server) {
+func newSharedMCP(t *testing.T, token string) (string, *dbgp.Server, *tools) {
 	t.Helper()
 	srv, err := dbgp.NewServer(dbgp.Config{Addr: phpAddr(0)})
 	if err != nil {
@@ -315,7 +315,7 @@ func newSharedMCP(t *testing.T, token string) (string, *dbgp.Server) {
 	server, tl := newMCPServer(srv, true, true)
 	hs := httptest.NewServer(httpHandler(server, tl, daemonState{Token: token}))
 	t.Cleanup(hs.Close)
-	return hs.URL + "/mcp", srv
+	return hs.URL + "/mcp", srv, tl
 }
 
 // connectAgent connects to the server at url as dbgp mcp does, as agent.
@@ -337,7 +337,7 @@ func connectAgent(t *testing.T, url, token, agent string) *mcp.ClientSession {
 // Agents on the background server are told they share it; an agent on
 // stdin and stdout has dbgp to itself.
 func TestMCPSharedInstructions(t *testing.T) {
-	url, _ := newSharedMCP(t, "token")
+	url, _, _ := newSharedMCP(t, "token")
 	shared := connectAgent(t, url, "token", "agent").InitializeResult().Instructions
 	if !strings.HasSuffix(shared, sharedInstructions) {
 		t.Errorf("background server instructions lack the shared ones:\n%s", shared)
@@ -353,7 +353,7 @@ func TestMCPSharedInstructions(t *testing.T) {
 // other's.
 func TestMCPAgentsSharingServer(t *testing.T) {
 	requireEngine(t)
-	url, srv := newSharedMCP(t, "token")
+	url, srv, _ := newSharedMCP(t, "token")
 	a := connectAgent(t, url, "token", "agent-a")
 	b := connectAgent(t, url, "token", "agent-b")
 
@@ -400,25 +400,44 @@ func TestMCPAgentsSharingServer(t *testing.T) {
 	}
 }
 
-// On the background server, dbgp listens while any agent that called
-// listen has not called unlisten, or left: one agent does not stop PHP
-// connections that another is waiting for.
-// leaveAs tells the server at url that agent has gone, as its dbgp mcp
-// does when it ends.
-func leaveAs(t *testing.T, url, agent string) {
+// attachAs tells the server at url, whose tools are tl, that agent is
+// there, as its dbgp mcp does when it starts. It returns the function that
+// ends that, as dbgp mcp ending does, and waits until tl has forgotten the
+// agent.
+func attachAs(t *testing.T, url string, tl *tools, agent string) (leave func()) {
 	t.Helper()
 	client, err := tokenClient(url, "token", agent)
 	if err != nil {
 		t.Fatal(err)
 	}
-	leaveServer(client, url)
+	presence, err := attachServer(context.Background(), client, url)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = presence.Close() })
+	return func() {
+		t.Helper()
+		_ = presence.Close()
+		for deadline := time.Now().Add(5 * time.Second); ; time.Sleep(10 * time.Millisecond) {
+			tl.mu.Lock()
+			_, present := tl.agents[agent]
+			tl.mu.Unlock()
+			if !present {
+				return
+			}
+			if time.Now().After(deadline) {
+				t.Fatalf("%s still known 5s after leaving", agent)
+			}
+		}
+	}
 }
 
 // An agent that leaves without ending its sessions does not hold their PHP
 // processes: they are detached, unless another agent took them too.
 func TestMCPLeaveDetachesSessions(t *testing.T) {
 	requireEngine(t)
-	url, srv := newSharedMCP(t, "token")
+	url, srv, tl := newSharedMCP(t, "token")
+	leaveA, leaveB := attachAs(t, url, tl, "agent-a"), attachAs(t, url, tl, "agent-b")
 	a := connectAgent(t, url, "token", "agent-a")
 	b := connectAgent(t, url, "token", "agent-b")
 	callTool(t, a, "listen", nil, &listenOutput{})
@@ -456,7 +475,7 @@ func TestMCPLeaveDetachesSessions(t *testing.T) {
 	shared := start(b, "shared")
 	callTool(t, a, "output", map[string]any{"session": shared}, &outputOutput{})
 
-	leaveAs(t, url, "agent-a")
+	leaveA()
 	if !detached(own) || !finished("own") {
 		t.Error("a's session was not detached when a left")
 	}
@@ -465,14 +484,54 @@ func TestMCPLeaveDetachesSessions(t *testing.T) {
 		t.Error("the session b took too was detached when a left")
 	case <-time.After(300 * time.Millisecond):
 	}
-	leaveAs(t, url, "agent-b")
+	leaveB()
 	if !detached(shared) || !finished("shared") {
 		t.Error("the shared session was not detached when b left too")
 	}
 }
 
+// A session the leaving agent took is detached as one step: no other agent
+// can take it after it was picked for detaching, and have it detached under
+// them; once it has ended, they can name it again.
+func TestMCPLeaveRace(t *testing.T) {
+	requireEngine(t)
+	srv, err := dbgp.Listen(dbgp.Config{Addr: "127.0.0.1:0"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = srv.Close() })
+	startPHP(t, srv.Port(), "-r", `echo "hi";`)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	s, err := srv.WaitForSession(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	as := func(agent string) *mcp.CallToolRequest {
+		return &mcp.CallToolRequest{Extra: &mcp.RequestExtra{Header: http.Header{agentHeader: {agent}}}}
+	}
+	tl := &tools{srv: srv}
+	tl.selectSession(as("a"), s)
+
+	orphans, err := tl.release("a")
+	if err != nil || len(orphans) != 1 || orphans[0] != s {
+		t.Fatalf("release = %v, %v; want session %d", orphans, err, s.ID())
+	}
+	if _, err := tl.session(as("b"), s.ID()); err == nil || !strings.Contains(err.Error(), "being detached") {
+		t.Errorf("taking a session picked for detaching: %v", err)
+	}
+	tl.detachSessions(orphans)
+	if got, err := tl.session(as("b"), s.ID()); err != nil || got != s || !ended(s.State()) {
+		t.Errorf("after detaching: session %v, %v; want the ended session", got, err)
+	}
+}
+
+// On the background server, dbgp listens while any agent that called
+// listen has not called unlisten, or left: one agent does not stop PHP
+// connections that another is waiting for.
 func TestMCPListeningPerAgent(t *testing.T) {
-	url, srv := newSharedMCP(t, "token")
+	url, srv, tl := newSharedMCP(t, "token")
+	leaveA, leaveB := attachAs(t, url, tl, "agent-a"), attachAs(t, url, tl, "agent-b")
 	a := connectAgent(t, url, "token", "agent-a")
 	b := connectAgent(t, url, "token", "agent-b")
 	unlisten := func(name string, cs *mcp.ClientSession, listening bool, others int) {
@@ -495,25 +554,24 @@ func TestMCPListeningPerAgent(t *testing.T) {
 	callTool(t, a, "listen", nil, &listenOutput{})
 	unlisten("b, not listening", b, true, 1)
 
-	// An agent leaving, as its dbgp mcp tells the server when it ends,
-	// counts as unlisten.
-	leaveAs(t, url, "agent-b")
+	// An agent leaving, as its dbgp mcp ending tells the server, counts as
+	// unlisten.
+	leaveB()
 	if !srv.Listening() {
 		t.Error("b leaving stopped a's listening")
 	}
-	leaveAs(t, url, "agent-a")
+	leaveA()
 	if srv.Listening() {
 		t.Error("still listening after a, the only agent listening, left")
 	}
 
-	// Only agents with the token can leave.
-	callTool(t, a, "listen", nil, &listenOutput{})
-	resp, err := http.Post(strings.TrimSuffix(url, "/mcp")+leavePath, "", nil)
+	// Only agents with the token can attach, and so leave.
+	resp, err := http.Post(strings.TrimSuffix(url, "/mcp")+attachPath, "", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
 	_ = resp.Body.Close()
-	if resp.StatusCode != http.StatusUnauthorized || !srv.Listening() {
-		t.Errorf("leave without the token: status %d, listening %v; want 401 and still listening", resp.StatusCode, srv.Listening())
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Errorf("attach without the token: status %d, want 401", resp.StatusCode)
 	}
 }
