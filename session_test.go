@@ -12,6 +12,7 @@ import (
 	"sync"
 	"testing"
 	"time"
+	"unicode/utf8"
 )
 
 func TestSessionInit(t *testing.T) {
@@ -1094,5 +1095,79 @@ func TestSetPropertyFailure(t *testing.T) {
 	})
 	if err := s.SetProperty("$b", "1", PropertyOptions{}); err == nil {
 		t.Error("SetProperty succeeded although the engine reported failure")
+	}
+}
+
+// Sessions take turns reading packets when together they would read more
+// than the server allows at once, and a session waiting for its turn still
+// ends when it is closed.
+func TestPacketBudget(t *testing.T) {
+	sess, e := startFakeSession(t, standardHandlers())
+	srv := sess.server
+	stream := `<stream xmlns="urn:debugger_protocol_v1" type="stdout" encoding="base64">` +
+		base64.StdEncoding.EncodeToString([]byte("hi")) + `</stream>`
+
+	// With the whole budget taken, the packet waits.
+	if err := srv.packetBudget.Acquire(context.Background(), maxPacketsInFlight); err != nil {
+		t.Fatal(err)
+	}
+	e.Send(stream)
+	time.Sleep(100 * time.Millisecond)
+	if text, _, _ := sess.Output(0); text != "" {
+		t.Fatalf("output %q read without budget", text)
+	}
+	srv.packetBudget.Release(maxPacketsInFlight)
+	waitFor(t, func() bool { text, _, _ := sess.Output(0); return text == "hi" })
+
+	// Closing the session ends the wait.
+	if err := srv.packetBudget.Acquire(context.Background(), maxPacketsInFlight); err != nil {
+		t.Fatal(err)
+	}
+	defer srv.packetBudget.Release(maxPacketsInFlight)
+	e.Send(stream)
+	time.Sleep(100 * time.Millisecond)
+	_ = sess.Close()
+	select {
+	case <-sess.Done():
+	case <-time.After(3 * time.Second):
+		t.Fatal("session waiting for budget did not end when closed")
+	}
+}
+
+// Notifications are bounded in bytes too, and each message in length.
+func TestNotificationBytesAreBounded(t *testing.T) {
+	s := &Session{}
+	long := strings.Repeat("é", maxMessageBytes) // two bytes each
+	for i := 0; i < maxNotifications; i++ {
+		s.addNotification(Notification{Name: strconv.Itoa(i), Message: &Message{Text: long}})
+	}
+	notes, next := s.Notifications(0)
+	if next != maxNotifications {
+		t.Errorf("next = %d, want %d", next, maxNotifications)
+	}
+	text := notes[len(notes)-1].Message.Text
+	if len(text) > maxMessageBytes || len(text) < maxMessageBytes-1 || !utf8.ValidString(text) {
+		t.Errorf("message cut to %d bytes, valid UTF-8 %v; want about %d", len(text), utf8.ValidString(text), maxMessageBytes)
+	}
+	total := 0
+	for _, n := range notes {
+		total += n.size()
+	}
+	if total > maxNotificationBytes || s.notesBytes != total || len(notes) == maxNotifications {
+		t.Errorf("%d notes of %d bytes (counted %d), want at most %d bytes, oldest dropped",
+			len(notes), total, s.notesBytes, maxNotificationBytes)
+	}
+
+	// One far too large to be real is dropped.
+	s.addNotification(Notification{Name: "huge", Message: &Message{Filename: strings.Repeat("x", maxNotificationBytes)}})
+	if _, after := s.Notifications(0); after != next {
+		t.Errorf("a huge notification was kept")
+	}
+}
+
+func TestPropertyMaxDataIsCapped(t *testing.T) {
+	args := PropertyOptions{MaxData: 1 << 30}.args("$big")
+	if got := args[len(args)-1]; got != strconv.Itoa(MaxValueBytes) {
+		t.Errorf("args = %v, want -m %d", args, MaxValueBytes)
 	}
 }

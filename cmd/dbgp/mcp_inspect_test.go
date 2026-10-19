@@ -1,6 +1,7 @@
 package main
 
 import (
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -209,4 +210,36 @@ func TestMCPInspectRunningSession(t *testing.T) {
 			t.Errorf("%s while running: %q", tool, msg)
 		}
 	}
+}
+
+// variable_value reads up to dbgp.MaxValueBytes of a value, which fits in a
+// packet; past that it says so, rather than ask for more than fits.
+func TestMCPVariableValueLimit(t *testing.T) {
+	requireEngine(t)
+	script := filepath.Join(t.TempDir(), "big.php")
+	if err := os.WriteFile(script, []byte("<?php\n$big = str_repeat('ab', 11 << 20);\necho 1;\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cs, srv := newTestMCP(t)
+	callTool(t, cs, "add_breakpoint", map[string]any{"file": script, "line": 3}, &addBreakpointOutput{})
+	callTool(t, cs, "listen", nil, &listenOutput{})
+	startPHP(t, srv.Port(), script)
+	callTool(t, cs, "wait_for_session", map[string]any{"wait": 10}, &waitForSessionOutput{})
+	var st stateOutput
+	callTool(t, cs, "continue", map[string]any{"wait": 10}, &st)
+	if st.Status != "break" {
+		t.Fatalf("continue = %+v, want break", st)
+	}
+
+	var out variableValueOutput
+	callTool(t, cs, "variable_value", map[string]any{"name": "$big", "offset": maxValueOffset}, &out)
+	if out.Size != 22<<20 || len(out.Value) != maxTextBytes || out.Next != 0 {
+		t.Errorf("variable_value at the limit = %d bytes of %d, next %d; want %d, no next",
+			len(out.Value), out.Size, out.Next, maxTextBytes)
+	}
+	msg := callToolError(t, cs, "variable_value", map[string]any{"name": "$big", "offset": maxValueOffset + 1})
+	if !strings.Contains(msg, "only the first 20 MB") {
+		t.Errorf("variable_value past the limit: %q", msg)
+	}
+	callTool(t, cs, "variables", nil, &variablesOutput{})
 }

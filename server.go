@@ -12,6 +12,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"golang.org/x/sync/semaphore"
 )
 
 // DefaultAddr is where PHP Debugger and Xdebug 3 connect by default:
@@ -71,6 +73,10 @@ const (
 	// maxLiveSessions bounds sessions that have not ended. Beyond it, new
 	// scripts are detached, so they run on without the debugger.
 	maxLiveSessions = 16
+	// maxPacketsInFlight bounds the bytes of the packets a server's sessions
+	// are reading and parsing at once, which takes a few times as much
+	// memory. At least maxPacketBytes, so every packet fits.
+	maxPacketsInFlight = 2 * maxPacketBytes
 )
 
 // Breakpoint is a breakpoint the server applies to every session, including
@@ -118,6 +124,10 @@ type Server struct {
 
 	// The connection limits; tests lower them.
 	maxHandshakes, maxLiveSessions int
+
+	// packetBudget holds maxPacketsInFlight bytes, which sessions take
+	// while they read and parse a packet.
+	packetBudget *semaphore.Weighted
 }
 
 // Listen creates a server and starts listening for engine connections.
@@ -152,6 +162,7 @@ func NewServer(cfg Config) (*Server, error) {
 		arrived:         make(chan struct{}),
 		maxHandshakes:   maxHandshakes,
 		maxLiveSessions: maxLiveSessions,
+		packetBudget:    semaphore.NewWeighted(maxPacketsInFlight),
 	}, nil
 }
 
@@ -394,6 +405,19 @@ func (s *Server) detachUnclaimed(sess *Session) {
 		_ = sess.Detach()
 		_ = sess.Close()
 	}
+}
+
+// reservePacket waits until the server's sessions are reading few enough
+// packets to read one of length bytes, and returns the function that ends
+// the read. A session without a server, in tests, does not wait.
+func (s *Server) reservePacket(ctx context.Context, length int) (release func(), err error) {
+	if s == nil {
+		return func() {}, nil
+	}
+	if err := s.packetBudget.Acquire(ctx, int64(length)); err != nil {
+		return nil, err
+	}
+	return func() { s.packetBudget.Release(int64(length)) }, nil
 }
 
 // detachConn lets the script on conn run on without the debugger.
