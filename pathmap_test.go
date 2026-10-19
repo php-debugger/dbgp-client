@@ -358,3 +358,62 @@ func TestAddPathMappingWhileRunning(t *testing.T) {
 		t.Errorf("commands = %q, want %q", strings.Join(names, " "), want)
 	}
 }
+
+// Windows compares paths regardless of case, so mappings for Windows paths
+// do too, on either side; other paths are compared exactly.
+func TestPathMapWindowsCase(t *testing.T) {
+	m := mustPathMap(t,
+		PathMapping{Local: "/home/me/win", Remote: `C:\Inetpub\wwwroot`},
+		PathMapping{Local: "/home/me/share", Remote: "//FileServer/php"},
+		PathMapping{Local: "/home/me/project", Remote: "/var/www/html"},
+	)
+	tests := []struct{ remote, local string }{
+		// PHP on Windows may send a path in another case: what follows the
+		// mapped directory keeps its own.
+		{"c:/inetpub/WWWROOT/Default.php", "/home/me/win/Default.php"},
+		{`C:\INETPUB\wwwroot`, "/home/me/win"},
+		{"//fileserver/PHP/app.php", "/home/me/share/app.php"},
+		// Linux paths are case-sensitive.
+		{"/VAR/www/html/a.php", "/VAR/www/html/a.php"},
+		// Whole components only, in any case.
+		{"C:/inetpub/wwwroot2/a.php", "C:/inetpub/wwwroot2/a.php"},
+	}
+	for _, tt := range tests {
+		if got := m.ToLocal(tt.remote); got != filepath.FromSlash(tt.local) {
+			t.Errorf("ToLocal(%q) = %q, want %q", tt.remote, got, filepath.FromSlash(tt.local))
+		}
+	}
+	if got := m.localPath("file:///c:/inetpub/wwwroot/x.php"); got != filepath.FromSlash("/home/me/win/x.php") {
+		t.Errorf("localPath(lower-case drive) = %q", got)
+	}
+
+	// Local Windows paths, as dbgp on Windows sees them.
+	for _, tt := range []struct {
+		p, prefix, sep, rest string
+		ok                   bool
+	}{
+		{`c:\project\src\a.php`, `C:\Project`, `\`, `src\a.php`, true},
+		{`C:\PROJECT`, `C:\Project`, `\`, "", true},
+		{`\\server\SHARE\a.php`, `\\Server\share`, `\`, "a.php", true},
+		{`C:\Project2\a.php`, `C:\Project`, `\`, "", false},
+		{"/home/Me/a.php", "/home/me", "/", "", false},
+	} {
+		if rest, ok := cutPathPrefix(tt.p, tt.prefix, tt.sep); rest != tt.rest || ok != tt.ok {
+			t.Errorf("cutPathPrefix(%q, %q) = %q, %v; want %q, %v", tt.p, tt.prefix, rest, ok, tt.rest, tt.ok)
+		}
+	}
+}
+
+// A mapping for a Windows directory replaces one for the same directory in
+// another case.
+func TestAddPathMappingWindowsCase(t *testing.T) {
+	srv := newTestServer(t, Config{})
+	for _, local := range []string{`C:\Project`, `c:\project`} {
+		if err := srv.AddPathMapping(PathMapping{Local: local, Remote: "/app"}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got := srv.PathMap(); len(got) != 1 || got[0].Local != `c:\project` {
+		t.Errorf("PathMap = %+v, want only the newer mapping", got)
+	}
+}

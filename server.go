@@ -531,7 +531,7 @@ func (s *Server) AddPathMapping(m PathMapping) error {
 	s.pathsMu.Lock()
 	paths := make(PathMap, 0, len(s.paths)+1)
 	for _, old := range s.paths {
-		if old.Local != m.Local {
+		if !samePath(old.Local, m.Local) {
 			paths = append(paths, old)
 		}
 	}

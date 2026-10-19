@@ -79,18 +79,38 @@ func (m PathMap) ToLocal(remote string) string {
 
 // cutPathPrefix reports whether p is prefix or inside it, and returns the
 // remainder. Matching is by whole path components: /var/www does not
-// contain /var/www2.
+// contain /var/www2. For a Windows prefix it ignores case, as Windows does:
+// C:\Project contains c:\project\a.php.
 func cutPathPrefix(p, prefix, sep string) (string, bool) {
-	if p == prefix {
+	if samePath(p, prefix) {
 		return "", true
 	}
 	if !strings.HasSuffix(prefix, sep) {
 		prefix += sep
 	}
-	if rest, ok := strings.CutPrefix(p, prefix); ok {
-		return rest, true
+	if len(p) < len(prefix) || !samePath(p[:len(prefix)], prefix) {
+		return "", false
 	}
-	return "", false
+	return p[len(prefix):], true
+}
+
+// samePath reports whether paths a and b are the same: regardless of case
+// for Windows paths, exactly for others.
+func samePath(a, b string) bool {
+	if windowsPath(a) || windowsPath(b) {
+		return strings.EqualFold(a, b)
+	}
+	return a == b
+}
+
+// windowsPath reports whether p is a Windows path, which Windows compares
+// regardless of case: one that starts with a drive, such as C:\dir or
+// C:/dir, or a UNC share, such as \\server\share or //server/share.
+func windowsPath(p string) bool {
+	if len(p) >= 2 && p[1] == ':' && 'a' <= p[0]|0x20 && p[0]|0x20 <= 'z' {
+		return true
+	}
+	return strings.HasPrefix(p, `\\`) || strings.HasPrefix(p, "//")
 }
 
 func joinPath(dir, rest, sep string) string {
