@@ -1,6 +1,6 @@
 module github.com/php-debugger/dbgp-client
 
-go 1.26.0
+go 1.26.9
 
 require (
 	github.com/ergochat/readline v0.1.3
