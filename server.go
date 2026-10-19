@@ -57,6 +57,10 @@ type Config struct {
 	// InitTimeout bounds how long a new connection may take to send its
 	// init packet. Default: 10s.
 	InitTimeout time.Duration
+	// CommandTimeout bounds how long a command may take to reach the engine
+	// and be answered; continuing the script is not bounded (see
+	// Session.Continue). Default: 30s.
+	CommandTimeout time.Duration
 	// PathMap maps local directories to the engine's, for PHP running in a
 	// container or on a remote server. Sessions take and return local paths.
 	PathMap []PathMapping
@@ -165,6 +169,9 @@ func NewServer(cfg Config) (*Server, error) {
 	}
 	if cfg.InitTimeout <= 0 {
 		cfg.InitTimeout = 10 * time.Second
+	}
+	if cfg.CommandTimeout <= 0 {
+		cfg.CommandTimeout = defaultCommandTimeout
 	}
 	paths, err := newPathMap(cfg.PathMap)
 	if err != nil {

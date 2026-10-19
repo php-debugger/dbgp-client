@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/base64"
 	"errors"
+	"fmt"
 	"io"
 	"reflect"
 	"strconv"
@@ -1169,5 +1170,67 @@ func TestPropertyMaxDataIsCapped(t *testing.T) {
 	args := PropertyOptions{MaxData: 1 << 30}.args("$big")
 	if got := args[len(args)-1]; got != strconv.Itoa(MaxValueBytes) {
 		t.Errorf("args = %v, want -m %d", args, MaxValueBytes)
+	}
+}
+
+// A command the engine does not answer fails after Config.CommandTimeout.
+func TestCommandTimeout(t *testing.T) {
+	srv := newTestServer(t, Config{CommandTimeout: 200 * time.Millisecond})
+	handlers := standardHandlers()
+	handlers["stack_get"] = func(*fakeEngine, fakeCommand) []string { return nil }
+	dialFakeEngine(t, srv, fixture(t, "init"), handlers)
+	sess := waitSession(t, srv)
+	start := time.Now()
+	if _, err := sess.GetStack(); err == nil || !strings.Contains(err.Error(), "timeout waiting for response") {
+		t.Errorf("GetStack = %v, want a timeout", err)
+	}
+	if took := time.Since(start); took > 2*time.Second {
+		t.Errorf("GetStack took %v, want about 200ms", took)
+	}
+}
+
+// An engine that stops reading cannot block a command for longer than the
+// command timeout: the write fails, and the session ends, since the rest of
+// the command would garble what follows.
+func TestWriteDeadline(t *testing.T) {
+	srv := newTestServer(t, Config{CommandTimeout: 200 * time.Millisecond})
+	conn := dialServer(t, srv)
+	init := fixture(t, "init")
+	fmt.Fprintf(conn, "%d\x00%s\x00", len(init), init)
+	// Answer the setup commands, up to output capture, the last one.
+	reader := bufio.NewReader(conn)
+	for {
+		line, err := reader.ReadString(0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		cmd := parseFakeCommand(strings.TrimSuffix(line, "\x00"))
+		resp := fmt.Sprintf(`<response xmlns="urn:debugger_protocol_v1" command=%q transaction_id=%q success="1"/>`, cmd.Name, cmd.Args["i"])
+		fmt.Fprintf(conn, "%d\x00%s\x00", len(resp), resp)
+		if cmd.Name == "stdout" {
+			break
+		}
+	}
+	sess := waitSession(t, srv)
+
+	// From now on the engine reads nothing: a command larger than the
+	// socket buffers cannot be written whole.
+	done := make(chan error, 1)
+	go func() {
+		_, err := sess.EvalProperty(strings.Repeat("1+", 16<<20)+"1", 0)
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		if err == nil || !strings.Contains(err.Error(), "send command") {
+			t.Errorf("EvalProperty = %v, want the write to fail", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("a command to an engine that stopped reading was still being written after 3s")
+	}
+	select {
+	case <-sess.Done():
+	case <-time.After(3 * time.Second):
+		t.Error("the session did not end after a write failed")
 	}
 }

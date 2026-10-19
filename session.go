@@ -18,9 +18,8 @@ import (
 	"unicode/utf8"
 )
 
-// commandTimeout bounds how long a command waits for its response.
-// Continuation commands are not bounded by it: see Session.Continue.
-const commandTimeout = 30 * time.Second
+// defaultCommandTimeout is Config.CommandTimeout's default.
+const defaultCommandTimeout = 30 * time.Second
 
 // Continuation commands resume the script, which then runs until it stops
 // again: at a breakpoint, after the step, or at the end of the script.
@@ -84,6 +83,8 @@ type Session struct {
 	closed chan struct{} // closed when the read loop exits
 	// connCtx is cancelled when conn is closed.
 	connCtx context.Context
+	// cmdTimeout is Config.CommandTimeout; see commandTimeout.
+	cmdTimeout time.Duration
 	// unclaimed is set while the session is being detached because nobody
 	// took it in time. Guarded by server.mu.
 	unclaimed bool
@@ -215,6 +216,9 @@ func newSession(id int, server *Server, conn net.Conn, reader *bufio.Reader, ini
 		rejected: map[int]*rejection{},
 		state:    State{Status: StatusStarting},
 		changed:  make(chan struct{}),
+	}
+	if server != nil {
+		s.cmdTimeout = server.cfg.CommandTimeout
 	}
 	go s.readLoop(reader)
 	return s
@@ -626,7 +630,7 @@ func (s *Session) checkCanSendLocked() error {
 // sendCommand sends a command and waits for its response. Commands are
 // serialized, so this also waits for any command already in flight.
 func (s *Session) sendCommand(name string, args []string, data []byte) (*Response, error) {
-	timeout := time.NewTimer(commandTimeout)
+	timeout := time.NewTimer(s.commandTimeout())
 	defer timeout.Stop()
 	if err := s.acquire(name, timeout.C); err != nil {
 		return nil, err
@@ -648,15 +652,9 @@ func (s *Session) sendCommand(name string, args []string, data []byte) (*Respons
 	s.pending = p
 	s.mu.Unlock()
 
-	// A peer that stops reading cannot block a write for long. A command
-	// cut short would garble the ones after it, so the connection ends.
-	_ = s.conn.SetWriteDeadline(time.Now().Add(commandTimeout))
-	_, err = s.conn.Write([]byte(line + "\x00"))
-	_ = s.conn.SetWriteDeadline(time.Time{})
-	if err != nil {
+	if err := s.writeCommand(line); err != nil {
 		s.clearPending(p)
-		_ = s.conn.Close()
-		return nil, fmt.Errorf("send command: %w", err)
+		return nil, err
 	}
 
 	select {
@@ -735,7 +733,7 @@ func (s *Session) Continue(ctx context.Context, command string, wait time.Durati
 // startContinuation sends a continuation command without waiting for the
 // script to stop; the response arrives when it does.
 func (s *Session) startContinuation(command string) error {
-	timeout := time.NewTimer(commandTimeout)
+	timeout := time.NewTimer(s.commandTimeout())
 	defer timeout.Stop()
 	if err := s.acquire(command, timeout.C); err != nil {
 		return err
@@ -760,16 +758,40 @@ func (s *Session) startContinuation(command string) error {
 	s.setStateLocked(State{Status: StatusRunning, Reason: "ok"})
 	s.mu.Unlock()
 
-	if _, err := s.conn.Write([]byte(line + "\x00")); err != nil {
+	if err := s.writeCommand(line); err != nil {
 		s.mu.Lock()
 		if s.contID == id {
 			s.contID = 0
 			s.setStateLocked(prev)
 		}
 		s.mu.Unlock()
+		return err
+	}
+	return nil
+}
+
+// writeCommand sends a command line to the engine. A peer that stops
+// reading cannot block it for longer than the command timeout. A command
+// cut short would garble the ones after it, so then the connection ends.
+func (s *Session) writeCommand(line string) error {
+	_ = s.conn.SetWriteDeadline(time.Now().Add(s.commandTimeout()))
+	_, err := s.conn.Write([]byte(line + "\x00"))
+	_ = s.conn.SetWriteDeadline(time.Time{})
+	if err != nil {
+		_ = s.conn.Close()
 		return fmt.Errorf("send command: %w", err)
 	}
 	return nil
+}
+
+// commandTimeout bounds how long a command waits to be sent and for its
+// response. Continuation commands wait for their response unbounded: see
+// Session.Continue.
+func (s *Session) commandTimeout() time.Duration {
+	if s.cmdTimeout > 0 {
+		return s.cmdTimeout
+	}
+	return defaultCommandTimeout
 }
 
 // Wait waits up to wait for a running script to stop and returns the
