@@ -645,8 +645,14 @@ func (s *Session) sendCommand(name string, args []string, data []byte) (*Respons
 	s.pending = p
 	s.mu.Unlock()
 
-	if _, err := s.conn.Write([]byte(line + "\x00")); err != nil {
+	// A peer that stops reading cannot block a write for long. A command
+	// cut short would garble the ones after it, so the connection ends.
+	_ = s.conn.SetWriteDeadline(time.Now().Add(commandTimeout))
+	_, err = s.conn.Write([]byte(line + "\x00"))
+	_ = s.conn.SetWriteDeadline(time.Time{})
+	if err != nil {
 		s.clearPending(p)
+		_ = s.conn.Close()
 		return nil, fmt.Errorf("send command: %w", err)
 	}
 

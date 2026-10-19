@@ -912,3 +912,61 @@ func TestSessionRemoteAddr(t *testing.T) {
 		t.Errorf("RemoteAddr() = %s, want 127.0.0.1", sess.RemoteAddr())
 	}
 }
+
+// A connection that sends its init packet and then stops answering is
+// dropped once setup takes too long, which frees its handshake slot.
+func TestServerDropsSilentSetup(t *testing.T) {
+	srv := newTestServer(t, Config{})
+	setLimits(srv, 1, maxLiveSessions)
+	srv.mu.Lock()
+	srv.setupTimeout = 300 * time.Millisecond
+	srv.mu.Unlock()
+
+	silent := dialFakeEngine(t, srv, fixture(t, "init"), map[string]fakeHandler{
+		"feature_set": func(*fakeEngine, fakeCommand) []string { return nil },
+	})
+	if !silent.WaitClosed(3 * time.Second) {
+		t.Fatal("a connection that stopped answering during setup was kept")
+	}
+	dialFakeEngine(t, srv, fixture(t, "init"), standardHandlers())
+	sess := waitSession(t, srv)
+	if got := srv.Sessions(); len(got) != 1 || got[0] != sess {
+		t.Errorf("sessions = %v, want only the one that answered", got)
+	}
+}
+
+// Handshakes setting up at the same time cannot go past the live session
+// limit together.
+func TestServerLimitsConcurrentHandshakes(t *testing.T) {
+	srv := newTestServer(t, Config{})
+	setLimits(srv, maxHandshakes, 1)
+	slow := func() map[string]fakeHandler {
+		handlers := standardHandlers()
+		handlers["feature_set"] = func(e *fakeEngine, cmd fakeCommand) []string {
+			time.Sleep(100 * time.Millisecond)
+			return reply("feature_set")(e, cmd)
+		}
+		return handlers
+	}
+	var engines []*fakeEngine
+	for range 3 {
+		engines = append(engines, dialFakeEngine(t, srv, fixture(t, "init"), slow()))
+	}
+	detached := func() int {
+		n := 0
+		for _, e := range engines {
+			select {
+			case <-e.done:
+				n++
+			default:
+			}
+		}
+		return n
+	}
+	waitFor(t, func() bool { return detached() == 2 })
+	waitFor(t, func() bool { return len(srv.Sessions()) == 1 })
+	time.Sleep(200 * time.Millisecond)
+	if n := len(srv.Sessions()); n != 1 || detached() != 2 {
+		t.Errorf("%d sessions and %d detached, want 1 and 2", n, detached())
+	}
+}

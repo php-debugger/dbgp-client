@@ -73,6 +73,11 @@ const (
 	// maxLiveSessions bounds sessions that have not ended. Beyond it, new
 	// scripts are detached, so they run on without the debugger.
 	maxLiveSessions = 16
+	// setupTimeout bounds setting up a session after its init packet:
+	// features, output capture and breakpoints, a command each. A
+	// connection that takes longer is dropped, so one that stops answering
+	// frees its handshake slot.
+	setupTimeout = 30 * time.Second
 	// maxPacketsInFlight bounds the bytes of the packets a server's sessions
 	// are reading and parsing at once, which takes a few times as much
 	// memory. At least maxPacketBytes, so every packet fits.
@@ -115,6 +120,7 @@ type Server struct {
 	warnings    []string // addresses the last StartListening could not use
 	closed      bool
 	handshakes  map[net.Conn]struct{}
+	reserved    int // live session slots taken by handshakes setting up
 	nextID      int
 	sessions    []*Session
 	queue       []*Session // not yet returned by WaitForSession
@@ -124,6 +130,7 @@ type Server struct {
 
 	// The connection limits; tests lower them.
 	maxHandshakes, maxLiveSessions int
+	setupTimeout                   time.Duration
 
 	// packetBudget holds maxPacketsInFlight bytes, which sessions take
 	// while they read and parse a packet.
@@ -162,6 +169,7 @@ func NewServer(cfg Config) (*Server, error) {
 		arrived:         make(chan struct{}),
 		maxHandshakes:   maxHandshakes,
 		maxLiveSessions: maxLiveSessions,
+		setupTimeout:    setupTimeout,
 		packetBudget:    semaphore.NewWeighted(maxPacketsInFlight),
 	}, nil
 }
@@ -363,25 +371,34 @@ func (s *Server) handshake(conn net.Conn) {
 		return
 	}
 
+	// The slot is reserved until the session is added, so handshakes
+	// setting up at the same time cannot go past the limit together.
 	s.mu.Lock()
-	if s.liveSessionsLocked() >= s.maxLiveSessions {
+	if s.liveSessionsLocked()+s.reserved >= s.maxLiveSessions {
 		s.mu.Unlock()
 		detachConn(conn)
 		return
 	}
+	s.reserved++
 	s.nextID++
 	id := s.nextID
+	setupTimeout := s.setupTimeout
 	s.mu.Unlock()
 
+	// One deadline for the whole setup: once it passes, the session ends
+	// and its remaining commands fail at once.
+	_ = conn.SetDeadline(time.Now().Add(setupTimeout))
 	sess := newSession(id, s, conn, reader, init)
 	sess.setup(s.cfg, s.pathMap())
 	// Nothing reports errors here: the first Continue reports rejected
 	// breakpoints, and retries the others.
 	_ = sess.syncBreakpoints(false)
+	_ = conn.SetDeadline(time.Time{})
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.closed {
+	s.reserved--
+	if s.closed || sess.ended() {
 		_ = sess.Close()
 		return
 	}
