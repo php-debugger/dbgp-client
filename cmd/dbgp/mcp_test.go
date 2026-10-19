@@ -1,13 +1,16 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"fmt"
 	"net"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -543,5 +546,58 @@ func TestMCPListenWarnings(t *testing.T) {
 	callTool(t, cs, "listen", nil, &out)
 	if !out.Listening || strconv.Itoa(out.Port) != port || len(out.Warnings) != 1 || !strings.Contains(out.Warnings[0], "[::1]:"+port) {
 		t.Errorf("listen = %+v, want port %s with a warning about [::1]", out, port)
+	}
+}
+
+// dbgp mcp -no-eval sends no eval of its own to the engine: the setup
+// probe for the engine's path mapping is skipped.
+func TestMCPNoEvalSendsNoEval(t *testing.T) {
+	bin := buildBinary(t)
+	daemonEnv(t)
+	init, err := os.ReadFile("../../testdata/dbgp/init.xml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, noEval := range []bool{false, true} {
+		args := []string{"mcp", "-php-port", "0"}
+		if noEval {
+			args = append(args, "-no-eval")
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		cs, err := mcp.NewClient(&mcp.Implementation{Name: "test", Version: "0"}, nil).
+			Connect(ctx, &mcp.CommandTransport{Command: exec.CommandContext(ctx, bin, args...)}, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer cs.Close()
+		var listening listenOutput
+		callTool(t, cs, "listen", nil, &listening)
+
+		// An engine that answers every setup command, until output capture,
+		// the last one.
+		conn, err := net.Dial("tcp", net.JoinHostPort("127.0.0.1", strconv.Itoa(listening.Port)))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer conn.Close()
+		_ = conn.SetDeadline(time.Now().Add(10 * time.Second))
+		fmt.Fprintf(conn, "%d\x00%s\x00", len(init), init)
+		reader := bufio.NewReader(conn)
+		var commands []string
+		for !slices.Contains(commands, "stdout") {
+			line, err := reader.ReadString(0)
+			if err != nil {
+				t.Fatalf("%v: reading commands %v: %v", args, commands, err)
+			}
+			fields := strings.Fields(strings.TrimSuffix(line, "\x00"))
+			id := fields[slices.Index(fields, "-i")+1]
+			commands = append(commands, fields[0])
+			resp := fmt.Sprintf(`<response xmlns="urn:debugger_protocol_v1" command=%q transaction_id=%q success="1"/>`, fields[0], id)
+			fmt.Fprintf(conn, "%d\x00%s\x00", len(resp), resp)
+		}
+		if sent := slices.Contains(commands, "eval"); sent == noEval {
+			t.Errorf("%v: setup commands %v, eval sent %v", args, commands, sent)
+		}
 	}
 }

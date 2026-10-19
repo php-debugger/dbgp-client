@@ -191,6 +191,8 @@ func runMCP(args []string) int {
 
 	srv, err := dbgp.NewServer(dbgp.Config{
 		Addr: phpAddr(*phpPort), IDEKey: *idekey, PathMap: pathMap, ClaimTimeout: claimTimeout,
+		// The tools never read the engine mapping that the probe reports.
+		NoEval: *noEval,
 	})
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)

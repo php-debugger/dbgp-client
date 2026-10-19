@@ -60,6 +60,11 @@ type Config struct {
 	// PathMap maps local directories to the engine's, for PHP running in a
 	// container or on a remote server. Sessions take and return local paths.
 	PathMap []PathMapping
+	// NoEval stops the server from running PHP code of its own in sessions:
+	// setup skips the eval that asks the engine whether it maps paths
+	// itself, so Session.EngineMapping reports nothing detected. Session
+	// methods that run code, such as EvalProperty, still do when called.
+	NoEval bool
 	// ClaimTimeout, when set, detaches sessions that neither WaitForSession
 	// nor Claim has taken within this time of connecting, so their scripts
 	// run on without the debugger instead of waiting for someone to debug
@@ -472,7 +477,9 @@ func (sess *Session) setup(cfg Config, paths PathMap) {
 	_ = sess.FeatureSet("notify_ok", "1")
 	_ = sess.FeatureSet("resolved_breakpoints", "1")
 	// Before cfg.Features, which may lower max_data below the probe's reply.
-	sess.detectEngineMapping(paths)
+	if !cfg.NoEval {
+		sess.detectEngineMapping(paths)
+	}
 
 	names := make([]string, 0, len(cfg.Features))
 	for name := range cfg.Features {

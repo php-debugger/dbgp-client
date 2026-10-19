@@ -128,6 +128,11 @@ func TestServerSessionSetup(t *testing.T) {
 			"feature_set -n resolved_breakpoints -v 1",
 			probeCommand,
 		}},
+		{"no eval", Config{NoEval: true}, []string{
+			"feature_set -n notify_ok -v 1",
+			"feature_set -n resolved_breakpoints -v 1",
+			"stdout -c 1",
+		}},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
