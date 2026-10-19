@@ -1,9 +1,11 @@
 package dbgp
 
 import (
+	"bufio"
 	"context"
 	"encoding/base64"
 	"errors"
+	"io"
 	"reflect"
 	"strconv"
 	"strings"
@@ -173,8 +175,17 @@ func TestCommandWireFormat(t *testing.T) {
 			},
 			args: map[string]string{"n": `$user["first name"]`, "d": "1", "c": "1", "p": "2", "m": "100"}},
 		{name: "GetPropertyValue", command: "property_value",
-			call: func(s *Session) error { _, err := s.GetPropertyValue("$long", PropertyOptions{Depth: 1}); return err },
+			call: func(s *Session) error {
+				_, _, err := s.GetPropertyValue("$long", PropertyOptions{Depth: 1})
+				return err
+			},
 			args: map[string]string{"n": "$long", "d": "1", "c": "0", "m": "0"}},
+		{name: "GetPropertyValue part", command: "property_value",
+			call: func(s *Session) error {
+				_, _, err := s.GetPropertyValue("$long", PropertyOptions{Depth: 1, MaxData: 32772})
+				return err
+			},
+			args: map[string]string{"n": "$long", "d": "1", "c": "0", "m": "32772"}},
 		{name: "SetProperty", command: "property_set",
 			call: func(s *Session) error { return s.SetProperty("$b", "7 * 2", PropertyOptions{}) },
 			args: map[string]string{"n": "$b", "d": "0", "c": "0"},
@@ -489,10 +500,61 @@ func TestCommandAfterDisconnectFailsFast(t *testing.T) {
 	}
 }
 
+func TestReadPacket(t *testing.T) {
+	const limit = 100
+	tests := []struct {
+		name, raw string
+		want      string // the data; empty when an error is expected
+	}{
+		{"packet", "5\x00hello\x00", "hello"},
+		{"at the limit", "100\x00" + strings.Repeat("x", 100) + "\x00", strings.Repeat("x", 100)},
+		{"leading zero", "05\x00hello\x00", "hello"},
+		{"over the limit", "101\x00" + strings.Repeat("x", 101) + "\x00", ""},
+		{"huge length", "9223372036854775807\x00", ""},
+		{"overflowing length", "99999999999999999999999\x00", ""},
+		{"endless zeros", strings.Repeat("0", 1000), ""},
+		{"no digits", "\x00hello\x00", ""},
+		{"negative", "-5\x00hello\x00", ""},
+		{"plus sign", "+5\x00hello\x00", ""},
+		{"space", " 5\x00hello\x00", ""},
+		{"short data", "10\x00hello", ""},
+		{"missing nul", "5\x00helloX", ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			data, err := readPacket(bufio.NewReader(strings.NewReader(tt.raw)), limit)
+			if tt.want == "" {
+				if err == nil {
+					t.Errorf("readPacket = %q, want an error", data)
+				}
+				return
+			}
+			if err != nil || string(data) != tt.want {
+				t.Errorf("readPacket = %q, %v; want %q", data, err, tt.want)
+			}
+		})
+	}
+}
+
+// A packet that claims a huge length is rejected at once, without reading
+// on: what follows its length is never read.
+func TestReadPacketStopsAtBadLength(t *testing.T) {
+	r := bufio.NewReader(strings.NewReader("9999999999999\x00rest"))
+	if _, err := readPacket(r, 100); err == nil {
+		t.Fatal("readPacket accepted a huge length")
+	}
+	if rest, _ := io.ReadAll(r); !strings.HasSuffix(string(rest), "\x00rest") {
+		t.Errorf("readPacket read on past the length: left %q", rest)
+	}
+}
+
 func TestMalformedPacketClosesSession(t *testing.T) {
 	for name, raw := range map[string]string{
-		"bad length":  "xyz\x00<response/>\x00",
-		"missing nul": "10\x00<response>X",
+		"bad length":     "xyz\x00<response/>\x00",
+		"missing nul":    "10\x00<response>X",
+		"huge length":    "9223372036854775807\x00",
+		"over the limit": strconv.Itoa(maxPacketBytes+1) + "\x00",
+		"endless length": strings.Repeat("0", 100),
 	} {
 		t.Run(name, func(t *testing.T) {
 			s, _ := startFakeSession(t, map[string]fakeHandler{
@@ -811,6 +873,34 @@ func TestStopEndsTheSession(t *testing.T) {
 	}
 }
 
+// A running script reads no commands, e.g. one stuck in a loop: Stop
+// cannot end it, but Detach lets it go by closing the connection, so the
+// engine carries on without the debugger.
+func TestDetachRunningScript(t *testing.T) {
+	handlers := standardHandlers()
+	handlers["run"] = func(*fakeEngine, fakeCommand) []string { return nil } // never stops
+	s, e := startFakeSession(t, handlers)
+	if st, err := s.Continue(context.Background(), ContinueRun, 50*time.Millisecond); err != nil || st.Status != StatusRunning {
+		t.Fatalf("Continue = %+v, %v; want running", st, err)
+	}
+	if err := s.Stop(); !errors.Is(err, ErrRunning) {
+		t.Errorf("Stop while running = %v, want ErrRunning", err)
+	}
+	e.ClearReceived()
+	if err := s.Detach(); err != nil {
+		t.Fatalf("Detach while running: %v", err)
+	}
+	if st := s.State(); !st.Closed {
+		t.Errorf("State after Detach = %+v, want closed", st)
+	}
+	if !e.WaitClosed(3 * time.Second) {
+		t.Error("the engine's connection is still open after Detach")
+	}
+	if got := e.Received(); len(got) != 0 {
+		t.Errorf("Detach sent %v to an engine that reads no commands", got)
+	}
+}
+
 func TestOutputIsCaptured(t *testing.T) {
 	s, e := startFakeSession(t, standardHandlers())
 	stream := func(text string) string {
@@ -920,9 +1010,9 @@ func TestInspectionDecoding(t *testing.T) {
 		}
 	})
 	t.Run("GetPropertyValue", func(t *testing.T) {
-		v, err := s.GetPropertyValue("$long", PropertyOptions{Depth: 1})
-		if err != nil || v != strings.Repeat("abcdefghij", 20) {
-			t.Errorf("GetPropertyValue = %q, %v", v, err)
+		v, size, err := s.GetPropertyValue("$long", PropertyOptions{Depth: 1})
+		if err != nil || v != strings.Repeat("abcdefghij", 20) || size != 200 {
+			t.Errorf("GetPropertyValue = %q, size %d, %v", v, size, err)
 		}
 	})
 	t.Run("SetProperty", func(t *testing.T) {

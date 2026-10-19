@@ -303,8 +303,14 @@ func TestEngineInspection(t *testing.T) {
 	if err != nil || !p.Truncated() || p.Size != 200 {
 		t.Errorf("$long = %+v, %v; want truncated", p, err)
 	}
-	if v, err := sess.GetPropertyValue("$long", main); err != nil || len(v) != 200 {
-		t.Errorf("GetPropertyValue($long) = %d bytes, %v; want 200", len(v), err)
+	if v, size, err := sess.GetPropertyValue("$long", main); err != nil || len(v) != 200 || size != 200 {
+		t.Errorf("GetPropertyValue($long) = %d bytes, size %d, %v; want 200", len(v), size, err)
+	}
+	// With MaxData, only the start is sent, with the whole size.
+	start := main
+	start.MaxData = 15
+	if v, size, err := sess.GetPropertyValue("$long", start); err != nil || len(v) != 15 || size != 200 {
+		t.Errorf("GetPropertyValue($long, MaxData 15) = %d bytes, size %d, %v; want 15 of 200", len(v), size, err)
 	}
 
 	// property_set evaluates its value as PHP.

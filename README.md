@@ -23,13 +23,15 @@ Windows (PowerShell as administrator; installs to `%ProgramFiles%\dbgp` and adds
 powershell -c "irm https://github.com/php-debugger/dbgp-client/releases/latest/download/install.ps1 | iex"
 ```
 
-Set `INSTALL_DIR` to install elsewhere, and `VERSION` (e.g. `0.1.1`) to install a release other than the latest. Run the script again to update. Builds are published for Linux and macOS (amd64 and arm64) and Windows (amd64); elsewhere, install with Go:
+Set `INSTALL_DIR` to install elsewhere (on Windows, it is then added to your own PATH rather than the system one), and `VERSION` (e.g. `0.1.1`) to install a release other than the latest. Run the script again to update. Builds are published for Linux and macOS (amd64 and arm64) and Windows (amd64); elsewhere, install with Go:
 
 ```sh
 go install github.com/php-debugger/dbgp-client/cmd/dbgp@latest
 ```
 
 `dbgp -version` shows the installed version.
+
+The install scripts check the download against the release's `SHA256SUMS` before installing it. Each release file also has a build provenance attestation, which shows it was built by this repository's release workflow; to check one you downloaded yourself, run `gh attestation verify FILE --repo php-debugger/dbgp-client`.
 
 To be debugged, PHP needs [PHP Debugger](https://php-debugger.dev) or Xdebug: `php -v` shows which one it has.
 
@@ -49,9 +51,9 @@ The agent starts the PHP code itself, as a script or a web request, and debugs i
 
 You can optionally add some options after `dbgp mcp`:
 
-- `-no-eval` leaves out the tools that run PHP code in the debugged script (evaluating expressions and changing variables), so the agent can only look.
+- `-no-eval` turns off everything that runs PHP code in the debugged script: evaluating expressions, changing variables and breakpoint conditions, so the agent can only look.
 - `-map LOCAL=REMOTE` maps a directory on this machine to where PHP sees it, for PHP in a container or on a server. The agent can also add mappings itself.
-- `-addr` changes the address dbgp listens on for PHP, `localhost:9003` by default.
+- `-php-port` changes the port dbgp listens on for PHP, 9003 by default. dbgp listens on every address of this machine, so PHP in a container or on another machine can connect too.
 
 By default each agent session starts its own dbgp. To keep breakpoints and sessions between agent sessions, and share them between agents, run dbgp in the background:
 
@@ -61,7 +63,9 @@ dbgp mcp status    # is it running?
 dbgp mcp stop      # stop it
 ```
 
-While it runs, agents that start `dbgp mcp` use it instead, with the options it was started with. After updating dbgp, restart it to use the new version.
+`dbgp mcp start` also takes `-mcp-port`, the port agents reach it on, 9004 by default. It listens on this machine only (127.0.0.1).
+
+While it runs, agents that start `dbgp mcp` use it instead, with the options it was started with. Only you can use it: `dbgp mcp` connects with a token kept in a file that other users on the machine cannot read. After updating dbgp, restart it to use the new version.
 
 `dbgp mcp -h` lists all the options.
 

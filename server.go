@@ -54,7 +54,24 @@ type Config struct {
 	// PathMap maps local directories to the engine's, for PHP running in a
 	// container or on a remote server. Sessions take and return local paths.
 	PathMap []PathMapping
+	// ClaimTimeout, when set, detaches sessions that neither WaitForSession
+	// nor Claim has taken within this time of connecting, so their scripts
+	// run on without the debugger instead of waiting for someone to debug
+	// them. Default: sessions wait until taken.
+	ClaimTimeout time.Duration
 }
+
+// Limits on connections, so that a flood of them, from anything that can
+// reach the port, cannot exhaust memory. PHP connects once per script run
+// or request, and holds its connection while it is debugged.
+const (
+	// maxHandshakes bounds connections that have not sent their init
+	// packet yet; each may take Config.InitTimeout to do so.
+	maxHandshakes = 8
+	// maxLiveSessions bounds sessions that have not ended. Beyond it, new
+	// scripts are detached, so they run on without the debugger.
+	maxLiveSessions = 16
+)
 
 // Breakpoint is a breakpoint the server applies to every session, including
 // sessions that connect later.
@@ -98,6 +115,9 @@ type Server struct {
 	arrived     chan struct{}
 	nextBPID    int
 	breakpoints []Breakpoint
+
+	// The connection limits; tests lower them.
+	maxHandshakes, maxLiveSessions int
 }
 
 // Listen creates a server and starts listening for engine connections.
@@ -125,11 +145,13 @@ func NewServer(cfg Config) (*Server, error) {
 		return nil, err
 	}
 	return &Server{
-		cfg:        cfg,
-		paths:      paths,
-		addr:       cfg.Addr,
-		handshakes: map[net.Conn]struct{}{},
-		arrived:    make(chan struct{}),
+		cfg:             cfg,
+		paths:           paths,
+		addr:            cfg.Addr,
+		handshakes:      map[net.Conn]struct{}{},
+		arrived:         make(chan struct{}),
+		maxHandshakes:   maxHandshakes,
+		maxLiveSessions: maxLiveSessions,
 	}, nil
 }
 
@@ -170,6 +192,15 @@ func (s *Server) StartListening() error {
 	}
 	if len(listeners) == 0 {
 		return fmt.Errorf("listen on %s: %s", s.addr, strings.Join(failures, "; "))
+	}
+	for _, listener := range listeners {
+		if shadowed := shadowedAddr(listener); shadowed != "" {
+			for _, l := range listeners {
+				_ = l.Close()
+			}
+			return fmt.Errorf("listen on %s: another program is listening on %s, so PHP connecting there would reach it instead",
+				s.addr, shadowed)
+		}
 	}
 
 	if len(hosts) == 1 {
@@ -280,7 +311,7 @@ func (s *Server) acceptLoop(listener net.Listener, done chan struct{}) {
 			return
 		}
 		s.mu.Lock()
-		if s.closed {
+		if s.closed || len(s.handshakes) >= s.maxHandshakes {
 			s.mu.Unlock()
 			_ = conn.Close()
 			continue
@@ -303,7 +334,7 @@ func (s *Server) handshake(conn net.Conn) {
 
 	_ = conn.SetReadDeadline(time.Now().Add(s.cfg.InitTimeout))
 	reader := bufio.NewReader(conn)
-	data, err := readPacket(reader)
+	data, err := readPacket(reader, maxInitPacketBytes)
 	if err != nil {
 		_ = conn.Close()
 		return
@@ -317,20 +348,25 @@ func (s *Server) handshake(conn net.Conn) {
 
 	if s.cfg.IDEKey != "" && init.IDEKey != s.cfg.IDEKey {
 		// Not ours: let the script run on without the debugger.
-		_, _ = conn.Write([]byte("detach -i 1\x00"))
-		_ = conn.Close()
+		detachConn(conn)
 		return
 	}
 
 	s.mu.Lock()
+	if s.liveSessionsLocked() >= s.maxLiveSessions {
+		s.mu.Unlock()
+		detachConn(conn)
+		return
+	}
 	s.nextID++
 	id := s.nextID
 	s.mu.Unlock()
 
 	sess := newSession(id, s, conn, reader, init)
 	sess.setup(s.cfg, s.pathMap())
-	// Failed breakpoints are retried, and reported, by the first Continue.
-	_ = sess.syncBreakpoints()
+	// Nothing reports errors here: the first Continue reports rejected
+	// breakpoints, and retries the others.
+	_ = sess.syncBreakpoints(false)
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -343,6 +379,38 @@ func (s *Server) handshake(conn net.Conn) {
 	s.pruneSessions()
 	close(s.arrived)
 	s.arrived = make(chan struct{})
+	if s.cfg.ClaimTimeout > 0 {
+		time.AfterFunc(s.cfg.ClaimTimeout, func() { s.detachUnclaimed(sess) })
+	}
+}
+
+// detachUnclaimed detaches sess if nobody has taken it, so its script runs
+// on instead of waiting.
+func (s *Server) detachUnclaimed(sess *Session) {
+	s.mu.Lock()
+	unclaimed := !s.closed && s.unqueueLocked(sess)
+	s.mu.Unlock()
+	if unclaimed {
+		_ = sess.Detach()
+		_ = sess.Close()
+	}
+}
+
+// detachConn lets the script on conn run on without the debugger.
+func detachConn(conn net.Conn) {
+	_, _ = conn.Write([]byte("detach -i 1\x00"))
+	_ = conn.Close()
+}
+
+// liveSessionsLocked counts the sessions that have not ended.
+func (s *Server) liveSessionsLocked() int {
+	live := 0
+	for _, sess := range s.sessions {
+		if !sess.ended() {
+			live++
+		}
+	}
+	return live
 }
 
 // setup enables notifications and output capture, then applies cfg.Features.
@@ -489,6 +557,26 @@ func (s *Server) WaitForSession(ctx context.Context) (*Session, error) {
 	}
 }
 
+// Claim takes sess as if WaitForSession had returned it, so WaitForSession
+// does not return it and Config.ClaimTimeout no longer applies to it. It
+// reports whether sess was still waiting to be taken.
+func (s *Server) Claim(sess *Session) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.unqueueLocked(sess)
+}
+
+// unqueueLocked removes sess from the sessions WaitForSession has not
+// returned yet, and reports whether it was there.
+func (s *Server) unqueueLocked(sess *Session) bool {
+	i := slices.Index(s.queue, sess)
+	if i < 0 {
+		return false
+	}
+	s.queue = slices.Delete(s.queue, i, i+1)
+	return true
+}
+
 // AddBreakpoint adds a breakpoint to every session: now for sessions that
 // are stopped, and on their next Continue for sessions that are running.
 // The returned error lists sessions that rejected it.
@@ -537,7 +625,7 @@ func (s *Server) syncStoppedSessions() error {
 		if sess.State().Status == StatusRunning {
 			continue
 		}
-		if err := sess.syncBreakpoints(); err != nil {
+		if err := sess.syncBreakpoints(true); err != nil {
 			errs = append(errs, fmt.Errorf("session %d: %w", sess.id, err))
 		}
 	}

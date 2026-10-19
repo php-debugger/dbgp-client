@@ -2,6 +2,7 @@ package dbgp
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/json"
@@ -75,9 +76,12 @@ type Session struct {
 	cmdSlot chan struct{}
 
 	// syncMu serializes breakpoint syncs; it guards bpIDs, which maps
-	// server breakpoint ids to this engine's breakpoint ids.
+	// server breakpoint ids to this engine's breakpoint ids, and rejected.
 	syncMu sync.Mutex
 	bpIDs  map[int]int
+	// rejected holds the server breakpoints the engine refused, by server
+	// id, so that syncs do not send them again, and so fail only once.
+	rejected map[int]*rejection
 	// resync asks the next sync to set every breakpoint again, because a
 	// path mapping changed.
 	resync atomic.Bool
@@ -164,6 +168,13 @@ func (s *Session) SetupWarnings() []string {
 	return append([]string(nil), s.warnings...)
 }
 
+// rejection is a breakpoint the engine refused, and whether that has been
+// reported.
+type rejection struct {
+	err      error
+	reported bool
+}
+
 // pendingCommand is a command waiting for its response.
 type pendingCommand struct {
 	id int
@@ -174,15 +185,16 @@ type pendingCommand struct {
 // packet has been read.
 func newSession(id int, server *Server, conn net.Conn, reader *bufio.Reader, init *InitPacket) *Session {
 	s := &Session{
-		id:      id,
-		server:  server,
-		conn:    conn,
-		init:    init,
-		closed:  make(chan struct{}),
-		cmdSlot: make(chan struct{}, 1),
-		bpIDs:   map[int]int{},
-		state:   State{Status: StatusStarting},
-		changed: make(chan struct{}),
+		id:       id,
+		server:   server,
+		conn:     conn,
+		init:     init,
+		closed:   make(chan struct{}),
+		cmdSlot:  make(chan struct{}, 1),
+		bpIDs:    map[int]int{},
+		rejected: map[int]*rejection{},
+		state:    State{Status: StatusStarting},
+		changed:  make(chan struct{}),
 	}
 	go s.readLoop(reader)
 	return s
@@ -193,6 +205,9 @@ func (s *Session) ID() int { return s.id }
 
 // Init returns the session's init packet.
 func (s *Session) Init() *InitPacket { return s.init }
+
+// RemoteAddr returns the address the engine connected from.
+func (s *Session) RemoteAddr() net.Addr { return s.conn.RemoteAddr() }
 
 // pathMap returns the server's current path map.
 func (s *Session) pathMap() PathMap {
@@ -263,32 +278,37 @@ func (s *Session) Notifications(from int) ([]Notification, int) {
 	return append([]Notification(nil), s.notes[from-s.notesBase:]...), next
 }
 
-// readPacket reads a single DBGp packet (length + NULL + data + NULL)
-func readPacket(reader *bufio.Reader) ([]byte, error) {
-	// Read length until NULL
-	line, err := reader.ReadString('\x00')
+// Packet size limits. The length comes from whoever connected, so a bad one
+// must not crash dbgp or make it allocate more than the data that arrives.
+const (
+	// maxPacketBytes bounds every packet. Responses can be large, such as a
+	// long string from property_value, but not this large.
+	maxPacketBytes = 256 << 20
+	// maxInitPacketBytes bounds the init packet, which a connection sends
+	// before it is known to be an engine. Real ones are well under 1 KB.
+	maxInitPacketBytes = 64 << 10
+	// packetChunk is how much of a packet is allocated ahead of the data.
+	packetChunk = 64 << 10
+)
+
+// readPacket reads a single DBGp packet, length NUL data NUL, of at most
+// limit bytes of data.
+func readPacket(reader *bufio.Reader, limit int) ([]byte, error) {
+	length, err := readPacketLength(reader, limit)
 	if err != nil {
 		return nil, err
 	}
 
-	// Parse length
-	line = strings.TrimSuffix(line, "\x00")
-	length, err := strconv.Atoi(line)
-	if err != nil {
-		return nil, fmt.Errorf("parse packet length: %w", err)
-	}
-	if length < 0 {
-		return nil, fmt.Errorf("negative packet length %d", length)
-	}
-
-	// Read exact number of bytes
-	data := make([]byte, length)
-	_, err = io.ReadFull(reader, data)
-	if err != nil {
+	// Grow the buffer as the data arrives rather than trusting the length.
+	var data bytes.Buffer
+	data.Grow(min(length, packetChunk))
+	if _, err := io.CopyN(&data, reader, int64(length)); err != nil {
+		if errors.Is(err, io.EOF) {
+			err = io.ErrUnexpectedEOF
+		}
 		return nil, err
 	}
 
-	// Read trailing NULL
 	b, err := reader.ReadByte()
 	if err != nil {
 		return nil, err
@@ -296,8 +316,33 @@ func readPacket(reader *bufio.Reader) ([]byte, error) {
 	if b != '\x00' {
 		return nil, fmt.Errorf("expected NULL terminator, got %x", b)
 	}
+	return data.Bytes(), nil
+}
 
-	return data, nil
+// readPacketLength reads the decimal length that starts a packet and its
+// NUL terminator. It stops at the first byte that cannot be part of a valid
+// length, so a sender cannot make it read an endless prefix.
+func readPacketLength(reader *bufio.Reader, limit int) (int, error) {
+	maxDigits := len(strconv.Itoa(limit))
+	var length int64
+	for digits := 0; ; digits++ {
+		b, err := reader.ReadByte()
+		if err != nil {
+			return 0, err
+		}
+		switch {
+		case b == '\x00' && digits > 0:
+			return int(length), nil
+		case b < '0' || b > '9':
+			return 0, fmt.Errorf("invalid packet length: unexpected byte %q", b)
+		case digits == maxDigits:
+			return 0, fmt.Errorf("invalid packet length: more than %d digits", maxDigits)
+		}
+		length = length*10 + int64(b-'0')
+		if length > int64(limit) {
+			return 0, fmt.Errorf("packet length exceeds the limit of %d bytes", limit)
+		}
+	}
 }
 
 // readLoop reads packets until the connection ends, then marks the session
@@ -305,7 +350,7 @@ func readPacket(reader *bufio.Reader) ([]byte, error) {
 func (s *Session) readLoop(reader *bufio.Reader) {
 	defer s.finish()
 	for {
-		data, err := readPacket(reader)
+		data, err := readPacket(reader, maxPacketBytes)
 		if err != nil {
 			return
 		}
@@ -566,15 +611,18 @@ func responseResult(resp *Response) (*Response, error) {
 // ContinueStepInto, ContinueStepOver or ContinueStepOut) and waits up to
 // wait for it to stop. If it is still running then, the returned state has
 // Status running: call Wait to keep waiting. Breakpoints added to the server
-// are applied first.
+// are applied first. If that fails, the script is not resumed: a breakpoint
+// the engine rejected is reported once, and the next Continue runs without
+// it.
 func (s *Session) Continue(ctx context.Context, command string, wait time.Duration) (State, error) {
 	switch command {
 	case ContinueRun, ContinueStepInto, ContinueStepOver, ContinueStepOut:
 	default:
 		return s.State(), fmt.Errorf("%q is not a continuation command", command)
 	}
-	if err := s.syncBreakpoints(); err != nil {
-		return s.State(), err
+	if err := s.syncBreakpoints(true); err != nil {
+		return s.State(), fmt.Errorf("%w; the script was not resumed: "+
+			"continue again to run it without the breakpoints the engine rejected", err)
 	}
 	if err := s.startContinuation(command); err != nil {
 		return s.State(), err
@@ -657,8 +705,11 @@ func (s *Session) finished() bool {
 }
 
 // syncBreakpoints makes the engine's breakpoints match the server's: it
-// sets breakpoints added since the last sync and removes deleted ones.
-func (s *Session) syncBreakpoints() error {
+// sets breakpoints added since the last sync and removes deleted ones. A
+// breakpoint the engine rejects is not sent again until a path mapping
+// changes; its error is returned once, by the first sync that reports.
+// Other errors, such as a timeout, are returned until the breakpoint is set.
+func (s *Session) syncBreakpoints(report bool) error {
 	if s.server == nil || s.finished() {
 		return nil
 	}
@@ -667,13 +718,15 @@ func (s *Session) syncBreakpoints() error {
 
 	var errs []error
 	if s.resync.Swap(false) {
-		// A path mapping changed: set every breakpoint again.
+		// A path mapping changed: set every breakpoint again, including
+		// rejected ones, which the new paths may fix.
 		for serverID, engineID := range s.bpIDs {
 			delete(s.bpIDs, serverID)
 			if err := s.RemoveBreakpoint(engineID); err != nil && !errors.Is(err, errConnectionClosed) {
 				errs = append(errs, fmt.Errorf("remove breakpoint %d: %w", serverID, err))
 			}
 		}
+		clear(s.rejected)
 	}
 	want := map[int]bool{}
 	for _, bp := range s.server.Breakpoints() {
@@ -681,12 +734,28 @@ func (s *Session) syncBreakpoints() error {
 		if _, ok := s.bpIDs[bp.ID]; ok {
 			continue
 		}
+		if r, ok := s.rejected[bp.ID]; ok {
+			if report && !r.reported {
+				r.reported = true
+				errs = append(errs, r.err)
+			}
+			continue
+		}
 		id, err := s.SetBreakpointSpec(bp)
 		if err != nil {
-			errs = append(errs, fmt.Errorf("breakpoint %d: %w", bp.ID, err))
+			err = fmt.Errorf("breakpoint %d: %w", bp.ID, err)
+			if engineErr := (*EngineError)(nil); errors.As(err, &engineErr) {
+				s.rejected[bp.ID] = &rejection{err: err, reported: report}
+			}
+			errs = append(errs, err)
 			continue
 		}
 		s.bpIDs[bp.ID] = id
+	}
+	for serverID := range s.rejected {
+		if !want[serverID] {
+			delete(s.rejected, serverID)
+		}
 	}
 	for serverID, engineID := range s.bpIDs {
 		if want[serverID] {
@@ -761,7 +830,9 @@ func (s *Session) ListBreakpoints() ([]BreakpointInfo, error) {
 
 // Stop ends the script and the session. Stopped mid-script, the engine
 // waits for the IDE to close the connection before PHP exits, so Stop closes
-// it, and returns once the session has ended.
+// it, and returns once the session has ended. A running script reads no
+// commands, so Stop cannot end it and returns ErrRunning; Detach can let it
+// go.
 func (s *Session) Stop() error {
 	if _, err := s.sendCommand("stop", nil, nil); err != nil {
 		return err
@@ -771,9 +842,17 @@ func (s *Session) Stop() error {
 	return nil
 }
 
-// Detach stops debugging and lets the script run to completion.
+// Detach stops debugging and lets the script run to completion. The engine
+// reads commands only while the script is stopped, so a running script, e.g.
+// one stuck in a loop, is detached by closing the connection instead: the
+// engine then carries on without the debugger.
 func (s *Session) Detach() error {
 	_, err := s.sendCommand("detach", nil, nil)
+	if errors.Is(err, ErrRunning) {
+		_ = s.conn.Close()
+		<-s.closed
+		return nil
+	}
 	return err
 }
 
@@ -862,16 +941,23 @@ func (s *Session) GetProperty(fullname string, opts PropertyOptions) (*Property,
 	return &resp.Properties[0], nil
 }
 
-// GetPropertyValue returns a property's value. With opts.MaxData 0 it
-// returns the whole value, however long; Page is ignored.
-func (s *Session) GetPropertyValue(fullname string, opts PropertyOptions) (string, error) {
+// GetPropertyValue returns a property's value and the length of all of
+// it. With opts.MaxData 0 it returns the whole value, however long;
+// otherwise only its first MaxData bytes, so a part of a long value can be
+// read without sending all of it. Page is ignored.
+func (s *Session) GetPropertyValue(fullname string, opts PropertyOptions) (value string, size int, err error) {
 	args := []string{"-n", fullname, "-d", strconv.Itoa(opts.Depth), "-c", strconv.Itoa(opts.Context),
 		"-m", strconv.Itoa(opts.MaxData)}
 	resp, err := s.sendCommand("property_value", args, nil)
 	if err != nil {
-		return "", err
+		return "", 0, err
 	}
-	return decodeEncoded(resp.Encoding, resp.Value)
+	if value, err = decodeEncoded(resp.Encoding, resp.Value); err != nil {
+		return "", 0, err
+	}
+	// The engine sends the whole length; one that does not at least sent
+	// this much.
+	return value, max(resp.Size, len(value)), nil
 }
 
 // SetProperty assigns value, a PHP expression, to a variable or a path

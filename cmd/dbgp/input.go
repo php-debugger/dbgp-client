@@ -6,6 +6,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 
 	"github.com/ergochat/readline"
@@ -53,6 +54,11 @@ func (t *terminalReader) ReadLine(prompt string) (string, error) {
 // the returned reader's Stdout redraws the prompt, so messages that arrive
 // while a line is being typed do not break it. historyFile may be empty.
 func newTerminalReader(historyFile string) (*terminalReader, error) {
+	if historyFile != "" {
+		if err := privateHistory(historyFile); err != nil {
+			return nil, err
+		}
+	}
 	rl, err := readline.NewFromConfig(readlineConfig(historyFile))
 	if err != nil {
 		return nil, err
@@ -91,6 +97,26 @@ func completer() *readline.PrefixCompleter {
 		items = append(items, readline.PcItem(name))
 	}
 	return readline.NewPrefixCompleter(items...)
+}
+
+// privateHistory keeps the history file readable by the user only: it
+// holds what was typed, such as code to evaluate, which may include
+// secrets. readline creates the file, and replaces it when it trims it,
+// asking for mode 0666, so the files this process creates are made private
+// (it creates no others), and an existing file is made private too.
+func privateHistory(path string) error {
+	privateFiles()
+	info, err := os.Lstat(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if info.Mode().IsRegular() && runtime.GOOS != "windows" && info.Mode().Perm()&0o077 != 0 {
+		return os.Chmod(path, 0o600)
+	}
+	return nil
 }
 
 // defaultHistoryFile is ~/.dbgp_history, or "" if there is no home.

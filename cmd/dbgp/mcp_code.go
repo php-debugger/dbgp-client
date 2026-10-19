@@ -31,7 +31,7 @@ func (t *tools) addCodeTools(server *mcp.Server) {
 }
 
 type evalInput struct {
-	Session int    `json:"session,omitempty" jsonschema:"the session id; defaults to the newest session that has not ended"`
+	Session int    `json:"session,omitempty" jsonschema:"the session id; defaults to the one wait_for_session last returned or you last named"`
 	Code    string `json:"code" jsonschema:"a PHP expression, e.g. count($items) or $user->getName(); it sees the variables of the frame where execution stopped"`
 	Page    int    `json:"page,omitempty" jsonschema:"the page of the result's elements or properties, from 0 (the default); see pages"`
 }
@@ -52,8 +52,8 @@ func codeError(s *dbgp.Session, err error) error {
 	return sessionError(s, err)
 }
 
-func (t *tools) eval(_ context.Context, _ *mcp.CallToolRequest, in evalInput) (*mcp.CallToolResult, evalOutput, error) {
-	s, err := t.session(in.Session)
+func (t *tools) eval(_ context.Context, req *mcp.CallToolRequest, in evalInput) (*mcp.CallToolResult, evalOutput, error) {
+	s, err := t.session(req, in.Session)
 	if err != nil {
 		return nil, evalOutput{}, err
 	}
@@ -84,7 +84,7 @@ func (t *tools) eval(_ context.Context, _ *mcp.CallToolRequest, in evalInput) (*
 }
 
 type setVariableInput struct {
-	Session int    `json:"session,omitempty" jsonschema:"the session id; defaults to the newest session that has not ended"`
+	Session int    `json:"session,omitempty" jsonschema:"the session id; defaults to the one wait_for_session last returned or you last named"`
 	Name    string `json:"name" jsonschema:"the variable, or a path into one, e.g. $count or $user[\"name\"]"`
 	Value   string `json:"value" jsonschema:"a PHP expression for the new value, e.g. 42, 'text' or $a * 2"`
 	Depth   int    `json:"depth,omitempty" jsonschema:"the stack frame: 0 (the default) is where execution stopped, 1 its caller, and so on; see stack"`
@@ -95,8 +95,8 @@ type setVariableOutput struct {
 	Variable variableInfo `json:"variable" jsonschema:"the variable after it was set"`
 }
 
-func (t *tools) setVariable(_ context.Context, _ *mcp.CallToolRequest, in setVariableInput) (*mcp.CallToolResult, setVariableOutput, error) {
-	s, err := t.session(in.Session)
+func (t *tools) setVariable(_ context.Context, req *mcp.CallToolRequest, in setVariableInput) (*mcp.CallToolResult, setVariableOutput, error) {
+	s, err := t.session(req, in.Session)
 	if err != nil {
 		return nil, setVariableOutput{}, err
 	}

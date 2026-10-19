@@ -10,6 +10,7 @@ import (
 	"reflect"
 	"slices"
 	"sort"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -213,6 +214,41 @@ func TestCommandsWaitForSessionUntilInterrupted(t *testing.T) {
 			!strings.Contains(out, "Waiting for PHP to connect (Ctrl-C to cancel)...") || !strings.Contains(out, "Interrupted.") {
 			t.Errorf("%s: after %v:\n%s", line, time.Since(start), out)
 		}
+	}
+}
+
+// A script stuck in a loop: after Ctrl-C, detach lets it go at once
+// rather than waiting for it to stop, as other commands do.
+func TestDetachRunawayScript(t *testing.T) {
+	requireEngine(t)
+	r, srv, output := newTestREPL(t)
+	go r.announceSessions()
+	startPHP(t, srv.Port(), "-r", `for (;;) { usleep(10000); }`)
+	interrupts := make(chan os.Signal, 1)
+	go r.cancelOnInterrupt(interrupts)
+	go func() {
+		time.Sleep(500 * time.Millisecond)
+		interrupts <- os.Interrupt
+	}()
+	r.execLine("run")
+	if out := output(); !strings.Contains(out, "except detach, which lets it run on without the debugger") {
+		t.Fatalf("run, then Ctrl-C:\n%s", out)
+	}
+
+	done := make(chan struct{})
+	go func() { r.execLine("detach"); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		interrupts <- os.Interrupt
+		<-done
+		t.Fatalf("detach waited for the script to stop:\n%s", output())
+	}
+	if out := output(); !strings.Contains(out, "Detached session 1; the script runs on.") {
+		t.Errorf("detach:\n%s", out)
+	}
+	if st := srv.Session(1).State(); !st.Closed {
+		t.Errorf("session 1 after detach = %+v, want closed", st)
 	}
 }
 
@@ -429,21 +465,26 @@ func TestBinary(t *testing.T) {
 		t.Errorf("-map nonsense: %v\n%s", err, out)
 	}
 
-	srv, err := dbgp.Listen(dbgp.Config{Addr: "127.0.0.1:0"})
+	srv, err := dbgp.Listen(dbgp.Config{Addr: phpAddr(0)})
 	if err != nil {
 		t.Fatal(err)
 	}
-	busy := srv.Addr()
-	cmd = exec.Command(bin, "-addr", busy)
+	cmd = exec.Command(bin, "-php-port", strconv.Itoa(srv.Port()))
 	if out, err := cmd.CombinedOutput(); cmd.ProcessState.ExitCode() != 1 {
-		t.Errorf("busy address: %v\n%s", err, out)
+		t.Errorf("busy port: %v\n%s", err, out)
 	}
 	_ = srv.Close()
+	for _, port := range []string{"-1", "65536"} {
+		cmd = exec.Command(bin, "-php-port", port)
+		if out, err := cmd.CombinedOutput(); cmd.ProcessState.ExitCode() != 2 {
+			t.Errorf("-php-port %s: %v\n%s", port, err, out)
+		}
+	}
 
-	cmd = exec.Command(bin, "-addr", "127.0.0.1:0", "-break", "/app/a.php:3", "-break", "/app/b.php:5")
+	cmd = exec.Command(bin, "-php-port", "0", "-break", "/app/a.php:3", "-break", "/app/b.php:5")
 	cmd.Stdin = strings.NewReader("breaks\nquit\n")
 	out, err = cmd.CombinedOutput()
-	if err != nil || !strings.Contains(string(out), "Listening on 127.0.0.1:") ||
+	if err != nil || !strings.Contains(string(out), "Listening for PHP on port ") ||
 		!strings.Contains(string(out), "1  /app/a.php:3\n") || !strings.Contains(string(out), "2  /app/b.php:5\n") {
 		t.Errorf("session: %v\n%s", err, out)
 	}
@@ -479,6 +520,7 @@ func TestFormatVariableUnset(t *testing.T) {
 func TestListenAndUnlisten(t *testing.T) {
 	r, srv, output := newTestREPL(t)
 	addr := srv.Addr()
+	port := strconv.Itoa(srv.Port())
 	refused := func() bool {
 		conn, err := net.DialTimeout("tcp", addr, time.Second)
 		if err == nil {
@@ -514,7 +556,7 @@ func TestListenAndUnlisten(t *testing.T) {
 		"Stopped listening: new PHP connections are refused. Connected sessions carry on.\nNot listening.\n",
 		"Not listening: PHP connections are refused (use listen).\nNo sessions.\n",
 		"Error: no session, and not listening for PHP connections (use listen)\n",
-		"Listening on " + addr + ".\nAlready listening on " + addr + ".\nListening on " + addr + ".\nNo sessions.\n",
+		"Listening for PHP on port " + port + ".\nAlready listening for PHP on port " + port + ".\nListening for PHP on port " + port + ".\nNo sessions.\n",
 	} {
 		if !strings.Contains(out, want) {
 			t.Errorf("output lacks %q", want)
@@ -554,4 +596,44 @@ func TestMapAndMaps(t *testing.T) {
 	if t.Failed() {
 		t.Logf("output:\n%s", out)
 	}
+}
+
+// dbgp listens for PHP on every address of this machine, so PHP in a
+// container or on another machine reaches it as well as PHP on this one.
+func TestPHPAddrIsEveryAddress(t *testing.T) {
+	srv, err := dbgp.Listen(dbgp.Config{Addr: phpAddr(0)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer srv.Close()
+	var hosts []string
+	if lan := lanAddr(); lan != "" {
+		hosts = append(hosts, lan)
+	} else {
+		t.Log("no network address besides loopback: checking loopback only")
+	}
+	for _, host := range append(hosts, "127.0.0.1", "::1") {
+		conn, err := net.DialTimeout("tcp", net.JoinHostPort(host, strconv.Itoa(srv.Port())), time.Second)
+		if err != nil {
+			if host == "::1" {
+				t.Logf("no IPv6 loopback: %v", err)
+				continue
+			}
+			t.Errorf("PHP cannot connect on %s: %v", host, err)
+			continue
+		}
+		_ = conn.Close()
+	}
+}
+
+// lanAddr returns an IPv4 address of this machine other than loopback, or
+// "" if it has none.
+func lanAddr() string {
+	addrs, _ := net.InterfaceAddrs()
+	for _, a := range addrs {
+		if ipnet, ok := a.(*net.IPNet); ok && ipnet.IP.To4() != nil && !ipnet.IP.IsLoopback() && !ipnet.IP.IsLinkLocalUnicast() {
+			return ipnet.IP.String()
+		}
+	}
+	return ""
 }

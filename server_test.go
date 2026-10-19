@@ -9,6 +9,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -66,6 +67,8 @@ func TestServerDropsBadInit(t *testing.T) {
 		"missing nul":     "7\x00<init/>X",
 		"wrong root":      "11\x00<response/>\x00",
 		"closed too soon": "100\x00<init",
+		"huge length":     "9223372036854775807\x00",
+		"over the limit":  strconv.Itoa(maxInitPacketBytes+1) + "\x00",
 	} {
 		t.Run(name, func(t *testing.T) {
 			srv := newTestServer(t, Config{})
@@ -385,19 +388,120 @@ func TestServerBreakpointErrors(t *testing.T) {
 		t.Errorf("invalid breakpoints were kept: %+v", srv.Breakpoints())
 	}
 
-	// A breakpoint the engine rejects is reported, and retried on Continue.
-	dialFakeEngine(t, srv, fixture(t, "init"), map[string]fakeHandler{
-		"breakpoint_set": func(e *fakeEngine, cmd fakeCommand) []string {
-			return []string{errorPacket(cmd, 200, "breakpoint could not be set")}
-		},
-		"run": reply("run_break"),
+	// A breakpoint the engine rejects is reported once, here by
+	// AddBreakpoint, and not sent again: Continue runs without it.
+	e := dialFakeEngine(t, srv, fixture(t, "init"), map[string]fakeHandler{
+		"breakpoint_set": rejectBreakpoints,
+		"run":            reply("run_break"),
 	})
 	sess := waitSession(t, srv)
 	if _, err := srv.AddBreakpoint(Breakpoint{File: "/app/basic.php", Line: 3}); err == nil || !strings.Contains(err.Error(), "session 1") {
 		t.Errorf("AddBreakpoint err = %v, want session 1 error", err)
 	}
-	if _, err := sess.Continue(context.Background(), ContinueRun, time.Second); err == nil || !strings.Contains(err.Error(), "200") {
-		t.Errorf("Continue err = %v, want breakpoint error 200", err)
+	e.ClearReceived()
+	if st, err := sess.Continue(context.Background(), ContinueRun, time.Second); err != nil || st.Status != StatusBreak {
+		t.Errorf("Continue after the rejection was reported = %+v, %v; want it to run", st, err)
+	}
+	if got := breakpointCommands(e); len(got) != 0 {
+		t.Errorf("rejected breakpoint sent again: %q", got)
+	}
+}
+
+// rejectBreakpoints answers breakpoint_set as an engine that cannot set it.
+func rejectBreakpoints(e *fakeEngine, cmd fakeCommand) []string {
+	return []string{errorPacket(cmd, 200, "breakpoint could not be set")}
+}
+
+// commandNames returns the names of the commands e received.
+func commandNames(e *fakeEngine) string {
+	var names []string
+	for _, cmd := range e.Received() {
+		names = append(names, cmd.Name)
+	}
+	return strings.Join(names, " ")
+}
+
+// A breakpoint rejected while the session was set up is reported by the
+// first Continue, which does not resume the script; the next one runs
+// without it.
+func TestRejectedBreakpointReportedByFirstContinue(t *testing.T) {
+	srv := newTestServer(t, Config{})
+	if _, err := srv.AddBreakpoint(Breakpoint{File: "/app/basic.php", Line: 3}); err != nil {
+		t.Fatal(err)
+	}
+	e := dialFakeEngine(t, srv, fixture(t, "init"), map[string]fakeHandler{
+		"breakpoint_set": rejectBreakpoints,
+		"run":            reply("run_break"),
+	})
+	sess := waitSession(t, srv)
+	e.ClearReceived()
+
+	_, err := sess.Continue(context.Background(), ContinueRun, time.Second)
+	if err == nil || !strings.Contains(err.Error(), "200") || !strings.Contains(err.Error(), "not resumed") {
+		t.Errorf("first Continue err = %v, want the rejection, not resumed", err)
+	}
+	if got := commandNames(e); got != "" {
+		t.Errorf("first Continue sent %q, want nothing", got)
+	}
+	st, err := sess.Continue(context.Background(), ContinueRun, time.Second)
+	if err != nil || st.Status != StatusBreak {
+		t.Errorf("second Continue = %+v, %v; want it to run", st, err)
+	}
+	if got := commandNames(e); got != "run" {
+		t.Errorf("second Continue sent %q, want only run", got)
+	}
+}
+
+// A path mapping change retries rejected breakpoints, as the new path may
+// be accepted; removing a rejected breakpoint forgets it.
+func TestRejectedBreakpointRetriedAfterPathMapping(t *testing.T) {
+	srv := newTestServer(t, Config{})
+	accept := false
+	var mu sync.Mutex
+	e := dialFakeEngine(t, srv, fixture(t, "init"), map[string]fakeHandler{
+		"breakpoint_set": func(e *fakeEngine, cmd fakeCommand) []string {
+			mu.Lock()
+			defer mu.Unlock()
+			if !accept {
+				return rejectBreakpoints(e, cmd)
+			}
+			return reply("breakpoint_set_line")(e, cmd)
+		},
+		"breakpoint_remove": reply("breakpoint_remove"),
+	})
+	sess := waitSession(t, srv)
+	rejected, err := srv.AddBreakpoint(Breakpoint{File: "/home/me/app/basic.php", Line: 3})
+	if err == nil {
+		t.Fatal("AddBreakpoint: the engine's rejection was not reported")
+	}
+
+	mu.Lock()
+	accept = true
+	mu.Unlock()
+	e.ClearReceived()
+	if err := srv.AddPathMapping(PathMapping{Local: "/home/me/app", Remote: "/app"}); err != nil {
+		t.Fatalf("AddPathMapping: %v", err)
+	}
+	if got := breakpointCommands(e); len(got) != 1 || got[0] != "breakpoint_set -t line -f file:///app/basic.php -n 3" {
+		t.Errorf("after the mapping: %q, want the breakpoint set with its new path", got)
+	}
+
+	// A breakpoint that stays rejected is forgotten once removed.
+	mu.Lock()
+	accept = false
+	mu.Unlock()
+	second, err := srv.AddBreakpoint(Breakpoint{File: "/home/me/app/other.php", Line: 5})
+	if err == nil {
+		t.Fatal("AddBreakpoint: the second rejection was not reported")
+	}
+	if err := srv.RemoveBreakpoint(second.ID); err != nil {
+		t.Fatal(err)
+	}
+	sess.syncMu.Lock()
+	n, wasSet := len(sess.rejected), sess.bpIDs[rejected.ID] != 0
+	sess.syncMu.Unlock()
+	if n != 0 || !wasSet {
+		t.Errorf("rejected = %d entries, first breakpoint set %v; want none, and set", n, wasSet)
 	}
 }
 
@@ -651,5 +755,160 @@ func TestBreakpointChangesSkipFinishedSessions(t *testing.T) {
 	change("stopped")
 	if err := srv.RemoveBreakpoint(bp.ID); err != nil {
 		t.Errorf("removing the first breakpoint: %v", err)
+	}
+}
+
+// setLimits lowers srv's connection limits for a test.
+func setLimits(srv *Server, handshakes, live int) {
+	srv.mu.Lock()
+	defer srv.mu.Unlock()
+	srv.maxHandshakes, srv.maxLiveSessions = handshakes, live
+}
+
+// Connections that have not sent their init packet are limited: beyond
+// the limit, new ones are closed at once.
+func TestServerLimitsHandshakes(t *testing.T) {
+	srv := newTestServer(t, Config{InitTimeout: time.Minute})
+	setLimits(srv, 2, maxLiveSessions)
+	silent := []net.Conn{dialServer(t, srv), dialServer(t, srv)}
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		srv.mu.Lock()
+		n := len(srv.handshakes)
+		srv.mu.Unlock()
+		if n == 2 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("%d handshakes, want 2", n)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	extra := dialServer(t, srv)
+	_ = extra.SetReadDeadline(time.Now().Add(3 * time.Second))
+	if _, err := extra.Read(make([]byte, 1)); err != io.EOF {
+		t.Errorf("connection beyond the limit: read %v, want it closed", err)
+	}
+
+	// Once they go, PHP can connect again.
+	for _, c := range silent {
+		_ = c.Close()
+	}
+	deadline = time.Now().Add(3 * time.Second)
+	for {
+		srv.mu.Lock()
+		n := len(srv.handshakes)
+		srv.mu.Unlock()
+		if n == 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("%d handshakes left after closing them", n)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	dialFakeEngine(t, srv, fixture(t, "init"), standardHandlers())
+	waitSession(t, srv)
+}
+
+// Live sessions are limited: beyond the limit, new scripts are detached
+// so they run on without the debugger.
+func TestServerLimitsLiveSessions(t *testing.T) {
+	srv := newTestServer(t, Config{})
+	setLimits(srv, maxHandshakes, 1)
+	first := dialFakeEngine(t, srv, fixture(t, "init"), standardHandlers())
+	waitSession(t, srv)
+
+	extra := dialFakeEngine(t, srv, fixture(t, "init"), standardHandlers())
+	if !extra.WaitClosed(3 * time.Second) {
+		t.Fatal("server kept a session beyond the limit")
+	}
+	if cmds := extra.Received(); len(cmds) != 1 || cmds[0].Raw != "detach -i 1" {
+		t.Errorf("session beyond the limit got %+v, want a single detach", cmds)
+	}
+
+	// An ended session no longer counts.
+	first.Close()
+	select {
+	case <-srv.Session(1).Done():
+	case <-time.After(3 * time.Second):
+		t.Fatal("session 1 did not end")
+	}
+	dialFakeEngine(t, srv, fixture(t, "init"), standardHandlers())
+	if sess := waitSession(t, srv); sess.ID() != 2 {
+		t.Errorf("session %d, want 2", sess.ID())
+	}
+}
+
+// waitForSessionID waits up to 5s for srv to have session id, without
+// taking it.
+func waitForSessionID(t *testing.T, srv *Server, id int) *Session {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if sess := srv.Session(id); sess != nil {
+			return sess
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("no session %d", id)
+	return nil
+}
+
+// Sessions nobody takes within ClaimTimeout are detached, so their scripts
+// run on; taken ones, by WaitForSession or Claim, are kept.
+func TestServerDetachesUnclaimedSessions(t *testing.T) {
+	const timeout = 200 * time.Millisecond
+	srv := newTestServer(t, Config{ClaimTimeout: timeout})
+
+	unclaimed := dialFakeEngine(t, srv, fixture(t, "init"), standardHandlers())
+	sess := waitForSessionID(t, srv, 1)
+	if !unclaimed.WaitClosed(3 * time.Second) {
+		t.Fatal("unclaimed session was not detached")
+	}
+	if cmd := unclaimed.Received(); cmd[len(cmd)-1].Name != "detach" {
+		t.Errorf("unclaimed session got %v, want detach last", cmd)
+	}
+	<-sess.Done()
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	if got, err := srv.WaitForSession(ctx); err == nil {
+		t.Errorf("WaitForSession returned detached session %d", got.ID())
+	}
+
+	waited := dialFakeEngine(t, srv, fixture(t, "init"), standardHandlers())
+	waitSession(t, srv)
+	claimed := dialFakeEngine(t, srv, fixture(t, "init"), standardHandlers())
+	if !srv.Claim(waitForSessionID(t, srv, 3)) {
+		t.Error("Claim of a new session = false")
+	}
+	if srv.Claim(srv.Session(3)) || srv.Claim(srv.Session(2)) {
+		t.Error("Claim of a taken session = true")
+	}
+	time.Sleep(3 * timeout)
+	for _, e := range []*fakeEngine{waited, claimed} {
+		for _, cmd := range e.Received() {
+			if cmd.Name == "detach" {
+				t.Errorf("taken session was detached")
+			}
+		}
+	}
+	for _, id := range []int{2, 3} {
+		if srv.Session(id).State().Closed {
+			t.Errorf("session %d ended", id)
+		}
+	}
+	ctx, cancel = context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	if got, err := srv.WaitForSession(ctx); err == nil {
+		t.Errorf("WaitForSession returned claimed session %d", got.ID())
+	}
+}
+
+func TestSessionRemoteAddr(t *testing.T) {
+	sess, _ := startFakeSession(t, standardHandlers())
+	if host, _, _ := net.SplitHostPort(sess.RemoteAddr().String()); host != "127.0.0.1" {
+		t.Errorf("RemoteAddr() = %s, want 127.0.0.1", sess.RemoteAddr())
 	}
 }

@@ -11,6 +11,9 @@
 #
 # sudo is used only when INSTALL_DIR is not writable.
 #
+# The download is checked against the release's SHA256SUMS before it is
+# installed.
+#
 # Because the archive is fetched with curl/wget (not a browser), the binary is
 # not quarantined, so macOS Gatekeeper does not block it. As a safety net the
 # script also clears the quarantine attribute if present.
@@ -49,18 +52,32 @@ esac
 
 ASSET="dbgp-${OS}-${ARCH}.tar.gz"
 if [ -n "$VERSION" ]; then
-	URL="https://github.com/$REPO/releases/download/$VERSION/$ASSET"
+	BASE="https://github.com/$REPO/releases/download/$VERSION"
 	info "Installing $BIN $VERSION ($OS/$ARCH)"
 else
 	# The releases/latest/download URL always resolves to the newest release.
-	URL="https://github.com/$REPO/releases/latest/download/$ASSET"
+	BASE="https://github.com/$REPO/releases/latest/download"
 	info "Installing $BIN (latest, $OS/$ARCH)"
 fi
 
-# --- download + extract ---
+# --- checksum tool ---
+if have sha256sum; then
+	sha256() { sha256sum "$1" | awk '{ print $1 }'; }
+elif have shasum; then
+	sha256() { shasum -a 256 "$1" | awk '{ print $1 }'; }
+else
+	fail "need sha256sum or shasum to check the download"
+fi
+
+# --- download, check + extract ---
 tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT INT TERM
-download "$URL" "$tmp/$ASSET" || fail "failed to download $URL"
+download "$BASE/$ASSET" "$tmp/$ASSET" || fail "failed to download $BASE/$ASSET"
+download "$BASE/SHA256SUMS" "$tmp/SHA256SUMS" || fail "failed to download $BASE/SHA256SUMS"
+want="$(awk -v f="$ASSET" '$2 == f || $2 == "*" f { print $1; exit }' "$tmp/SHA256SUMS")"
+[ -n "$want" ] || fail "SHA256SUMS has no checksum for $ASSET"
+got="$(sha256 "$tmp/$ASSET")"
+[ "$got" = "$want" ] || fail "$ASSET does not match its checksum (got $got, want $want): not installing it"
 tar -xzf "$tmp/$ASSET" -C "$tmp" || fail "failed to extract $ASSET"
 [ -f "$tmp/$BIN" ] || fail "archive did not contain $BIN"
 chmod +x "$tmp/$BIN"

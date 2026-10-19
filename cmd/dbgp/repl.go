@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"net"
 	"os"
 	"path/filepath"
 	"slices"
@@ -41,8 +42,10 @@ type repl struct {
 	notesFrom  map[int]int        // per session: notifications already shown
 }
 
+// newREPL returns a REPL that writes to out, through safeText: what it
+// prints comes largely from the debugged script.
 func newREPL(srv *dbgp.Server, out io.Writer) *repl {
-	return &repl{srv: srv, out: out, outputFrom: map[int]int{}, notesFrom: map[int]int{}}
+	return &repl{srv: srv, out: safeWriter{out}, outputFrom: map[int]int{}, notesFrom: map[int]int{}}
 }
 
 func (r *repl) printf(format string, args ...any) {
@@ -69,6 +72,9 @@ func (r *repl) run(lines lineReader) {
 	}
 }
 
+// prompt returns the prompt, which shows the selected session's status.
+// The terminal reader prints it itself, so it is made safe here: the status
+// comes from the engine.
 func (r *repl) prompt() string {
 	s := r.session()
 	if s == nil {
@@ -78,7 +84,7 @@ func (r *repl) prompt() string {
 	if ended(st) {
 		return fmt.Sprintf("(dbgp %d:ended) ", s.ID())
 	}
-	return fmt.Sprintf("(dbgp %d:%s) ", s.ID(), st.Status)
+	return safeText(fmt.Sprintf("(dbgp %d:%s) ", s.ID(), st.Status))
 }
 
 func (r *repl) session() *dbgp.Session {
@@ -107,11 +113,22 @@ func (r *repl) announceSessions() {
 				r.onPrompt(r.prompt())
 			}
 		}
-		r.printf("\n[session %d connected: %s%s]\n", s.ID(), s.Script(), note)
+		r.printf("\n[session %d connected%s: %s%s]\n", s.ID(), fromElsewhere(s), s.Script(), note)
 		for _, w := range s.SetupWarnings() {
 			r.printf("[session %d warning: %s]\n", s.ID(), w)
 		}
 	}
+}
+
+// fromElsewhere names the address a session connected from, unless it is
+// this machine: dbgp accepts PHP from every network the machine is on, so a
+// session from elsewhere may not be the user's.
+func fromElsewhere(s *dbgp.Session) string {
+	host := remoteHost(s)
+	if ip := net.ParseIP(host); ip != nil && ip.IsLoopback() {
+		return ""
+	}
+	return " from " + host
 }
 
 // cancelOnInterrupt cancels the running command on Ctrl-C.
@@ -335,13 +352,13 @@ func (r *repl) cmdMaps(context.Context, string) error {
 
 func (r *repl) cmdListen(context.Context, string) error {
 	if r.srv.Listening() {
-		r.printf("Already listening on %s.\n", r.srv.Addr())
+		r.printf("Already listening for PHP on port %d.\n", r.srv.Port())
 		return nil
 	}
 	if err := r.srv.StartListening(); err != nil {
 		return err
 	}
-	r.printf("Listening on %s.\n", r.srv.Addr())
+	r.printf("Listening for PHP on port %d.\n", r.srv.Port())
 	r.printListenWarnings()
 	return nil
 }
@@ -367,7 +384,7 @@ func (r *repl) cmdUnlisten(context.Context, string) error {
 
 func (r *repl) cmdSessions(context.Context, string) error {
 	if r.srv.Listening() {
-		r.printf("Listening on %s.\n", r.srv.Addr())
+		r.printf("Listening for PHP on port %d.\n", r.srv.Port())
 	} else {
 		r.printf("Not listening: PHP connections are refused (use listen).\n")
 	}
@@ -382,7 +399,7 @@ func (r *repl) cmdSessions(context.Context, string) error {
 		if s == cur {
 			mark = "*"
 		}
-		r.printf("%s %d  %-9s %s\n", mark, s.ID(), describeStatus(s.State()), s.Script())
+		r.printf("%s %d  %-9s %s%s\n", mark, s.ID(), describeStatus(s.State()), s.Script(), fromElsewhere(s))
 	}
 	return nil
 }
@@ -427,7 +444,8 @@ func continueWith(command string) func(r *repl, ctx context.Context, args string
 		}
 		st, err := s.Continue(ctx, command, forever)
 		if errors.Is(err, context.Canceled) {
-			r.printf("Interrupted; the script is still running. The next command waits for it to stop.\n")
+			r.printf("Interrupted; the script is still running. The next command waits for it to stop,\n" +
+				"except detach, which lets it run on without the debugger.\n")
 			return nil
 		}
 		if err != nil {
@@ -774,7 +792,7 @@ func (r *repl) cmdValue(ctx context.Context, args string) error {
 	if err != nil {
 		return err
 	}
-	v, err := s.GetPropertyValue(name, opts)
+	v, _, err := s.GetPropertyValue(name, opts)
 	if err != nil {
 		return err
 	}
@@ -952,9 +970,14 @@ func (r *repl) cmdStop(ctx context.Context, _ string) error {
 }
 
 func (r *repl) cmdDetach(ctx context.Context, _ string) error {
-	s, err := r.live(ctx)
-	if err != nil {
-		return err
+	// A running script is detached at once, not waited for: it may never
+	// stop, e.g. stuck in a loop.
+	s := r.session()
+	if s == nil || s.State().Status != dbgp.StatusRunning {
+		var err error
+		if s, err = r.live(ctx); err != nil {
+			return err
+		}
 	}
 	if err := s.Detach(); err != nil {
 		return err

@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
+	"unicode/utf8"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 	dbgp "github.com/php-debugger/dbgp-client"
@@ -48,7 +50,7 @@ type frameInfo struct {
 }
 
 type stackInput struct {
-	Session int `json:"session,omitempty" jsonschema:"the session id; defaults to the newest session that has not ended"`
+	Session int `json:"session,omitempty" jsonschema:"the session id; defaults to the one wait_for_session last returned or you last named"`
 	Page    int `json:"page,omitempty" jsonschema:"the page of frames, from 0 (the default); see pages"`
 }
 
@@ -59,8 +61,8 @@ type stackOutput struct {
 	Pages   int         `json:"pages" jsonschema:"how many pages of frames there are; call stack with page for the others"`
 }
 
-func (t *tools) stack(_ context.Context, _ *mcp.CallToolRequest, in stackInput) (*mcp.CallToolResult, stackOutput, error) {
-	s, err := t.session(in.Session)
+func (t *tools) stack(_ context.Context, req *mcp.CallToolRequest, in stackInput) (*mcp.CallToolResult, stackOutput, error) {
+	s, err := t.session(req, in.Session)
 	if err != nil {
 		return nil, stackOutput{}, err
 	}
@@ -81,7 +83,7 @@ func (t *tools) stack(_ context.Context, _ *mcp.CallToolRequest, in stackInput) 
 
 // frameInput picks where to look for variables.
 type frameInput struct {
-	Session int `json:"session,omitempty" jsonschema:"the session id; defaults to the newest session that has not ended"`
+	Session int `json:"session,omitempty" jsonschema:"the session id; defaults to the one wait_for_session last returned or you last named"`
 	Depth   int `json:"depth,omitempty" jsonschema:"the stack frame: 0 (the default) is where execution stopped, 1 its caller, and so on; see stack"`
 	Context int `json:"context,omitempty" jsonschema:"0 (the default) local variables, 1 superglobals such as $_SERVER and $_GET, 2 user-defined constants"`
 	Page    int `json:"page,omitempty" jsonschema:"the page of variables, from 0 (the default); see pages"`
@@ -143,8 +145,8 @@ type variablesOutput struct {
 	Pages     int            `json:"pages" jsonschema:"how many pages of variables there are; call variables with page for the others"`
 }
 
-func (t *tools) variables(_ context.Context, _ *mcp.CallToolRequest, in frameInput) (*mcp.CallToolResult, variablesOutput, error) {
-	s, err := t.session(in.Session)
+func (t *tools) variables(_ context.Context, req *mcp.CallToolRequest, in frameInput) (*mcp.CallToolResult, variablesOutput, error) {
+	s, err := t.session(req, in.Session)
 	if err != nil {
 		return nil, variablesOutput{}, err
 	}
@@ -164,7 +166,7 @@ func (t *tools) variables(_ context.Context, _ *mcp.CallToolRequest, in frameInp
 }
 
 type variableInput struct {
-	Session int    `json:"session,omitempty" jsonschema:"the session id; defaults to the newest session that has not ended"`
+	Session int    `json:"session,omitempty" jsonschema:"the session id; defaults to the one wait_for_session last returned or you last named"`
 	Name    string `json:"name" jsonschema:"the variable, or a path into one, e.g. $user, $user[\"name\"] or $obj->cache"`
 	Depth   int    `json:"depth,omitempty" jsonschema:"the stack frame: 0 (the default) is where execution stopped, 1 its caller, and so on; see stack"`
 	Context int    `json:"context,omitempty" jsonschema:"0 (the default) local variables, 1 superglobals such as $_SERVER and $_GET, 2 user-defined constants"`
@@ -178,8 +180,8 @@ type variableOutput struct {
 	Pages    int            `json:"pages" jsonschema:"how many pages of elements or properties there are; call variable with page for the others"`
 }
 
-func (t *tools) variable(_ context.Context, _ *mcp.CallToolRequest, in variableInput) (*mcp.CallToolResult, variableOutput, error) {
-	s, err := t.session(in.Session)
+func (t *tools) variable(_ context.Context, req *mcp.CallToolRequest, in variableInput) (*mcp.CallToolResult, variableOutput, error) {
+	s, err := t.session(req, in.Session)
 	if err != nil {
 		return nil, variableOutput{}, err
 	}
@@ -204,7 +206,7 @@ func (t *tools) variable(_ context.Context, _ *mcp.CallToolRequest, in variableI
 }
 
 type variableValueInput struct {
-	Session int    `json:"session,omitempty" jsonschema:"the session id; defaults to the newest session that has not ended"`
+	Session int    `json:"session,omitempty" jsonschema:"the session id; defaults to the one wait_for_session last returned or you last named"`
 	Name    string `json:"name" jsonschema:"the variable, or a path into one, e.g. $html or $page[\"body\"]"`
 	Depth   int    `json:"depth,omitempty" jsonschema:"the stack frame: 0 (the default) is where execution stopped, 1 its caller, and so on; see stack"`
 	Context int    `json:"context,omitempty" jsonschema:"0 (the default) local variables, 1 superglobals such as $_SERVER and $_GET, 2 user-defined constants"`
@@ -218,23 +220,30 @@ type variableValueOutput struct {
 	Next  int    `json:"next,omitempty" jsonschema:"where the rest of the value starts: call variable_value again with this offset; absent when the value is complete"`
 }
 
-func (t *tools) variableValue(_ context.Context, _ *mcp.CallToolRequest, in variableValueInput) (*mcp.CallToolResult, variableValueOutput, error) {
-	s, err := t.session(in.Session)
+func (t *tools) variableValue(_ context.Context, req *mcp.CallToolRequest, in variableValueInput) (*mcp.CallToolResult, variableValueOutput, error) {
+	s, err := t.session(req, in.Session)
 	if err != nil {
 		return nil, variableValueOutput{}, err
 	}
 	if in.Name == "" {
 		return nil, variableValueOutput{}, errors.New("name is required, e.g. $html")
 	}
-	value, err := s.GetPropertyValue(in.Name, dbgp.PropertyOptions{Depth: in.Depth, Context: in.Context})
+	if in.Offset < 0 || in.Offset > math.MaxInt32 {
+		return nil, variableValueOutput{}, fmt.Errorf("offset must be from 0 to the size of %s", in.Name)
+	}
+	// The engine sends a value's first bytes, not a range: ask for those up
+	// to the end of this part, not the whole value each time, and a few more
+	// so that the part can end on a whole character.
+	opts := dbgp.PropertyOptions{Depth: in.Depth, Context: in.Context, MaxData: in.Offset + maxTextBytes + utf8.UTFMax}
+	value, size, err := s.GetPropertyValue(in.Name, opts)
 	if err != nil {
 		return nil, variableValueOutput{}, inspectError(s, in.Name, in.Depth, err)
 	}
-	if in.Offset < 0 || in.Offset > len(value) {
-		return nil, variableValueOutput{}, fmt.Errorf("offset must be from 0 to %d, the size of %s", len(value), in.Name)
+	if in.Offset > size || in.Offset > len(value) {
+		return nil, variableValueOutput{}, fmt.Errorf("offset must be from 0 to %d, the size of %s", size, in.Name)
 	}
-	out := variableValueOutput{Name: in.Name, Value: cutText(value[in.Offset:], maxTextBytes), Size: len(value)}
-	if end := in.Offset + len(out.Value); end < len(value) {
+	out := variableValueOutput{Name: in.Name, Value: cutText(value[in.Offset:], maxTextBytes), Size: size}
+	if end := in.Offset + len(out.Value); end < size {
 		out.Next = end
 	}
 	return nil, out, nil

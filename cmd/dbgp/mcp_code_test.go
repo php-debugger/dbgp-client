@@ -2,8 +2,11 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"strings"
 	"testing"
+
+	dbgp "github.com/php-debugger/dbgp-client"
 )
 
 func TestMCPCodeToolsCanBeLeftOut(t *testing.T) {
@@ -126,5 +129,71 @@ func TestMCPEvalDescriptionExplainsFrames(t *testing.T) {
 				t.Errorf("eval description lacks %q", want)
 			}
 		}
+	}
+}
+
+// Breakpoint conditions are PHP code the engine runs, so -no-eval turns
+// them off along with the code tools.
+func TestMCPNoEvalTurnsOffConditions(t *testing.T) {
+	for _, allowCode := range []bool{true, false} {
+		cs, srv := newTestMCPOn(t, "127.0.0.1:0", allowCode)
+		res, err := cs.ListTools(context.Background(), nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, tool := range res.Tools {
+			if tool.Name != "add_breakpoint" {
+				continue
+			}
+			data, _ := json.Marshal(tool.InputSchema)
+			var schema struct {
+				Properties map[string]any `json:"properties"`
+			}
+			if err := json.Unmarshal(data, &schema); err != nil {
+				t.Fatal(err)
+			}
+			if _, ok := schema.Properties["condition"]; ok != allowCode {
+				t.Errorf("allowCode %v: condition in the schema is %v", allowCode, ok)
+			}
+			if mentions := strings.Contains(tool.Description, "-no-eval"); mentions == allowCode {
+				t.Errorf("allowCode %v: description %q", allowCode, tool.Description)
+			}
+		}
+		if allowCode {
+			continue
+		}
+
+		// An agent that sends one anyway is refused, and nothing is added.
+		args := map[string]any{"file": "/app/a.php", "line": 3, "condition": "file_put_contents('/tmp/x', 'x')"}
+		callToolError(t, cs, "add_breakpoint", args)
+		if bps := srv.Breakpoints(); len(bps) != 0 {
+			t.Errorf("breakpoints after a refused condition = %+v", bps)
+		}
+		if instructions := cs.InitializeResult().Instructions; !strings.Contains(instructions, "conditions on\nbreakpoints") {
+			t.Errorf("instructions do not say conditions are off: %s", instructions)
+		}
+		// Breakpoints without one still work.
+		var added addBreakpointOutput
+		callTool(t, cs, "add_breakpoint", map[string]any{"file": "/app/a.php", "line": 3}, &added)
+		if added.Breakpoint.Type != "line" {
+			t.Errorf("add_breakpoint = %+v", added)
+		}
+	}
+}
+
+// The tool refuses a condition itself too, not only through its schema.
+func TestAddBreakpointRefusesConditionWithoutCode(t *testing.T) {
+	srv, err := dbgp.NewServer(dbgp.Config{Addr: "127.0.0.1:0"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer srv.Close()
+	tl := &tools{srv: srv}
+	_, _, err = tl.addBreakpoint(context.Background(), nil, addBreakpointInput{File: "/app/a.php", Line: 3, Condition: "true"})
+	if err == nil || !strings.Contains(err.Error(), "-no-eval") {
+		t.Errorf("addBreakpoint with a condition = %v, want refused for -no-eval", err)
+	}
+	if bps := srv.Breakpoints(); len(bps) != 0 {
+		t.Errorf("breakpoints = %+v, want none", bps)
 	}
 }

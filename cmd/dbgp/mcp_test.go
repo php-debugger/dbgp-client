@@ -8,6 +8,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"reflect"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -27,7 +28,13 @@ func newTestMCP(t *testing.T) (*mcp.ClientSession, *dbgp.Server) {
 // only if allowCode.
 func newTestMCPOn(t *testing.T, addr string, allowCode bool) (*mcp.ClientSession, *dbgp.Server) {
 	t.Helper()
-	srv, err := dbgp.NewServer(dbgp.Config{Addr: addr})
+	return newTestMCPWith(t, dbgp.Config{Addr: addr}, allowCode)
+}
+
+// newTestMCPWith is newTestMCPOn with the server configured by cfg.
+func newTestMCPWith(t *testing.T, cfg dbgp.Config, allowCode bool) (*mcp.ClientSession, *dbgp.Server) {
+	t.Helper()
+	srv, err := dbgp.NewServer(cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -35,7 +42,8 @@ func newTestMCPOn(t *testing.T, addr string, allowCode bool) (*mcp.ClientSession
 
 	ctx := context.Background()
 	clientTransport, serverTransport := mcp.NewInMemoryTransports()
-	ss, err := newMCPServer(srv, allowCode).Connect(ctx, serverTransport, nil)
+	server, _ := newMCPServer(srv, allowCode, false)
+	ss, err := server.Connect(ctx, serverTransport, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -119,7 +127,7 @@ func TestMCPTools(t *testing.T) {
 		t.Error("status has no output schema")
 	}
 	for _, want := range []string{"listen", "php -v", "with PHP Debugger", "do not set xdebug.mode", "remove_breakpoint",
-		"in the background", "stop or detach", "in parts"} {
+		"in the background", "stop or detach", "in parts", "__get"} {
 		if !strings.Contains(cs.InitializeResult().Instructions, want) {
 			t.Errorf("instructions lack %q: %s", want, cs.InitializeResult().Instructions)
 		}
@@ -134,7 +142,7 @@ func TestMCPStatusBeforeListening(t *testing.T) {
 	}
 	// Empty lists are [], not null, so agents need not special-case them.
 	text := resultText(res)
-	for _, want := range []string{`"listening":false`, `"address":"127.0.0.1:0"`, `"sessions":[]`, `"breakpoints":[]`, `"pathMappings":[]`} {
+	for _, want := range []string{`"listening":false`, `"port":0`, `"sessions":[]`, `"breakpoints":[]`, `"pathMappings":[]`} {
 		if !strings.Contains(text, want) {
 			t.Errorf("status text lacks %s: %s", want, text)
 		}
@@ -153,7 +161,8 @@ func TestMCPListenAndUnlisten(t *testing.T) {
 
 	var listened listenOutput
 	callTool(t, cs, "listen", nil, &listened)
-	if !listened.Listening || listened.Address != srv.Addr() || refused(listened.Address) {
+	addr := net.JoinHostPort("127.0.0.1", strconv.Itoa(listened.Port))
+	if !listened.Listening || listened.Port == 0 || listened.Port != srv.Port() || refused(addr) {
 		t.Fatalf("listen = %+v; server listening %v", listened, srv.Listening())
 	}
 	callTool(t, cs, "listen", nil, &listened)
@@ -163,13 +172,13 @@ func TestMCPListenAndUnlisten(t *testing.T) {
 
 	var status statusOutput
 	callTool(t, cs, "status", nil, &status)
-	if !status.Listening || status.Address != listened.Address {
+	if !status.Listening || status.Port != listened.Port {
 		t.Errorf("status after listen = %+v", status)
 	}
 
 	var unlistened unlistenOutput
 	callTool(t, cs, "unlisten", nil, &unlistened)
-	if unlistened.Listening || srv.Listening() || !refused(listened.Address) {
+	if unlistened.Listening || srv.Listening() || !refused(addr) {
 		t.Errorf("after unlisten: %+v, server listening %v", unlistened, srv.Listening())
 	}
 	callTool(t, cs, "status", nil, &status)
@@ -283,9 +292,9 @@ func TestMCPBinary(t *testing.T) {
 		args      []string
 		listening bool
 	}{
-		{[]string{"mcp", "-addr", "127.0.0.1:0"}, false},
-		{[]string{"mcp", "-addr", "127.0.0.1:0", "-listen"}, true},
-		{[]string{"mcp", "-addr", "127.0.0.1:0", "-no-eval"}, false},
+		{[]string{"mcp", "-php-port", "0"}, false},
+		{[]string{"mcp", "-php-port", "0", "-listen"}, true},
+		{[]string{"mcp", "-php-port", "0", "-no-eval"}, false},
 	} {
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		transport := &mcp.CommandTransport{Command: exec.CommandContext(ctx, bin, tc.args...)}
@@ -369,13 +378,12 @@ func callToolError(t *testing.T, cs *mcp.ClientSession, name string, args any) s
 
 func TestMCPAddBreakpoint(t *testing.T) {
 	cs, _ := newTestMCP(t)
-	abs, _ := filepath.Abs("app/a.php")
 	tests := []struct {
 		args map[string]any
 		want breakpointInfo
 	}{
 		{map[string]any{"file": "/app/a.php", "line": 12}, breakpointInfo{ID: 1, Type: "line", File: "/app/a.php", Line: 12}},
-		{map[string]any{"type": "line", "file": "app/a.php", "line": 3}, breakpointInfo{ID: 2, Type: "line", File: abs, Line: 3}},
+		{map[string]any{"type": "line", "file": "/app/../app/b.php", "line": 3}, breakpointInfo{ID: 2, Type: "line", File: "/app/b.php", Line: 3}},
 		{map[string]any{"file": "/app/a.php", "line": 5, "condition": "$i > 2"}, breakpointInfo{ID: 3, Type: "conditional", File: "/app/a.php", Line: 5, Condition: "$i > 2"}},
 		{map[string]any{"type": "call", "function": "add"}, breakpointInfo{ID: 4, Type: "call", Function: "add"}},
 		{map[string]any{"type": "return", "function": "add"}, breakpointInfo{ID: 5, Type: "return", Function: "add"}},
@@ -401,6 +409,8 @@ func TestMCPAddBreakpoint(t *testing.T) {
 		{map[string]any{"type": "exception"}, "needs an exception class"},
 		{map[string]any{"type": "conditional", "file": "/app/a.php", "line": 3}, "type"},
 		{map[string]any{"type": "watch", "file": "/app/a.php", "line": 3}, "type"},
+		// dbgp's working directory is not the agent's.
+		{map[string]any{"file": "app/a.php", "line": 3}, `file must be an absolute path, not "app/a.php"`},
 	} {
 		if msg := callToolError(t, cs, "add_breakpoint", tt.args); !strings.Contains(msg, tt.want) {
 			t.Errorf("add_breakpoint(%v) error = %q, want it to mention %q", tt.args, msg, tt.want)
@@ -435,7 +445,6 @@ func TestMCPRemoveBreakpoint(t *testing.T) {
 
 func TestMCPPathMappings(t *testing.T) {
 	cs, _ := newTestMCP(t)
-	abs, _ := filepath.Abs("testdata/php")
 	var listed pathMappingListOutput
 	callTool(t, cs, "path_mappings", nil, &listed)
 	if listed.PathMappings == nil || len(listed.PathMappings) != 0 {
@@ -443,9 +452,9 @@ func TestMCPPathMappings(t *testing.T) {
 	}
 	var out pathMappingsOutput
 	callTool(t, cs, "add_path_mapping", map[string]any{"local": "/home/me/app", "remote": "/var/www/html"}, &out)
-	callTool(t, cs, "add_path_mapping", map[string]any{"local": "testdata/php", "remote": "/srv/php"}, &out)
+	callTool(t, cs, "add_path_mapping", map[string]any{"local": "/srv/../srv/php", "remote": "/srv/php"}, &out)
 	callTool(t, cs, "add_path_mapping", map[string]any{"local": "/home/me/app/", "remote": "/app"}, &out)
-	want := []pathMapping{{Local: abs, Remote: "/srv/php"}, {Local: "/home/me/app", Remote: "/app"}}
+	want := []pathMapping{{Local: "/srv/php", Remote: "/srv/php"}, {Local: "/home/me/app", Remote: "/app"}}
 	if fmt.Sprint(out.PathMappings) != fmt.Sprint(want) || out.Warning != "" {
 		t.Errorf("add_path_mapping = %+v, want %+v", out, want)
 	}
@@ -455,6 +464,10 @@ func TestMCPPathMappings(t *testing.T) {
 	}
 	for _, args := range []map[string]any{{"local": "/a"}, {"remote": "/b"}, {"local": "", "remote": "/b"}} {
 		callToolError(t, cs, "add_path_mapping", args)
+	}
+	// dbgp's working directory is not the agent's.
+	if msg := callToolError(t, cs, "add_path_mapping", map[string]any{"local": "app", "remote": "/app"}); !strings.Contains(msg, `local must be an absolute path, not "app"`) {
+		t.Errorf("relative local directory: %q", msg)
 	}
 }
 
@@ -528,7 +541,7 @@ func TestMCPListenWarnings(t *testing.T) {
 	cs, _ := newTestMCPOn(t, "localhost:"+port, true)
 	var out listenOutput
 	callTool(t, cs, "listen", nil, &out)
-	if !out.Listening || out.Address != "localhost:"+port || len(out.Warnings) != 1 || !strings.Contains(out.Warnings[0], "[::1]:"+port) {
-		t.Errorf("listen = %+v, want localhost:%s with a warning about [::1]", out, port)
+	if !out.Listening || strconv.Itoa(out.Port) != port || len(out.Warnings) != 1 || !strings.Contains(out.Warnings[0], "[::1]:"+port) {
+		t.Errorf("listen = %+v, want port %s with a warning about [::1]", out, port)
 	}
 }
