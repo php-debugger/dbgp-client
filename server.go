@@ -193,6 +193,15 @@ func (s *Server) StartListening() error {
 	if len(listeners) == 0 {
 		return fmt.Errorf("listen on %s: %s", s.addr, strings.Join(failures, "; "))
 	}
+	for _, listener := range listeners {
+		if shadowed := shadowedAddr(listener); shadowed != "" {
+			for _, l := range listeners {
+				_ = l.Close()
+			}
+			return fmt.Errorf("listen on %s: another program is listening on %s, so PHP connecting there would reach it instead",
+				s.addr, shadowed)
+		}
+	}
 
 	if len(hosts) == 1 {
 		s.addr = listeners[0].Addr().String()
