@@ -45,6 +45,12 @@ that neither wait_for_session nor a tool naming it by id takes within a minute
 of connecting is detached, so its script runs on without the debugger: call
 wait_for_session right after starting the PHP code.
 
+Reading an object property that does not exist, with variable or
+variable_value, makes PHP call the object's __isset and __get methods: the
+script's own code runs, and may change its state or have other side effects.
+Listing variables and reading properties that exist run no code, so take
+property names from what variables and variable list, and do not guess them.
+
 The session tools act on the session wait_for_session last returned, or the
 last one you named by id. Each session shows the address PHP connected from:
 127.0.0.1 or ::1 for PHP on this machine. dbgp accepts PHP connections from
@@ -72,8 +78,8 @@ host.docker.internal from a Docker container.`
 // -no-eval, so agents know the code tools were left out on purpose.
 const noCodeInstructions = `
 
-The user started dbgp with -no-eval, which turns off everything that runs PHP
-code in the debugged script: the eval and set_variable tools, and conditions on
+The user started dbgp with -no-eval, which turns off running PHP code you
+write in the debugged script: the eval and set_variable tools, and conditions on
 breakpoints. So you cannot evaluate PHP, change variables or set conditional
 breakpoints. This is the user's choice, not a missing feature or an outdated
 build: do not suggest rebuilding or restarting dbgp to get them. Read values
@@ -123,7 +129,7 @@ func runMCP(args []string) int {
 	phpPort := fs.Int("php-port", defaultPHPPort, "port to listen on for PHP connections, on every address of this machine")
 	idekey := fs.String("idekey", "", "accept only sessions with this IDE key")
 	listen := fs.Bool("listen", false, "listen for PHP connections from the start, instead of waiting for the listen tool")
-	noEval := fs.Bool("no-eval", false, "turn off everything that runs PHP code in the debugged script: the eval and set_variable tools, and breakpoint conditions")
+	noEval := fs.Bool("no-eval", false, "turn off running PHP code the agent writes in the debugged script: the eval and set_variable tools, and breakpoint conditions")
 	mcpPort := fs.Int("mcp-port", defaultHTTPPort, "with start: the port agents connect to over HTTP, on "+httpHost+" only")
 	var maps listFlag
 	fs.Var(&maps, "map", "path mapping `LOCAL=REMOTE` for PHP in a container or on a server (repeatable)")
@@ -211,8 +217,8 @@ func runMCP(args []string) int {
 }
 
 // newMCPServer returns an MCP server whose tools drive srv. allowCode adds
-// what runs PHP code in the debugged script: the code tools, and conditions
-// on breakpoints. shared is for the background server, which agents share.
+// what runs the agent's PHP code in the debugged script: the code tools, and
+// conditions on breakpoints. shared is for the background server, which agents share.
 // The tools are returned too, for what they keep about agents.
 func newMCPServer(srv *dbgp.Server, allowCode, shared bool) (*mcp.Server, *tools) {
 	instructions := mcpInstructions
@@ -343,7 +349,7 @@ func pageOf[T any](items []T, n int) ([]T, int, error) {
 // tools implements the MCP tools on a dbgp server.
 type tools struct {
 	srv *dbgp.Server
-	// allowCode allows what runs PHP code in the debugged script.
+	// allowCode allows what runs the agent's PHP code in the debugged script.
 	allowCode bool
 
 	// mu guards agents, by agent id: see agentID.

@@ -127,7 +127,7 @@ func TestMCPTools(t *testing.T) {
 		t.Error("status has no output schema")
 	}
 	for _, want := range []string{"listen", "php -v", "with PHP Debugger", "do not set xdebug.mode", "remove_breakpoint",
-		"in the background", "stop or detach", "in parts"} {
+		"in the background", "stop or detach", "in parts", "__get"} {
 		if !strings.Contains(cs.InitializeResult().Instructions, want) {
 			t.Errorf("instructions lack %q: %s", want, cs.InitializeResult().Instructions)
 		}
