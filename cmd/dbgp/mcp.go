@@ -365,6 +365,9 @@ type agentState struct {
 	// wait_for_session last returned or a tool was last given by id. Not
 	// simply the newest, which anything that connects would become.
 	selected int
+	// taken holds the ids of the sessions the agent has taken, with
+	// wait_for_session or by naming them, to detach when it leaves.
+	taken map[int]bool
 	// output and warnings return only what is new since their last call,
 	// so they keep read positions per session id.
 	outputFrom, warningsFrom map[int]int
@@ -382,26 +385,60 @@ func (t *tools) agent(req *mcp.CallToolRequest) *agentState {
 		if t.agents == nil {
 			t.agents = map[string]*agentState{}
 		}
-		a = &agentState{outputFrom: map[int]int{}, warningsFrom: map[int]int{}}
+		a = &agentState{taken: map[int]bool{}, outputFrom: map[int]int{}, warningsFrom: map[int]int{}}
 		t.agents[id] = a
 	}
 	return a
 }
 
+// take makes session id a's selected session, and one it has taken.
+func (a *agentState) take(id int) {
+	a.selected = id
+	a.taken[id] = true
+}
+
 // leave forgets the agent with the given id, which has gone: it no longer
-// keeps dbgp listening.
+// keeps dbgp listening, and the sessions it took are detached, so their
+// scripts run on instead of holding their PHP workers, unless another agent
+// has taken them too.
 func (t *tools) leave(id string) error {
 	t.mu.Lock()
-	defer t.mu.Unlock()
 	a := t.agents[id]
 	if a == nil {
+		t.mu.Unlock()
 		return nil
 	}
 	delete(t.agents, id)
-	if !a.listening || t.listeners() > 0 {
-		return nil
+	var orphans []int
+	for sid := range a.taken {
+		if !t.taken(sid) {
+			orphans = append(orphans, sid)
+		}
 	}
-	return t.srv.StopListening()
+	var err error
+	if a.listening && t.listeners() == 0 {
+		err = t.srv.StopListening()
+	}
+	t.mu.Unlock()
+
+	// Outside t.mu: detaching a stopped session waits for PHP's answer.
+	for _, sid := range orphans {
+		if s := t.srv.Session(sid); s != nil && !ended(s.State()) {
+			_ = s.Detach()
+			_ = s.Close()
+		}
+	}
+	return err
+}
+
+// taken reports whether any agent has taken session id. t.mu must be held.
+func (t *tools) taken(id int) bool {
+	for _, a := range t.agents {
+		if a.taken[id] {
+			return true
+		}
+	}
+	return false
 }
 
 // listeners returns how many agents have called listen and not unlisten.

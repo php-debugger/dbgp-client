@@ -403,6 +403,74 @@ func TestMCPAgentsSharingServer(t *testing.T) {
 // On the background server, dbgp listens while any agent that called
 // listen has not called unlisten, or left: one agent does not stop PHP
 // connections that another is waiting for.
+// leaveAs tells the server at url that agent has gone, as its dbgp mcp
+// does when it ends.
+func leaveAs(t *testing.T, url, agent string) {
+	t.Helper()
+	client, err := tokenClient(url, "token", agent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	leaveServer(client, url)
+}
+
+// An agent that leaves without ending its sessions does not hold their PHP
+// processes: they are detached, unless another agent took them too.
+func TestMCPLeaveDetachesSessions(t *testing.T) {
+	requireEngine(t)
+	url, srv := newSharedMCP(t, "token")
+	a := connectAgent(t, url, "token", "agent-a")
+	b := connectAgent(t, url, "token", "agent-b")
+	callTool(t, a, "listen", nil, &listenOutput{})
+	dir := t.TempDir()
+	start := func(cs *mcp.ClientSession, name string) int {
+		t.Helper()
+		startPHP(t, srv.Port(), "-r", fmt.Sprintf(`file_put_contents(%q, "done");`, filepath.Join(dir, name)))
+		var waited waitForSessionOutput
+		callTool(t, cs, "wait_for_session", map[string]any{"wait": 10}, &waited)
+		if !waited.Connected {
+			t.Fatalf("%s did not connect", name)
+		}
+		return waited.Session.ID
+	}
+	detached := func(id int) bool {
+		t.Helper()
+		select {
+		case <-srv.Session(id).Done():
+			return true
+		case <-time.After(5 * time.Second):
+			return false
+		}
+	}
+	finished := func(name string) bool {
+		t.Helper()
+		for deadline := time.Now().Add(5 * time.Second); time.Now().Before(deadline); time.Sleep(20 * time.Millisecond) {
+			if _, err := os.Stat(filepath.Join(dir, name)); err == nil {
+				return true
+			}
+		}
+		return false
+	}
+
+	own := start(a, "own")
+	shared := start(b, "shared")
+	callTool(t, a, "output", map[string]any{"session": shared}, &outputOutput{})
+
+	leaveAs(t, url, "agent-a")
+	if !detached(own) || !finished("own") {
+		t.Error("a's session was not detached when a left")
+	}
+	select {
+	case <-srv.Session(shared).Done():
+		t.Error("the session b took too was detached when a left")
+	case <-time.After(300 * time.Millisecond):
+	}
+	leaveAs(t, url, "agent-b")
+	if !detached(shared) || !finished("shared") {
+		t.Error("the shared session was not detached when b left too")
+	}
+}
+
 func TestMCPListeningPerAgent(t *testing.T) {
 	url, srv := newSharedMCP(t, "token")
 	a := connectAgent(t, url, "token", "agent-a")
@@ -429,19 +497,11 @@ func TestMCPListeningPerAgent(t *testing.T) {
 
 	// An agent leaving, as its dbgp mcp tells the server when it ends,
 	// counts as unlisten.
-	leaveAs := func(agent string) {
-		t.Helper()
-		client, err := tokenClient(url, "token", agent)
-		if err != nil {
-			t.Fatal(err)
-		}
-		leaveServer(client, url)
-	}
-	leaveAs("agent-b")
+	leaveAs(t, url, "agent-b")
 	if !srv.Listening() {
 		t.Error("b leaving stopped a's listening")
 	}
-	leaveAs("agent-a")
+	leaveAs(t, url, "agent-a")
 	if srv.Listening() {
 		t.Error("still listening after a, the only agent listening, left")
 	}
