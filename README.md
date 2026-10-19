@@ -81,3 +81,10 @@ php app.php
 Each script or request that connects becomes a session, stopped at its start. At the prompt, `run` runs to the next breakpoint, `next`, `step` and `out` step through the code, and `stack`, `vars` and `print $user["name"]` show where it stopped. On a terminal it has line editing, tab completion and history.
 
 Type `help` at the prompt for all the commands, and see `dbgp -h` for the options, such as `-map` for PHP in a container or on a server.
+
+## Security
+
+Like any debugger, dbgp trusts the PHP that connects to it and the agent that uses it:
+
+- **The PHP port.** DBGp has no authentication: anything that can reach the port, 9003 by default, can connect as PHP and show dbgp made-up code, variables and output, which agents then read. dbgp listens on every address of this machine so that PHP in a container or on another machine can connect, so make sure only your PHP hosts and container networks can reach that port, for example with a firewall. `-idekey` accepts only sessions with that IDE key, which keeps out other PHP, but it is sent in plain text and is not a password. To debug PHP across a network you do not trust, connect through an SSH tunnel or a VPN. `dbgp mcp` only listens while an agent is debugging, and every session shows the address it connected from.
+- **The agent.** An agent using dbgp can see everything the debugged script can: its variables, including passwords and keys, and any file PHP can read. `-no-eval` stops the agent from running PHP code of its own, but does not hide anything from it.
