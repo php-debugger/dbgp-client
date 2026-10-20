@@ -526,6 +526,67 @@ func TestMCPLeaveRace(t *testing.T) {
 	}
 }
 
+// An agent that leaves without ending its MCP session, as when its dbgp mcp
+// is killed, does not leave the session behind; other agents keep theirs.
+func TestMCPLeaveClosesMCPSessions(t *testing.T) {
+	srv, err := dbgp.NewServer(dbgp.Config{Addr: phpAddr(0)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = srv.Close() })
+	server, tl := newMCPServer(srv, true, true)
+	hs := httptest.NewServer(httpHandler(server, tl, daemonState{Token: "token"}))
+	t.Cleanup(hs.Close)
+	url := hs.URL + "/mcp"
+	sessions := func() []string {
+		var ids []string
+		for ss := range server.Sessions() {
+			ids = append(ids, ss.ID())
+		}
+		return ids
+	}
+
+	waitSessions := func(want int, after string) {
+		t.Helper()
+		for deadline := time.Now().Add(5 * time.Second); len(sessions()) != want; time.Sleep(10 * time.Millisecond) {
+			if time.Now().After(deadline) {
+				t.Fatalf("MCP sessions after %s = %v, want %d", after, sessions(), want)
+			}
+		}
+	}
+
+	leaveA := attachAs(t, url, tl, "agent-a")
+	attachAs(t, url, tl, "agent-b")
+	// Neither closes its MCP session.
+	for _, agent := range []string{"agent-a", "agent-b"} {
+		callTool(t, connectAgent(t, url, "token", agent), "status", nil, &statusOutput{})
+	}
+	waitSessions(2, "two agents connected")
+	leaveA()
+	waitSessions(1, "a left")
+
+	// An agent killed right after initialize, before it sent anything
+	// with its session id.
+	leaveC := attachAs(t, url, tl, "agent-c")
+	body := `{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"c","version":"0"}}}`
+	req, err := http.NewRequest(http.MethodPost, url, strings.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Authorization", "Bearer token")
+	req.Header.Set(agentHeader, "agent-c")
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/json, text/event-stream")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = resp.Body.Close()
+	waitSessions(2, "c initialized")
+	leaveC()
+	waitSessions(1, "c left")
+}
+
 // On the background server, dbgp listens while any agent that called
 // listen has not called unlisten, or left: one agent does not stop PHP
 // connections that another is waiting for.

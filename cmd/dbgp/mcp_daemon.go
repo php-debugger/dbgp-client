@@ -18,6 +18,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strconv"
+	"sync"
 	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
@@ -439,8 +440,9 @@ func attachServer(ctx context.Context, client *http.Client, rawURL string) (io.C
 }
 
 // attach holds each request open until the agent it is from, by its
-// agentHeader, has gone, then forgets that agent.
-func attach(t *tools) http.Handler {
+// agentHeader, has gone, then forgets that agent and closes its MCP
+// sessions.
+func attach(t *tools, sessions *mcpSessions) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 		if req.Method != http.MethodPost {
 			w.Header().Set("Allow", http.MethodPost)
@@ -459,7 +461,63 @@ func attach(t *tools) http.Handler {
 		if err := t.leave(id); err != nil {
 			fmt.Fprintf(os.Stderr, "dbgp: agent left: %v\n", err)
 		}
+		sessions.close(id)
 	})
+}
+
+// mcpSessionHeader carries the id of the MCP session a request belongs to,
+// which the MCP library assigns in its answer to initialize.
+const mcpSessionHeader = "Mcp-Session-Id"
+
+// mcpSessions records which MCP sessions each agent uses, to close them when
+// it leaves: the MCP library keeps a session until its client ends it, which
+// a dbgp mcp that crashed or was killed never does.
+type mcpSessions struct {
+	server *mcp.Server
+
+	mu      sync.Mutex
+	byAgent map[string]map[string]bool // session ids, by agent id
+}
+
+// track passes requests on to next, recording the MCP session each is from
+// for the agent it is from.
+func (m *mcpSessions) track(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		agent := req.Header.Get(agentHeader)
+		m.add(agent, req.Header.Get(mcpSessionHeader))
+		next.ServeHTTP(w, req)
+		// The answer to initialize, which the session starts with.
+		m.add(agent, w.Header().Get(mcpSessionHeader))
+	})
+}
+
+func (m *mcpSessions) add(agent, session string) {
+	if agent == "" || session == "" {
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.byAgent == nil {
+		m.byAgent = map[string]map[string]bool{}
+	}
+	if m.byAgent[agent] == nil {
+		m.byAgent[agent] = map[string]bool{}
+	}
+	m.byAgent[agent][session] = true
+}
+
+// close closes the MCP sessions of the agent with the given id, which has
+// left, and forgets them.
+func (m *mcpSessions) close(agent string) {
+	m.mu.Lock()
+	ids := m.byAgent[agent]
+	delete(m.byAgent, agent)
+	m.mu.Unlock()
+	for ss := range m.server.Sessions() {
+		if ids[ss.ID()] {
+			_ = ss.Close()
+		}
+	}
 }
 
 // agentHeader carries the id of the agent a request is from, which its
@@ -540,9 +598,10 @@ func serveHTTP(ctx context.Context, server *mcp.Server, t *tools, port int) erro
 func httpHandler(server *mcp.Server, t *tools, st daemonState) http.Handler {
 	handler := mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return server },
 		&mcp.StreamableHTTPOptions{CrossOriginProtection: http.NewCrossOriginProtection()})
+	sessions := &mcpSessions{server: server}
 	mux := http.NewServeMux()
-	mux.Handle("/mcp", requireToken(st.Token, handler))
-	mux.Handle(attachPath, requireToken(st.Token, attach(t)))
+	mux.Handle("/mcp", requireToken(st.Token, sessions.track(handler)))
+	mux.Handle(attachPath, requireToken(st.Token, attach(t, sessions)))
 	mux.Handle(identifyPath, identify(st))
 	return mux
 }
