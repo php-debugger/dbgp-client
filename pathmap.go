@@ -4,8 +4,14 @@ import (
 	"fmt"
 	"net/url"
 	"path/filepath"
+	"runtime"
 	"strings"
 )
+
+// localIgnoresCase reports whether local paths are compared regardless of
+// case: on Windows, and on macOS, whose disks ignore case unless they were
+// formatted otherwise. It is a variable so tests can change it.
+var localIgnoresCase = runtime.GOOS == "windows" || runtime.GOOS == "darwin"
 
 // PathMapping maps a local directory to the directory the engine sees, for
 // PHP running in a container or on a remote server.
@@ -52,7 +58,7 @@ func (m PathMap) ToRemote(local string) string {
 	local = filepath.Clean(local)
 	best, rest := -1, ""
 	for i, pm := range m {
-		if r, ok := cutPathPrefix(local, pm.Local, string(filepath.Separator)); ok && (best < 0 || len(pm.Local) > len(m[best].Local)) {
+		if r, ok := cutPathPrefix(local, pm.Local, string(filepath.Separator), localIgnoresCase); ok && (best < 0 || len(pm.Local) > len(m[best].Local)) {
 			best, rest = i, r
 		}
 	}
@@ -67,7 +73,7 @@ func (m PathMap) ToLocal(remote string) string {
 	remote = cleanRemote(remote)
 	best, rest := -1, ""
 	for i, pm := range m {
-		if r, ok := cutPathPrefix(remote, pm.Remote, "/"); ok && (best < 0 || len(pm.Remote) > len(m[best].Remote)) {
+		if r, ok := cutPathPrefix(remote, pm.Remote, "/", false); ok && (best < 0 || len(pm.Remote) > len(m[best].Remote)) {
 			best, rest = i, r
 		}
 	}
@@ -79,25 +85,25 @@ func (m PathMap) ToLocal(remote string) string {
 
 // cutPathPrefix reports whether p is prefix or inside it, and returns the
 // remainder. Matching is by whole path components: /var/www does not
-// contain /var/www2. For a Windows prefix it ignores case, as Windows does:
-// C:\Project contains c:\project\a.php.
-func cutPathPrefix(p, prefix, sep string) (string, bool) {
-	if samePath(p, prefix) {
+// contain /var/www2. It ignores case if ignoreCase is set, and for a Windows
+// prefix, as Windows does: C:\Project contains c:\project\a.php.
+func cutPathPrefix(p, prefix, sep string, ignoreCase bool) (string, bool) {
+	if samePath(p, prefix, ignoreCase) {
 		return "", true
 	}
 	if !strings.HasSuffix(prefix, sep) {
 		prefix += sep
 	}
-	if len(p) < len(prefix) || !samePath(p[:len(prefix)], prefix) {
+	if len(p) < len(prefix) || !samePath(p[:len(prefix)], prefix, ignoreCase) {
 		return "", false
 	}
 	return p[len(prefix):], true
 }
 
 // samePath reports whether paths a and b are the same: regardless of case
-// for Windows paths, exactly for others.
-func samePath(a, b string) bool {
-	if windowsPath(a) || windowsPath(b) {
+// if ignoreCase is set or for Windows paths, exactly otherwise.
+func samePath(a, b string, ignoreCase bool) bool {
+	if ignoreCase || windowsPath(a) || windowsPath(b) {
 		return strings.EqualFold(a, b)
 	}
 	return a == b

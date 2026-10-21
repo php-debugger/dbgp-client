@@ -525,7 +525,7 @@ func (s *Server) PathMap() []PathMapping {
 }
 
 // AddPathMapping adds a mapping, or replaces the one for the same local
-// directory. It applies to every session at once: paths from the engine are
+// directory, in any case on Windows and macOS. It applies to every session at once: paths from the engine are
 // translated with it from now on, and breakpoints already set are set again
 // with their new paths, now in stopped sessions and on the next Continue in
 // running ones. The returned error lists sessions that rejected a breakpoint.
@@ -538,7 +538,7 @@ func (s *Server) AddPathMapping(m PathMapping) error {
 	s.pathsMu.Lock()
 	paths := make(PathMap, 0, len(s.paths)+1)
 	for _, old := range s.paths {
-		if !samePath(old.Local, m.Local) {
+		if !samePath(old.Local, m.Local, localIgnoresCase) {
 			paths = append(paths, old)
 		}
 	}

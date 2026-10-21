@@ -398,7 +398,7 @@ func TestPathMapWindowsCase(t *testing.T) {
 		{`C:\Project2\a.php`, `C:\Project`, `\`, "", false},
 		{"/home/Me/a.php", "/home/me", "/", "", false},
 	} {
-		if rest, ok := cutPathPrefix(tt.p, tt.prefix, tt.sep); rest != tt.rest || ok != tt.ok {
+		if rest, ok := cutPathPrefix(tt.p, tt.prefix, tt.sep, false); rest != tt.rest || ok != tt.ok {
 			t.Errorf("cutPathPrefix(%q, %q) = %q, %v; want %q, %v", tt.p, tt.prefix, rest, ok, tt.rest, tt.ok)
 		}
 	}
@@ -416,4 +416,58 @@ func TestAddPathMappingWindowsCase(t *testing.T) {
 	if got := srv.PathMap(); len(got) != 1 || got[0].Local != `c:\project` {
 		t.Errorf("PathMap = %+v, want only the newer mapping", got)
 	}
+}
+
+// On macOS and Windows, whose disks ignore case, local paths match a
+// mapping in any case. Remote paths are still compared exactly, since PHP
+// in a Linux container sees /var/www and /VAR/www as different.
+func TestPathMapLocalCase(t *testing.T) {
+	for _, ignoreCase := range []bool{true, false} {
+		setLocalIgnoresCase(t, ignoreCase)
+		m := mustPathMap(t, PathMapping{Local: "/Users/me/Project", Remote: "/var/www/html"})
+
+		local := filepath.FromSlash("/users/ME/project/src/A.php")
+		want := local // no mapping matches
+		if ignoreCase {
+			want = "/var/www/html/src/A.php" // the rest keeps its own case
+		}
+		if got := m.ToRemote(local); got != want {
+			t.Errorf("ignoreCase=%v: ToRemote(%q) = %q, want %q", ignoreCase, local, got, want)
+		}
+		// Whole components only.
+		other := filepath.FromSlash("/users/me/project2/a.php")
+		if got := m.ToRemote(other); got != other {
+			t.Errorf("ignoreCase=%v: ToRemote(%q) = %q, want it unchanged", ignoreCase, other, got)
+		}
+		if got, want := m.ToLocal("/VAR/www/html/a.php"), filepath.FromSlash("/VAR/www/html/a.php"); got != want {
+			t.Errorf("ignoreCase=%v: ToLocal = %q, want %q", ignoreCase, got, want)
+		}
+	}
+}
+
+// On macOS and Windows, a mapping for a local directory replaces one for
+// the same directory in another case.
+func TestAddPathMappingLocalCase(t *testing.T) {
+	for _, ignoreCase := range []bool{true, false} {
+		setLocalIgnoresCase(t, ignoreCase)
+		srv := newTestServer(t, Config{})
+		for _, local := range []string{"/Users/me/Project", "/users/me/project"} {
+			if err := srv.AddPathMapping(PathMapping{Local: local, Remote: "/app"}); err != nil {
+				t.Fatal(err)
+			}
+		}
+		want := 2
+		if ignoreCase {
+			want = 1
+		}
+		if got := srv.PathMap(); len(got) != want || got[len(got)-1].Local != filepath.FromSlash("/users/me/project") {
+			t.Errorf("ignoreCase=%v: PathMap = %+v, want %d mappings, ending with the newer one", ignoreCase, got, want)
+		}
+	}
+}
+
+func setLocalIgnoresCase(t *testing.T, v bool) {
+	old := localIgnoresCase
+	localIgnoresCase = v
+	t.Cleanup(func() { localIgnoresCase = old })
 }
