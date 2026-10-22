@@ -34,21 +34,6 @@ func shadowedAddr(l net.Listener) string {
 	return ""
 }
 
-// localIPs returns this machine's addresses, except link-local ones,
-// always including the loopback addresses.
-func localIPs() []net.IP {
-	ips := []net.IP{net.IPv4(127, 0, 0, 1), net.IPv6loopback}
-	addrs, _ := net.InterfaceAddrs()
-	for _, a := range addrs {
-		ipNet, ok := a.(*net.IPNet)
-		if !ok || ipNet.IP.IsLinkLocalUnicast() || ipNet.IP.IsLoopback() {
-			continue
-		}
-		ips = append(ips, ipNet.IP)
-	}
-	return ips
-}
-
 // bindInUse reports whether binding a TCP socket to ip and port fails
 // because another socket is bound there. The socket is only bound, never
 // listening, so no connection reaches it.

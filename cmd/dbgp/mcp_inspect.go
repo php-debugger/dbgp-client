@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"math"
 	"unicode/utf8"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
@@ -37,7 +36,8 @@ func (t *tools) addInspectTools(server *mcp.Server) {
 	mcp.AddTool(server, &mcp.Tool{
 		Name: "variable_value",
 		Description: "Show the whole value of a variable whose value variables or variable returned truncated, " +
-			"such as a long string. A value longer than 32 KB is returned in parts: call again with offset set to next.",
+			"such as a long string. A value longer than 32 KB is returned in parts: call again with offset set to next. " +
+			"Only the first 20 MB of a value can be read: next is not set past that.",
 		Annotations: &mcp.ToolAnnotations{ReadOnlyHint: true},
 	}, t.variableValue)
 }
@@ -220,6 +220,11 @@ type variableValueOutput struct {
 	Next  int    `json:"next,omitempty" jsonschema:"where the rest of the value starts: call variable_value again with this offset; absent when the value is complete"`
 }
 
+// maxValueOffset is the furthest variable_value can start a part: PHP sends
+// a value's first bytes up to the end of the part, and at most
+// dbgp.MaxValueBytes of them.
+const maxValueOffset = dbgp.MaxValueBytes - maxTextBytes - utf8.UTFMax
+
 func (t *tools) variableValue(_ context.Context, req *mcp.CallToolRequest, in variableValueInput) (*mcp.CallToolResult, variableValueOutput, error) {
 	s, err := t.session(req, in.Session)
 	if err != nil {
@@ -228,8 +233,12 @@ func (t *tools) variableValue(_ context.Context, req *mcp.CallToolRequest, in va
 	if in.Name == "" {
 		return nil, variableValueOutput{}, errors.New("name is required, e.g. $html")
 	}
-	if in.Offset < 0 || in.Offset > math.MaxInt32 {
+	if in.Offset < 0 {
 		return nil, variableValueOutput{}, fmt.Errorf("offset must be from 0 to the size of %s", in.Name)
+	}
+	if in.Offset > maxValueOffset {
+		return nil, variableValueOutput{}, fmt.Errorf("only the first %d MB of a value can be read: offset must be at most %d",
+			dbgp.MaxValueBytes>>20, maxValueOffset)
 	}
 	// The engine sends a value's first bytes, not a range: ask for those up
 	// to the end of this part, not the whole value each time, and a few more
@@ -243,7 +252,7 @@ func (t *tools) variableValue(_ context.Context, req *mcp.CallToolRequest, in va
 		return nil, variableValueOutput{}, fmt.Errorf("offset must be from 0 to %d, the size of %s", size, in.Name)
 	}
 	out := variableValueOutput{Name: in.Name, Value: cutText(value[in.Offset:], maxTextBytes), Size: size}
-	if end := in.Offset + len(out.Value); end < size {
+	if end := in.Offset + len(out.Value); end < size && end <= maxValueOffset {
 		out.Next = end
 	}
 	return nil, out, nil

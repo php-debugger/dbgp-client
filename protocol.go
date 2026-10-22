@@ -11,47 +11,23 @@ import (
 	"path/filepath"
 	"strings"
 	"unicode"
+
+	"golang.org/x/text/encoding/charmap"
 )
 
-// charsetReader handles non-UTF-8 XML encodings
+// charsetReader handles non-UTF-8 XML encodings, decoding as it reads, so a
+// large packet is not copied whole.
 func charsetReader(encoding string, input io.Reader) (io.Reader, error) {
 	switch strings.ToLower(encoding) {
 	case "utf-8", "us-ascii":
 		return input, nil
 	case "iso-8859-1", "latin1":
-		return decodeSingleByte(input, nil)
+		return charmap.ISO8859_1.NewDecoder().Reader(input), nil
 	case "windows-1252":
-		return decodeSingleByte(input, windows1252Overrides)
+		return charmap.Windows1252.NewDecoder().Reader(input), nil
 	default:
 		return nil, fmt.Errorf("unsupported charset: %s", encoding)
 	}
-}
-
-func decodeSingleByte(input io.Reader, overrides map[byte]rune) (io.Reader, error) {
-	data, err := io.ReadAll(input)
-	if err != nil {
-		return nil, err
-	}
-
-	runes := make([]rune, len(data))
-	for i, b := range data {
-		if overrides != nil {
-			if mapped, ok := overrides[b]; ok {
-				runes[i] = mapped
-				continue
-			}
-		}
-		runes[i] = rune(b)
-	}
-
-	return strings.NewReader(string(runes)), nil
-}
-
-var windows1252Overrides = map[byte]rune{
-	0x80: '€', 0x82: '‚', 0x83: 'ƒ', 0x84: '„', 0x85: '…', 0x86: '†', 0x87: '‡', 0x88: 'ˆ',
-	0x89: '‰', 0x8A: 'Š', 0x8B: '‹', 0x8C: 'Œ', 0x8E: 'Ž', 0x91: '‘', 0x92: '’', 0x93: '“',
-	0x94: '”', 0x95: '•', 0x96: '–', 0x97: '—', 0x98: '˜', 0x99: '™', 0x9A: 'š', 0x9B: '›',
-	0x9C: 'œ', 0x9E: 'ž', 0x9F: 'Ÿ',
 }
 
 // Status values

@@ -50,7 +50,7 @@ func TestPathMapTranslation(t *testing.T) {
 	}
 
 	// Mappings match whole path components only.
-	if got := m.ToRemote(filepath.FromSlash("/home/me/project2/a.php")); got != filepath.FromSlash("/home/me/project2/a.php") {
+	if got := m.ToRemote(filepath.FromSlash("/home/me/project2/a.php")); got != "/home/me/project2/a.php" {
 		t.Errorf("ToRemote matched a partial component: %q", got)
 	}
 	if got := m.ToLocal("/var/www/html2/a.php"); got != filepath.FromSlash("/var/www/html2/a.php") {
@@ -282,7 +282,7 @@ func TestAddPathMapping(t *testing.T) {
 	if got := e.LastCommand("breakpoint_set").Args["f"]; got != "file:///home/me/app/basic.php" {
 		t.Fatalf("breakpoint before mapping sent for %q", got)
 	}
-	if sess.Script() != "/app/basic.php" {
+	if sess.Script() != filepath.FromSlash("/app/basic.php") {
 		t.Fatalf("Script() before mapping = %q", sess.Script())
 	}
 	e.ClearReceived()
@@ -357,4 +357,117 @@ func TestAddPathMappingWhileRunning(t *testing.T) {
 	if want := "run breakpoint_remove breakpoint_set run"; strings.Join(names, " ") != want {
 		t.Errorf("commands = %q, want %q", strings.Join(names, " "), want)
 	}
+}
+
+// Windows compares paths regardless of case, so mappings for Windows paths
+// do too, on either side; other paths are compared exactly.
+func TestPathMapWindowsCase(t *testing.T) {
+	m := mustPathMap(t,
+		PathMapping{Local: "/home/me/win", Remote: `C:\Inetpub\wwwroot`},
+		PathMapping{Local: "/home/me/share", Remote: "//FileServer/php"},
+		PathMapping{Local: "/home/me/project", Remote: "/var/www/html"},
+	)
+	tests := []struct{ remote, local string }{
+		// PHP on Windows may send a path in another case: what follows the
+		// mapped directory keeps its own.
+		{"c:/inetpub/WWWROOT/Default.php", "/home/me/win/Default.php"},
+		{`C:\INETPUB\wwwroot`, "/home/me/win"},
+		{"//fileserver/PHP/app.php", "/home/me/share/app.php"},
+		// Linux paths are case-sensitive.
+		{"/VAR/www/html/a.php", "/VAR/www/html/a.php"},
+		// Whole components only, in any case.
+		{"C:/inetpub/wwwroot2/a.php", "C:/inetpub/wwwroot2/a.php"},
+	}
+	for _, tt := range tests {
+		if got := m.ToLocal(tt.remote); got != filepath.FromSlash(tt.local) {
+			t.Errorf("ToLocal(%q) = %q, want %q", tt.remote, got, filepath.FromSlash(tt.local))
+		}
+	}
+	if got := m.localPath("file:///c:/inetpub/wwwroot/x.php"); got != filepath.FromSlash("/home/me/win/x.php") {
+		t.Errorf("localPath(lower-case drive) = %q", got)
+	}
+
+	// Local Windows paths, as dbgp on Windows sees them.
+	for _, tt := range []struct {
+		p, prefix, sep, rest string
+		ok                   bool
+	}{
+		{`c:\project\src\a.php`, `C:\Project`, `\`, `src\a.php`, true},
+		{`C:\PROJECT`, `C:\Project`, `\`, "", true},
+		{`\\server\SHARE\a.php`, `\\Server\share`, `\`, "a.php", true},
+		{`C:\Project2\a.php`, `C:\Project`, `\`, "", false},
+		{"/home/Me/a.php", "/home/me", "/", "", false},
+	} {
+		if rest, ok := cutPathPrefix(tt.p, tt.prefix, tt.sep, false); rest != tt.rest || ok != tt.ok {
+			t.Errorf("cutPathPrefix(%q, %q) = %q, %v; want %q, %v", tt.p, tt.prefix, rest, ok, tt.rest, tt.ok)
+		}
+	}
+}
+
+// A mapping for a Windows directory replaces one for the same directory in
+// another case.
+func TestAddPathMappingWindowsCase(t *testing.T) {
+	srv := newTestServer(t, Config{})
+	for _, local := range []string{`C:\Project`, `c:\project`} {
+		if err := srv.AddPathMapping(PathMapping{Local: local, Remote: "/app"}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got := srv.PathMap(); len(got) != 1 || got[0].Local != `c:\project` {
+		t.Errorf("PathMap = %+v, want only the newer mapping", got)
+	}
+}
+
+// On macOS and Windows, whose disks ignore case, local paths match a
+// mapping in any case. Remote paths are still compared exactly, since PHP
+// in a Linux container sees /var/www and /VAR/www as different.
+func TestPathMapLocalCase(t *testing.T) {
+	for _, ignoreCase := range []bool{true, false} {
+		setLocalIgnoresCase(t, ignoreCase)
+		m := mustPathMap(t, PathMapping{Local: "/Users/me/Project", Remote: "/var/www/html"})
+
+		local := filepath.FromSlash("/users/ME/project/src/A.php")
+		want := filepath.ToSlash(local) // no mapping matches
+		if ignoreCase {
+			want = "/var/www/html/src/A.php" // the rest keeps its own case
+		}
+		if got := m.ToRemote(local); got != want {
+			t.Errorf("ignoreCase=%v: ToRemote(%q) = %q, want %q", ignoreCase, local, got, want)
+		}
+		// Whole components only.
+		other := filepath.FromSlash("/users/me/project2/a.php")
+		if got := m.ToRemote(other); got != filepath.ToSlash(other) {
+			t.Errorf("ignoreCase=%v: ToRemote(%q) = %q, want it unchanged", ignoreCase, other, got)
+		}
+		if got, want := m.ToLocal("/VAR/www/html/a.php"), filepath.FromSlash("/VAR/www/html/a.php"); got != want {
+			t.Errorf("ignoreCase=%v: ToLocal = %q, want %q", ignoreCase, got, want)
+		}
+	}
+}
+
+// On macOS and Windows, a mapping for a local directory replaces one for
+// the same directory in another case.
+func TestAddPathMappingLocalCase(t *testing.T) {
+	for _, ignoreCase := range []bool{true, false} {
+		setLocalIgnoresCase(t, ignoreCase)
+		srv := newTestServer(t, Config{})
+		for _, local := range []string{"/Users/me/Project", "/users/me/project"} {
+			if err := srv.AddPathMapping(PathMapping{Local: local, Remote: "/app"}); err != nil {
+				t.Fatal(err)
+			}
+		}
+		want := 2
+		if ignoreCase {
+			want = 1
+		}
+		if got := srv.PathMap(); len(got) != want || got[len(got)-1].Local != filepath.FromSlash("/users/me/project") {
+			t.Errorf("ignoreCase=%v: PathMap = %+v, want %d mappings, ending with the newer one", ignoreCase, got, want)
+		}
+	}
+}
+
+func setLocalIgnoresCase(t *testing.T, v bool) {
+	old := localIgnoresCase
+	localIgnoresCase = v
+	t.Cleanup(func() { localIgnoresCase = old })
 }

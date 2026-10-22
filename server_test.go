@@ -6,6 +6,7 @@ import (
 	"errors"
 	"io"
 	"net"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -126,6 +127,11 @@ func TestServerSessionSetup(t *testing.T) {
 			"feature_set -n notify_ok -v 1",
 			"feature_set -n resolved_breakpoints -v 1",
 			probeCommand,
+		}},
+		{"no eval", Config{NoEval: true}, []string{
+			"feature_set -n notify_ok -v 1",
+			"feature_set -n resolved_breakpoints -v 1",
+			"stdout -c 1",
 		}},
 	}
 	for _, tt := range tests {
@@ -880,11 +886,11 @@ func TestServerDetachesUnclaimedSessions(t *testing.T) {
 	waited := dialFakeEngine(t, srv, fixture(t, "init"), standardHandlers())
 	waitSession(t, srv)
 	claimed := dialFakeEngine(t, srv, fixture(t, "init"), standardHandlers())
-	if !srv.Claim(waitForSessionID(t, srv, 3)) {
-		t.Error("Claim of a new session = false")
+	if err := srv.Claim(waitForSessionID(t, srv, 3)); err != nil {
+		t.Errorf("Claim of a new session: %v", err)
 	}
-	if srv.Claim(srv.Session(3)) || srv.Claim(srv.Session(2)) {
-		t.Error("Claim of a taken session = true")
+	if err := errors.Join(srv.Claim(srv.Session(3)), srv.Claim(srv.Session(2))); err != nil {
+		t.Errorf("Claim of a taken session: %v", err)
 	}
 	time.Sleep(3 * timeout)
 	for _, e := range []*fakeEngine{waited, claimed} {
@@ -911,4 +917,99 @@ func TestSessionRemoteAddr(t *testing.T) {
 	if host, _, _ := net.SplitHostPort(sess.RemoteAddr().String()); host != "127.0.0.1" {
 		t.Errorf("RemoteAddr() = %s, want 127.0.0.1", sess.RemoteAddr())
 	}
+}
+
+// A connection that sends its init packet and then stops answering is
+// dropped once setup takes too long, which frees its handshake slot.
+func TestServerDropsSilentSetup(t *testing.T) {
+	srv := newTestServer(t, Config{})
+	setLimits(srv, 1, maxLiveSessions)
+	srv.mu.Lock()
+	srv.setupTimeout = 300 * time.Millisecond
+	srv.mu.Unlock()
+
+	silent := dialFakeEngine(t, srv, fixture(t, "init"), map[string]fakeHandler{
+		"feature_set": func(*fakeEngine, fakeCommand) []string { return nil },
+	})
+	if !silent.WaitClosed(3 * time.Second) {
+		t.Fatal("a connection that stopped answering during setup was kept")
+	}
+	// The slot is freed just after the connection is closed.
+	waitFor(t, func() bool {
+		srv.mu.Lock()
+		defer srv.mu.Unlock()
+		return len(srv.handshakes) == 0
+	})
+	dialFakeEngine(t, srv, fixture(t, "init"), standardHandlers())
+	sess := waitSession(t, srv)
+	if got := srv.Sessions(); len(got) != 1 || got[0] != sess {
+		t.Errorf("sessions = %v, want only the one that answered", got)
+	}
+}
+
+// Handshakes setting up at the same time cannot go past the live session
+// limit together.
+func TestServerLimitsConcurrentHandshakes(t *testing.T) {
+	srv := newTestServer(t, Config{})
+	setLimits(srv, maxHandshakes, 1)
+	slow := func() map[string]fakeHandler {
+		handlers := standardHandlers()
+		handlers["feature_set"] = func(e *fakeEngine, cmd fakeCommand) []string {
+			time.Sleep(100 * time.Millisecond)
+			return reply("feature_set")(e, cmd)
+		}
+		return handlers
+	}
+	var engines []*fakeEngine
+	for range 3 {
+		engines = append(engines, dialFakeEngine(t, srv, fixture(t, "init"), slow()))
+	}
+	detached := func() int {
+		n := 0
+		for _, e := range engines {
+			select {
+			case <-e.done:
+				n++
+			default:
+			}
+		}
+		return n
+	}
+	waitFor(t, func() bool { return detached() == 2 })
+	waitFor(t, func() bool { return len(srv.Sessions()) == 1 })
+	time.Sleep(200 * time.Millisecond)
+	if n := len(srv.Sessions()); n != 1 || detached() != 2 {
+		t.Errorf("%d sessions and %d detached, want 1 and 2", n, detached())
+	}
+}
+
+// While a session nobody took is being detached, nobody can claim it, so it
+// is not detached under them; once it has ended, claiming it is harmless.
+func TestClaimWhileDetachingUnclaimed(t *testing.T) {
+	answer := make(chan struct{})
+	var once sync.Once
+	answerDetach := func() { once.Do(func() { close(answer) }) }
+	defer answerDetach()
+	handlers := standardHandlers()
+	handlers["detach"] = func(e *fakeEngine, cmd fakeCommand) []string {
+		<-answer
+		return reply("detach")(e, cmd)
+	}
+	srv := newTestServer(t, Config{ClaimTimeout: 100 * time.Millisecond})
+	e := dialFakeEngine(t, srv, fixture(t, "init"), handlers)
+	sess := waitForSessionID(t, srv, 1)
+	waitFor(t, func() bool {
+		return slices.ContainsFunc(e.Received(), func(c fakeCommand) bool { return c.Name == "detach" })
+	})
+
+	if err := srv.Claim(sess); !errors.Is(err, ErrUnclaimed) {
+		t.Errorf("Claim while detaching = %v, want ErrUnclaimed", err)
+	}
+	answerDetach()
+	select {
+	case <-sess.Done():
+	case <-time.After(3 * time.Second):
+		t.Fatal("the unclaimed session did not end")
+	}
+	waitFor(t, func() bool { return srv.Claim(sess) == nil })
 }

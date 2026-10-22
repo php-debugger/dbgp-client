@@ -18,6 +18,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strconv"
+	"sync"
 	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
@@ -375,7 +376,11 @@ func bridge(ctx context.Context, st *daemonState) error {
 	if err != nil {
 		return err
 	}
-	defer leaveServer(client, st.URL)
+	presence, err := attachServer(ctx, client, st.URL)
+	if err != nil {
+		return err
+	}
+	defer presence.Close()
 	remote, err := (&mcp.StreamableClientTransport{Endpoint: st.URL, HTTPClient: client}).Connect(ctx)
 	if err != nil {
 		return err
@@ -404,36 +409,40 @@ func bridge(ctx context.Context, st *daemonState) error {
 	return nil
 }
 
-// leavePath is where dbgp mcp tells the server its agent has gone, so it
-// no longer keeps dbgp listening.
-const leavePath = "/leave"
+// attachPath is where dbgp mcp tells the server its agent is there, for as
+// long as it runs: it keeps the request open, and the server takes the
+// agent as gone when the request ends. The operating system ends it when
+// dbgp mcp ends, even when it crashes or is killed.
+const attachPath = "/attach"
 
-// leaveTimeout is how long dbgp mcp waits for the server to hear it has
-// gone.
-const leaveTimeout = 2 * time.Second
-
-// leaveServer tells the server at rawURL, through client, that the agent
-// client sends the id of has gone. It is best effort: the agent has
-// already gone, and so has its dbgp mcp when the server cannot be reached.
-func leaveServer(client *http.Client, rawURL string) {
+// attachServer tells the server at rawURL, through client, that the agent
+// client sends the id of is there, until the returned body is closed or
+// ctx is done.
+func attachServer(ctx context.Context, client *http.Client, rawURL string) (io.Closer, error) {
 	u, err := url.Parse(rawURL)
 	if err != nil {
-		return
+		return nil, err
 	}
-	u.Path = leavePath
-	ctx, cancel := context.WithTimeout(context.Background(), leaveTimeout)
-	defer cancel()
+	u.Path = attachPath
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, u.String(), nil)
 	if err != nil {
-		return
+		return nil, err
 	}
-	if resp, err := client.Do(req); err == nil {
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("attach to the background server: %w", err)
+	}
+	if resp.StatusCode != http.StatusOK {
 		_ = resp.Body.Close()
+		return nil, fmt.Errorf("attach to the background server: %s", resp.Status)
 	}
+	return resp.Body, nil
 }
 
-// leave forgets the agent each request is from, by its agentHeader.
-func leave(t *tools) http.Handler {
+// attach holds each request open until the agent it is from, by its
+// agentHeader, has gone, then forgets that agent and closes its MCP
+// sessions.
+func attach(t *tools, sessions *mcpSessions) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 		if req.Method != http.MethodPost {
 			w.Header().Set("Allow", http.MethodPost)
@@ -445,12 +454,70 @@ func leave(t *tools) http.Handler {
 			http.Error(w, "no "+agentHeader+" header", http.StatusBadRequest)
 			return
 		}
+		w.WriteHeader(http.StatusOK)
+		_ = http.NewResponseController(w).Flush()
+		// Done when dbgp mcp closes the connection or the server stops.
+		<-req.Context().Done()
 		if err := t.leave(id); err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
+			fmt.Fprintf(os.Stderr, "dbgp: agent left: %v\n", err)
 		}
-		w.WriteHeader(http.StatusNoContent)
+		sessions.close(id)
 	})
+}
+
+// mcpSessionHeader carries the id of the MCP session a request belongs to,
+// which the MCP library assigns in its answer to initialize.
+const mcpSessionHeader = "Mcp-Session-Id"
+
+// mcpSessions records which MCP sessions each agent uses, to close them when
+// it leaves: the MCP library keeps a session until its client ends it, which
+// a dbgp mcp that crashed or was killed never does.
+type mcpSessions struct {
+	server *mcp.Server
+
+	mu      sync.Mutex
+	byAgent map[string]map[string]bool // session ids, by agent id
+}
+
+// track passes requests on to next, recording the MCP session each is from
+// for the agent it is from.
+func (m *mcpSessions) track(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		agent := req.Header.Get(agentHeader)
+		m.add(agent, req.Header.Get(mcpSessionHeader))
+		next.ServeHTTP(w, req)
+		// The answer to initialize, which the session starts with.
+		m.add(agent, w.Header().Get(mcpSessionHeader))
+	})
+}
+
+func (m *mcpSessions) add(agent, session string) {
+	if agent == "" || session == "" {
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.byAgent == nil {
+		m.byAgent = map[string]map[string]bool{}
+	}
+	if m.byAgent[agent] == nil {
+		m.byAgent[agent] = map[string]bool{}
+	}
+	m.byAgent[agent][session] = true
+}
+
+// close closes the MCP sessions of the agent with the given id, which has
+// left, and forgets them.
+func (m *mcpSessions) close(agent string) {
+	m.mu.Lock()
+	ids := m.byAgent[agent]
+	delete(m.byAgent, agent)
+	m.mu.Unlock()
+	for ss := range m.server.Sessions() {
+		if ids[ss.ID()] {
+			_ = ss.Close()
+		}
+	}
 }
 
 // agentHeader carries the id of the agent a request is from, which its
@@ -526,14 +593,15 @@ func serveHTTP(ctx context.Context, server *mcp.Server, t *tools, port int) erro
 	return nil
 }
 
-// httpHandler serves MCP at /mcp and agents leaving, to requests with st's
+// httpHandler serves MCP at /mcp and agents' presence, to requests with st's
 // token, and the identity check. t are server's tools.
 func httpHandler(server *mcp.Server, t *tools, st daemonState) http.Handler {
 	handler := mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return server },
 		&mcp.StreamableHTTPOptions{CrossOriginProtection: http.NewCrossOriginProtection()})
+	sessions := &mcpSessions{server: server}
 	mux := http.NewServeMux()
-	mux.Handle("/mcp", requireToken(st.Token, handler))
-	mux.Handle(leavePath, requireToken(st.Token, leave(t)))
+	mux.Handle("/mcp", requireToken(st.Token, sessions.track(handler)))
+	mux.Handle(attachPath, requireToken(st.Token, attach(t, sessions)))
 	mux.Handle(identifyPath, identify(st))
 	return mux
 }

@@ -15,11 +15,11 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode/utf8"
 )
 
-// commandTimeout bounds how long a command waits for its response.
-// Continuation commands are not bounded by it: see Session.Continue.
-const commandTimeout = 30 * time.Second
+// defaultCommandTimeout is Config.CommandTimeout's default.
+const defaultCommandTimeout = 30 * time.Second
 
 // Continuation commands resume the script, which then runs until it stops
 // again: at a breakpoint, after the step, or at the end of the script.
@@ -33,9 +33,20 @@ const (
 // Output and notification history kept per session; older entries are
 // dropped first.
 const (
-	maxOutputBytes   = 1 << 20
-	maxNotifications = 1000
+	maxOutputBytes       = 1 << 20
+	maxNotifications     = 1000
+	maxNotificationBytes = 1 << 20
+	// maxMessageBytes bounds the text kept of one notification's message,
+	// such as a PHP warning: real ones, even with a stack trace, are
+	// shorter.
+	maxMessageBytes = 8 << 10
 )
+
+// MaxValueBytes is the most of a value GetProperty and GetPropertyValue
+// ask the engine for, whatever PropertyOptions.MaxData says: the engine
+// sends it in one packet, base64-encoded, which must stay under the packet
+// size limit.
+const MaxValueBytes = 20 << 20
 
 // maxEndedSessions is how many ended sessions a Server keeps; older ones
 // are forgotten.
@@ -70,6 +81,13 @@ type Session struct {
 	conn   net.Conn
 	init   *InitPacket
 	closed chan struct{} // closed when the read loop exits
+	// connCtx is cancelled when conn is closed.
+	connCtx context.Context
+	// cmdTimeout is Config.CommandTimeout; see commandTimeout.
+	cmdTimeout time.Duration
+	// unclaimed is set while the session is being detached because nobody
+	// took it in time. Guarded by server.mu.
+	unclaimed bool
 
 	// cmdSlot serializes commands: at most one is in flight, so an error
 	// response without a transaction_id belongs to it.
@@ -97,6 +115,7 @@ type Session struct {
 	outputBase int    // stream offset of output[0]
 	notes      []Notification
 	notesBase  int // index of notes[0] among all notifications
+	notesBytes int // size of notes, see Notification.size
 	setupErr   error
 	warnings   []string
 	engineMap  EngineMapping
@@ -184,10 +203,12 @@ type pendingCommand struct {
 // newSession starts reading responses for an engine connection whose init
 // packet has been read.
 func newSession(id int, server *Server, conn net.Conn, reader *bufio.Reader, init *InitPacket) *Session {
+	ctx, cancel := context.WithCancel(context.Background())
 	s := &Session{
 		id:       id,
 		server:   server,
-		conn:     conn,
+		conn:     &sessionConn{Conn: conn, cancel: cancel},
+		connCtx:  ctx,
 		init:     init,
 		closed:   make(chan struct{}),
 		cmdSlot:  make(chan struct{}, 1),
@@ -196,8 +217,23 @@ func newSession(id int, server *Server, conn net.Conn, reader *bufio.Reader, ini
 		state:    State{Status: StatusStarting},
 		changed:  make(chan struct{}),
 	}
+	if server != nil {
+		s.cmdTimeout = server.cfg.CommandTimeout
+	}
 	go s.readLoop(reader)
 	return s
+}
+
+// sessionConn is a session's connection, whose Close also cancels the
+// context the session reads with, so a read waiting for its turn ends too.
+type sessionConn struct {
+	net.Conn
+	cancel context.CancelFunc
+}
+
+func (c *sessionConn) Close() error {
+	c.cancel()
+	return c.Conn.Close()
 }
 
 // ID identifies the session within its server.
@@ -282,8 +318,9 @@ func (s *Session) Notifications(from int) ([]Notification, int) {
 // must not crash dbgp or make it allocate more than the data that arrives.
 const (
 	// maxPacketBytes bounds every packet. Responses can be large, such as a
-	// long string from property_value, but not this large.
-	maxPacketBytes = 256 << 20
+	// long string from property_value (see MaxValueBytes), but not larger.
+	// A larger packet ends the session.
+	maxPacketBytes = 32 << 20
 	// maxInitPacketBytes bounds the init packet, which a connection sends
 	// before it is known to be an engine. Real ones are well under 1 KB.
 	maxInitPacketBytes = 64 << 10
@@ -298,7 +335,12 @@ func readPacket(reader *bufio.Reader, limit int) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
+	return readPacketData(reader, length)
+}
 
+// readPacketData reads the length bytes of a packet's data and the NUL
+// that ends it.
+func readPacketData(reader *bufio.Reader, length int) ([]byte, error) {
 	// Grow the buffer as the data arrives rather than trusting the length.
 	var data bytes.Buffer
 	data.Grow(min(length, packetChunk))
@@ -350,27 +392,44 @@ func readPacketLength(reader *bufio.Reader, limit int) (int, error) {
 func (s *Session) readLoop(reader *bufio.Reader) {
 	defer s.finish()
 	for {
-		data, err := readPacket(reader, maxPacketBytes)
+		length, err := readPacketLength(reader, maxPacketBytes)
 		if err != nil {
 			return
 		}
-		kind, err := packetKind(data)
+		// Reading and parsing a packet takes a few times its size: the
+		// server bounds how much its sessions read at once.
+		release, err := s.server.reservePacket(s.connCtx, length)
 		if err != nil {
-			continue
+			return
 		}
-		switch kind {
-		case "response":
-			if resp, err := ParseResponse(data); err == nil {
-				s.dispatch(resp)
-			}
-		case "stream":
-			if _, text, err := ParseStream(data); err == nil {
-				s.appendOutput(text)
-			}
-		case "notify":
-			if n, err := ParseNotification(data); err == nil {
-				s.addNotification(*n)
-			}
+		data, err := readPacketData(reader, length)
+		if err != nil {
+			release()
+			return
+		}
+		s.handlePacket(data)
+		release()
+	}
+}
+
+// handlePacket parses a packet from the engine and acts on it.
+func (s *Session) handlePacket(data []byte) {
+	kind, err := packetKind(data)
+	if err != nil {
+		return
+	}
+	switch kind {
+	case "response":
+		if resp, err := ParseResponse(data); err == nil {
+			s.dispatch(resp)
+		}
+	case "stream":
+		if _, text, err := ParseStream(data); err == nil {
+			s.appendOutput(text)
+		}
+	case "notify":
+		if n, err := ParseNotification(data); err == nil {
+			s.addNotification(*n)
 		}
 	}
 }
@@ -450,17 +509,54 @@ func (s *Session) appendOutput(text string) {
 func (s *Session) addNotification(n Notification) {
 	if n.Message != nil {
 		n.Message.Filename = s.pathMap().localPath(n.Message.Filename)
+		n.Message.Text = cutUTF8(n.Message.Text, maxMessageBytes)
 	}
 	if n.Breakpoint != nil && n.Breakpoint.Filename != "" {
 		n.Breakpoint.Filename = s.pathMap().localPath(n.Breakpoint.Filename)
 	}
+	size := n.size()
+	if size > maxNotificationBytes/16 {
+		return // only a malicious engine sends one this large
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.notes = append(s.notes, n)
-	if over := len(s.notes) - maxNotifications; over > 0 {
+	s.notesBytes += size
+	over := 0
+	for len(s.notes)-over > maxNotifications || s.notesBytes > maxNotificationBytes {
+		s.notesBytes -= s.notes[over].size()
+		over++
+	}
+	if over > 0 {
 		s.notes = append([]Notification(nil), s.notes[over:]...)
 		s.notesBase += over
 	}
+}
+
+// size approximates the memory a notification takes: its strings, and a
+// little for the rest.
+func (n Notification) size() int {
+	size := 64 + len(n.Name)
+	if m := n.Message; m != nil {
+		size += len(m.Filename) + len(m.Exception) + len(m.Type) + len(m.Code) + len(m.Text)
+	}
+	if b := n.Breakpoint; b != nil {
+		size += len(b.Type) + len(b.Filename) + len(b.Function) + len(b.State) + len(b.Resolved) +
+			len(b.Exception) + len(b.HitCondition) + len(b.Expression)
+	}
+	return size
+}
+
+// cutUTF8 returns at most the first n bytes of s, ending on a whole
+// character.
+func cutUTF8(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	for n > 0 && !utf8.RuneStart(s[n]) {
+		n--
+	}
+	return s[:n]
 }
 
 // formatCommand builds a DBGp command line:
@@ -534,7 +630,7 @@ func (s *Session) checkCanSendLocked() error {
 // sendCommand sends a command and waits for its response. Commands are
 // serialized, so this also waits for any command already in flight.
 func (s *Session) sendCommand(name string, args []string, data []byte) (*Response, error) {
-	timeout := time.NewTimer(commandTimeout)
+	timeout := time.NewTimer(s.commandTimeout())
 	defer timeout.Stop()
 	if err := s.acquire(name, timeout.C); err != nil {
 		return nil, err
@@ -556,9 +652,9 @@ func (s *Session) sendCommand(name string, args []string, data []byte) (*Respons
 	s.pending = p
 	s.mu.Unlock()
 
-	if _, err := s.conn.Write([]byte(line + "\x00")); err != nil {
+	if err := s.writeCommand(line); err != nil {
 		s.clearPending(p)
-		return nil, fmt.Errorf("send command: %w", err)
+		return nil, err
 	}
 
 	select {
@@ -637,7 +733,7 @@ func (s *Session) Continue(ctx context.Context, command string, wait time.Durati
 // startContinuation sends a continuation command without waiting for the
 // script to stop; the response arrives when it does.
 func (s *Session) startContinuation(command string) error {
-	timeout := time.NewTimer(commandTimeout)
+	timeout := time.NewTimer(s.commandTimeout())
 	defer timeout.Stop()
 	if err := s.acquire(command, timeout.C); err != nil {
 		return err
@@ -662,16 +758,40 @@ func (s *Session) startContinuation(command string) error {
 	s.setStateLocked(State{Status: StatusRunning, Reason: "ok"})
 	s.mu.Unlock()
 
-	if _, err := s.conn.Write([]byte(line + "\x00")); err != nil {
+	if err := s.writeCommand(line); err != nil {
 		s.mu.Lock()
 		if s.contID == id {
 			s.contID = 0
 			s.setStateLocked(prev)
 		}
 		s.mu.Unlock()
+		return err
+	}
+	return nil
+}
+
+// writeCommand sends a command line to the engine. A peer that stops
+// reading cannot block it for longer than the command timeout. A command
+// cut short would garble the ones after it, so then the connection ends.
+func (s *Session) writeCommand(line string) error {
+	_ = s.conn.SetWriteDeadline(time.Now().Add(s.commandTimeout()))
+	_, err := s.conn.Write([]byte(line + "\x00"))
+	_ = s.conn.SetWriteDeadline(time.Time{})
+	if err != nil {
+		_ = s.conn.Close()
 		return fmt.Errorf("send command: %w", err)
 	}
 	return nil
+}
+
+// commandTimeout bounds how long a command waits to be sent and for its
+// response. Continuation commands wait for their response unbounded: see
+// Session.Continue.
+func (s *Session) commandTimeout() time.Duration {
+	if s.cmdTimeout > 0 {
+		return s.cmdTimeout
+	}
+	return defaultCommandTimeout
 }
 
 // Wait waits up to wait for a running script to stop and returns the
@@ -921,7 +1041,7 @@ func (o PropertyOptions) args(fullname string) []string {
 		args = append(args, "-p", strconv.Itoa(o.Page))
 	}
 	if o.MaxData > 0 {
-		args = append(args, "-m", strconv.Itoa(o.MaxData))
+		args = append(args, "-m", strconv.Itoa(min(o.MaxData, MaxValueBytes)))
 	}
 	return args
 }

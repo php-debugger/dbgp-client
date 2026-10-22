@@ -112,9 +112,14 @@ func (t *tools) session(req *mcp.CallToolRequest, id int) (*dbgp.Session, error)
 	if s == nil {
 		return nil, fmt.Errorf("no session %d", id)
 	}
+	if t.detaching[id] {
+		return nil, fmt.Errorf("session %d is being detached: the agent that took it has left", id)
+	}
 	// Named by id, it is taken: wait_for_session will not return it, and it
 	// is not detached for waiting too long.
-	t.srv.Claim(s)
+	if err := t.srv.Claim(s); errors.Is(err, dbgp.ErrUnclaimed) {
+		return nil, fmt.Errorf("session %d is being detached: no agent took it within a minute of connecting", id)
+	}
 	a.take(id)
 	return s, nil
 }

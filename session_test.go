@@ -5,13 +5,17 @@ import (
 	"context"
 	"encoding/base64"
 	"errors"
+	"fmt"
 	"io"
+	"path/filepath"
 	"reflect"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
 	"testing"
 	"time"
+	"unicode/utf8"
 )
 
 func TestSessionInit(t *testing.T) {
@@ -317,7 +321,7 @@ func TestResponseDecoding(t *testing.T) {
 		if want := []string{"line", "conditional", "call", "exception"}; !reflect.DeepEqual(types, want) {
 			t.Fatalf("types = %v, want %v", types, want)
 		}
-		if bps[0].ID != 42420001 || bps[0].Filename != "/app/basic.php" || bps[0].Lineno != 24 || bps[0].State != "enabled" {
+		if bps[0].ID != 42420001 || bps[0].Filename != filepath.FromSlash("/app/basic.php") || bps[0].Lineno != 24 || bps[0].State != "enabled" {
 			t.Errorf("line breakpoint = %+v", bps[0])
 		}
 		if bps[2].State != "disabled" {
@@ -330,8 +334,8 @@ func TestResponseDecoding(t *testing.T) {
 			t.Fatal(err)
 		}
 		want := []StackFrame{
-			{Level: 0, Type: "file", Filename: "/app/basic.php", Lineno: 24, Where: "add"},
-			{Level: 1, Type: "file", Filename: "/app/basic.php", Lineno: 36, Where: "{main}"},
+			{Level: 0, Type: "file", Filename: filepath.FromSlash("/app/basic.php"), Lineno: 24, Where: "add"},
+			{Level: 1, Type: "file", Filename: filepath.FromSlash("/app/basic.php"), Lineno: 36, Where: "{main}"},
 		}
 		if !reflect.DeepEqual(stack, want) {
 			t.Errorf("stack = %+v, want %+v", stack, want)
@@ -720,7 +724,7 @@ func TestContinueStopsAtBreak(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := State{Status: StatusBreak, Reason: "ok", File: "/app/basic.php", Line: lineAddBody}
+	want := State{Status: StatusBreak, Reason: "ok", File: filepath.FromSlash("/app/basic.php"), Line: lineAddBody}
 	if st != want {
 		t.Errorf("State = %+v, want %+v", st, want)
 	}
@@ -942,7 +946,7 @@ func TestNotificationsAreCollected(t *testing.T) {
 	if next != 2 || notes[0].Name != "error" || notes[1].Name != "breakpoint_resolved" {
 		t.Fatalf("Notifications = %+v, %d", notes, next)
 	}
-	want := Message{Filename: "/app/basic.php", Lineno: lineWarning, Type: "Warning", Text: "Undefined variable $undefinedVariable"}
+	want := Message{Filename: filepath.FromSlash("/app/basic.php"), Lineno: lineWarning, Type: "Warning", Text: "Undefined variable $undefinedVariable"}
 	if *notes[0].Message != want {
 		t.Errorf("error notification = %+v, want %+v", *notes[0].Message, want)
 	}
@@ -1094,5 +1098,146 @@ func TestSetPropertyFailure(t *testing.T) {
 	})
 	if err := s.SetProperty("$b", "1", PropertyOptions{}); err == nil {
 		t.Error("SetProperty succeeded although the engine reported failure")
+	}
+}
+
+// Sessions take turns reading packets when together they would read more
+// than the server allows at once, and a session waiting for its turn still
+// ends when it is closed.
+func TestPacketBudget(t *testing.T) {
+	sess, e := startFakeSession(t, standardHandlers())
+	srv := sess.server
+	stream := `<stream xmlns="urn:debugger_protocol_v1" type="stdout" encoding="base64">` +
+		base64.StdEncoding.EncodeToString([]byte("hi")) + `</stream>`
+
+	// With the whole budget taken, the packet waits.
+	if err := srv.packetBudget.Acquire(context.Background(), maxPacketsInFlight); err != nil {
+		t.Fatal(err)
+	}
+	e.Send(stream)
+	time.Sleep(100 * time.Millisecond)
+	if text, _, _ := sess.Output(0); text != "" {
+		t.Fatalf("output %q read without budget", text)
+	}
+	srv.packetBudget.Release(maxPacketsInFlight)
+	waitFor(t, func() bool { text, _, _ := sess.Output(0); return text == "hi" })
+
+	// Closing the session ends the wait.
+	if err := srv.packetBudget.Acquire(context.Background(), maxPacketsInFlight); err != nil {
+		t.Fatal(err)
+	}
+	defer srv.packetBudget.Release(maxPacketsInFlight)
+	e.Send(stream)
+	time.Sleep(100 * time.Millisecond)
+	_ = sess.Close()
+	select {
+	case <-sess.Done():
+	case <-time.After(3 * time.Second):
+		t.Fatal("session waiting for budget did not end when closed")
+	}
+}
+
+// Notifications are bounded in bytes too, and each message in length.
+func TestNotificationBytesAreBounded(t *testing.T) {
+	s := &Session{}
+	long := strings.Repeat("é", maxMessageBytes) // two bytes each
+	for i := 0; i < maxNotifications; i++ {
+		s.addNotification(Notification{Name: strconv.Itoa(i), Message: &Message{Text: long}})
+	}
+	notes, next := s.Notifications(0)
+	if next != maxNotifications {
+		t.Errorf("next = %d, want %d", next, maxNotifications)
+	}
+	text := notes[len(notes)-1].Message.Text
+	if len(text) > maxMessageBytes || len(text) < maxMessageBytes-1 || !utf8.ValidString(text) {
+		t.Errorf("message cut to %d bytes, valid UTF-8 %v; want about %d", len(text), utf8.ValidString(text), maxMessageBytes)
+	}
+	total := 0
+	for _, n := range notes {
+		total += n.size()
+	}
+	if total > maxNotificationBytes || s.notesBytes != total || len(notes) == maxNotifications {
+		t.Errorf("%d notes of %d bytes (counted %d), want at most %d bytes, oldest dropped",
+			len(notes), total, s.notesBytes, maxNotificationBytes)
+	}
+
+	// One far too large to be real is dropped.
+	s.addNotification(Notification{Name: "huge", Message: &Message{Filename: strings.Repeat("x", maxNotificationBytes)}})
+	if _, after := s.Notifications(0); after != next {
+		t.Errorf("a huge notification was kept")
+	}
+}
+
+func TestPropertyMaxDataIsCapped(t *testing.T) {
+	args := PropertyOptions{MaxData: 1 << 30}.args("$big")
+	if got := args[len(args)-1]; got != strconv.Itoa(MaxValueBytes) {
+		t.Errorf("args = %v, want -m %d", args, MaxValueBytes)
+	}
+}
+
+// A command the engine does not answer fails after Config.CommandTimeout.
+func TestCommandTimeout(t *testing.T) {
+	srv := newTestServer(t, Config{CommandTimeout: 200 * time.Millisecond})
+	handlers := standardHandlers()
+	handlers["stack_get"] = func(*fakeEngine, fakeCommand) []string { return nil }
+	dialFakeEngine(t, srv, fixture(t, "init"), handlers)
+	sess := waitSession(t, srv)
+	start := time.Now()
+	if _, err := sess.GetStack(); err == nil || !strings.Contains(err.Error(), "timeout waiting for response") {
+		t.Errorf("GetStack = %v, want a timeout", err)
+	}
+	if took := time.Since(start); took > 2*time.Second {
+		t.Errorf("GetStack took %v, want about 200ms", took)
+	}
+}
+
+// An engine that stops reading cannot block a command for longer than the
+// command timeout: the write fails, and the session ends, since the rest of
+// the command would garble what follows.
+func TestWriteDeadline(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		// Windows takes in a 40 MB command whole, even with a small receive
+		// buffer, so the write does not block; the command timeout applies.
+		t.Skip("writes to an engine that stopped reading do not block on Windows")
+	}
+	srv := newTestServer(t, Config{CommandTimeout: 200 * time.Millisecond})
+	conn := dialServer(t, srv)
+	init := fixture(t, "init")
+	fmt.Fprintf(conn, "%d\x00%s\x00", len(init), init)
+	// Answer the setup commands, up to output capture, the last one.
+	reader := bufio.NewReader(conn)
+	for {
+		line, err := reader.ReadString(0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		cmd := parseFakeCommand(strings.TrimSuffix(line, "\x00"))
+		resp := fmt.Sprintf(`<response xmlns="urn:debugger_protocol_v1" command=%q transaction_id=%q success="1"/>`, cmd.Name, cmd.Args["i"])
+		fmt.Fprintf(conn, "%d\x00%s\x00", len(resp), resp)
+		if cmd.Name == "stdout" {
+			break
+		}
+	}
+	sess := waitSession(t, srv)
+
+	// From now on the engine reads nothing: a command larger than the
+	// socket buffers cannot be written whole.
+	done := make(chan error, 1)
+	go func() {
+		_, err := sess.EvalProperty(strings.Repeat("1+", 16<<20)+"1", 0)
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		if err == nil || !strings.Contains(err.Error(), "send command") {
+			t.Errorf("EvalProperty = %v, want the write to fail", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("a command to an engine that stopped reading was still being written after 3s")
+	}
+	select {
+	case <-sess.Done():
+	case <-time.After(3 * time.Second):
+		t.Error("the session did not end after a write failed")
 	}
 }

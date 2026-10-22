@@ -12,6 +12,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"golang.org/x/sync/semaphore"
 )
 
 // DefaultAddr is where PHP Debugger and Xdebug 3 connect by default:
@@ -21,6 +23,10 @@ const DefaultAddr = "localhost:9003"
 
 // ErrServerClosed is returned by WaitForSession after Close.
 var ErrServerClosed = errors.New("server closed")
+
+// ErrUnclaimed is returned by Claim for a session being detached because
+// nobody took it within Config.ClaimTimeout.
+var ErrUnclaimed = errors.New("session is being detached: nobody took it in time")
 
 // StdoutMode selects what happens to a session's program output.
 type StdoutMode int
@@ -51,9 +57,18 @@ type Config struct {
 	// InitTimeout bounds how long a new connection may take to send its
 	// init packet. Default: 10s.
 	InitTimeout time.Duration
+	// CommandTimeout bounds how long a command may take to reach the engine
+	// and be answered; continuing the script is not bounded (see
+	// Session.Continue). Default: 30s.
+	CommandTimeout time.Duration
 	// PathMap maps local directories to the engine's, for PHP running in a
 	// container or on a remote server. Sessions take and return local paths.
 	PathMap []PathMapping
+	// NoEval stops the server from running PHP code of its own in sessions:
+	// setup skips the eval that asks the engine whether it maps paths
+	// itself, so Session.EngineMapping reports nothing detected. Session
+	// methods that run code, such as EvalProperty, still do when called.
+	NoEval bool
 	// ClaimTimeout, when set, detaches sessions that neither WaitForSession
 	// nor Claim has taken within this time of connecting, so their scripts
 	// run on without the debugger instead of waiting for someone to debug
@@ -71,6 +86,15 @@ const (
 	// maxLiveSessions bounds sessions that have not ended. Beyond it, new
 	// scripts are detached, so they run on without the debugger.
 	maxLiveSessions = 16
+	// setupTimeout bounds setting up a session after its init packet:
+	// features, output capture and breakpoints, a command each. A
+	// connection that takes longer is dropped, so one that stops answering
+	// frees its handshake slot.
+	setupTimeout = 30 * time.Second
+	// maxPacketsInFlight bounds the bytes of the packets a server's sessions
+	// are reading and parsing at once, which takes a few times as much
+	// memory. At least maxPacketBytes, so every packet fits.
+	maxPacketsInFlight = 2 * maxPacketBytes
 )
 
 // Breakpoint is a breakpoint the server applies to every session, including
@@ -109,6 +133,7 @@ type Server struct {
 	warnings    []string // addresses the last StartListening could not use
 	closed      bool
 	handshakes  map[net.Conn]struct{}
+	reserved    int // live session slots taken by handshakes setting up
 	nextID      int
 	sessions    []*Session
 	queue       []*Session // not yet returned by WaitForSession
@@ -118,6 +143,11 @@ type Server struct {
 
 	// The connection limits; tests lower them.
 	maxHandshakes, maxLiveSessions int
+	setupTimeout                   time.Duration
+
+	// packetBudget holds maxPacketsInFlight bytes, which sessions take
+	// while they read and parse a packet.
+	packetBudget *semaphore.Weighted
 }
 
 // Listen creates a server and starts listening for engine connections.
@@ -140,6 +170,9 @@ func NewServer(cfg Config) (*Server, error) {
 	if cfg.InitTimeout <= 0 {
 		cfg.InitTimeout = 10 * time.Second
 	}
+	if cfg.CommandTimeout <= 0 {
+		cfg.CommandTimeout = defaultCommandTimeout
+	}
 	paths, err := newPathMap(cfg.PathMap)
 	if err != nil {
 		return nil, err
@@ -152,6 +185,8 @@ func NewServer(cfg Config) (*Server, error) {
 		arrived:         make(chan struct{}),
 		maxHandshakes:   maxHandshakes,
 		maxLiveSessions: maxLiveSessions,
+		setupTimeout:    setupTimeout,
+		packetBudget:    semaphore.NewWeighted(maxPacketsInFlight),
 	}, nil
 }
 
@@ -179,7 +214,7 @@ func (s *Server) StartListening() error {
 	var listeners []net.Listener
 	var failures []string
 	for _, h := range hosts {
-		listener, err := net.Listen("tcp", net.JoinHostPort(h, port))
+		listener, err := listenTCP(net.JoinHostPort(h, port))
 		if err != nil {
 			failures = append(failures, err.Error())
 			continue
@@ -352,25 +387,34 @@ func (s *Server) handshake(conn net.Conn) {
 		return
 	}
 
+	// The slot is reserved until the session is added, so handshakes
+	// setting up at the same time cannot go past the limit together.
 	s.mu.Lock()
-	if s.liveSessionsLocked() >= s.maxLiveSessions {
+	if s.liveSessionsLocked()+s.reserved >= s.maxLiveSessions {
 		s.mu.Unlock()
 		detachConn(conn)
 		return
 	}
+	s.reserved++
 	s.nextID++
 	id := s.nextID
+	setupTimeout := s.setupTimeout
 	s.mu.Unlock()
 
+	// One deadline for the whole setup: once it passes, the session ends
+	// and its remaining commands fail at once.
+	_ = conn.SetDeadline(time.Now().Add(setupTimeout))
 	sess := newSession(id, s, conn, reader, init)
 	sess.setup(s.cfg, s.pathMap())
 	// Nothing reports errors here: the first Continue reports rejected
 	// breakpoints, and retries the others.
 	_ = sess.syncBreakpoints(false)
+	_ = conn.SetDeadline(time.Time{})
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.closed {
+	s.reserved--
+	if s.closed || sess.ended() {
 		_ = sess.Close()
 		return
 	}
@@ -385,15 +429,34 @@ func (s *Server) handshake(conn net.Conn) {
 }
 
 // detachUnclaimed detaches sess if nobody has taken it, so its script runs
-// on instead of waiting.
+// on instead of waiting. Meanwhile Claim refuses it.
 func (s *Server) detachUnclaimed(sess *Session) {
 	s.mu.Lock()
 	unclaimed := !s.closed && s.unqueueLocked(sess)
+	sess.unclaimed = unclaimed
 	s.mu.Unlock()
-	if unclaimed {
-		_ = sess.Detach()
-		_ = sess.Close()
+	if !unclaimed {
+		return
 	}
+	_ = sess.Detach()
+	_ = sess.Close()
+	<-sess.Done()
+	s.mu.Lock()
+	sess.unclaimed = false
+	s.mu.Unlock()
+}
+
+// reservePacket waits until the server's sessions are reading few enough
+// packets to read one of length bytes, and returns the function that ends
+// the read. A session without a server, in tests, does not wait.
+func (s *Server) reservePacket(ctx context.Context, length int) (release func(), err error) {
+	if s == nil {
+		return func() {}, nil
+	}
+	if err := s.packetBudget.Acquire(ctx, int64(length)); err != nil {
+		return nil, err
+	}
+	return func() { s.packetBudget.Release(int64(length)) }, nil
 }
 
 // detachConn lets the script on conn run on without the debugger.
@@ -421,7 +484,9 @@ func (sess *Session) setup(cfg Config, paths PathMap) {
 	_ = sess.FeatureSet("notify_ok", "1")
 	_ = sess.FeatureSet("resolved_breakpoints", "1")
 	// Before cfg.Features, which may lower max_data below the probe's reply.
-	sess.detectEngineMapping(paths)
+	if !cfg.NoEval {
+		sess.detectEngineMapping(paths)
+	}
 
 	names := make([]string, 0, len(cfg.Features))
 	for name := range cfg.Features {
@@ -460,7 +525,7 @@ func (s *Server) PathMap() []PathMapping {
 }
 
 // AddPathMapping adds a mapping, or replaces the one for the same local
-// directory. It applies to every session at once: paths from the engine are
+// directory, in any case on Windows and macOS. It applies to every session at once: paths from the engine are
 // translated with it from now on, and breakpoints already set are set again
 // with their new paths, now in stopped sessions and on the next Continue in
 // running ones. The returned error lists sessions that rejected a breakpoint.
@@ -473,7 +538,7 @@ func (s *Server) AddPathMapping(m PathMapping) error {
 	s.pathsMu.Lock()
 	paths := make(PathMap, 0, len(s.paths)+1)
 	for _, old := range s.paths {
-		if old.Local != m.Local {
+		if !samePath(old.Local, m.Local, localIgnoresCase) {
 			paths = append(paths, old)
 		}
 	}
@@ -558,12 +623,18 @@ func (s *Server) WaitForSession(ctx context.Context) (*Session, error) {
 }
 
 // Claim takes sess as if WaitForSession had returned it, so WaitForSession
-// does not return it and Config.ClaimTimeout no longer applies to it. It
-// reports whether sess was still waiting to be taken.
-func (s *Server) Claim(sess *Session) bool {
+// does not return it and Config.ClaimTimeout no longer applies to it.
+// Claiming a session already taken does nothing. It returns ErrUnclaimed
+// while sess is being detached because nobody took it in time; once that
+// is done, the session has ended.
+func (s *Server) Claim(sess *Session) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.unqueueLocked(sess)
+	if sess.unclaimed {
+		return ErrUnclaimed
+	}
+	s.unqueueLocked(sess)
+	return nil
 }
 
 // unqueueLocked removes sess from the sessions WaitForSession has not

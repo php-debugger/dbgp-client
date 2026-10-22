@@ -39,7 +39,7 @@ func newTestREPL(t *testing.T) (*repl, *dbgp.Server, func() string) {
 func TestParsePathMap(t *testing.T) {
 	abs, _ := filepath.Abs("rel")
 	got, err := parsePathMap([]string{"/home/me/app=/var/www", "/a=C:/b", "rel=/srv"})
-	want := []dbgp.PathMapping{{Local: "/home/me/app", Remote: "/var/www"}, {Local: "/a", Remote: "C:/b"}, {Local: abs, Remote: "/srv"}}
+	want := []dbgp.PathMapping{{Local: absPath(t, "/home/me/app"), Remote: "/var/www"}, {Local: absPath(t, "/a"), Remote: "C:/b"}, {Local: abs, Remote: "/srv"}}
 	if err != nil || !reflect.DeepEqual(got, want) {
 		t.Errorf("parsePathMap = %+v, %v", got, err)
 	}
@@ -57,9 +57,9 @@ func TestParseBreakpoint(t *testing.T) {
 		args string
 		want dbgp.Breakpoint
 	}{
-		{"/app/a.php:12", dbgp.Breakpoint{Type: "line", File: "/app/a.php", Line: 12}},
+		{"/app/a.php:12", dbgp.Breakpoint{Type: "line", File: absPath(t, "/app/a.php"), Line: 12}},
 		{"a.php:3", dbgp.Breakpoint{Type: "line", File: abs, Line: 3}},
-		{"/app/a.php:5 if $i > 2", dbgp.Breakpoint{Type: "conditional", File: "/app/a.php", Line: 5, Condition: "$i > 2"}},
+		{"/app/a.php:5 if $i > 2", dbgp.Breakpoint{Type: "conditional", File: absPath(t, "/app/a.php"), Line: 5, Condition: "$i > 2"}},
 		{"call App\\run", dbgp.Breakpoint{Type: "call", Function: "App\\run"}},
 		{"return add", dbgp.Breakpoint{Type: "return", Function: "add"}},
 		{"exception RuntimeException", dbgp.Breakpoint{Type: "exception", Exception: "RuntimeException"}},
@@ -447,13 +447,7 @@ func TestREPLBreakpointKindsAndDetach(t *testing.T) {
 
 // The built command: flags, startup and quitting.
 func TestBinary(t *testing.T) {
-	if testing.Short() {
-		t.Skip("builds the binary")
-	}
-	bin := filepath.Join(t.TempDir(), "dbgp")
-	if out, err := exec.Command("go", "build", "-o", bin, ".").CombinedOutput(); err != nil {
-		t.Fatalf("go build: %v\n%s", err, out)
-	}
+	bin := buildBinary(t)
 
 	out, _ := exec.Command(bin, "-h").CombinedOutput()
 	if !strings.Contains(string(out), "Usage: dbgp [options]") || !strings.Contains(string(out), "-map LOCAL=REMOTE") {
@@ -485,7 +479,7 @@ func TestBinary(t *testing.T) {
 	cmd.Stdin = strings.NewReader("breaks\nquit\n")
 	out, err = cmd.CombinedOutput()
 	if err != nil || !strings.Contains(string(out), "Listening for PHP on port ") ||
-		!strings.Contains(string(out), "1  /app/a.php:3\n") || !strings.Contains(string(out), "2  /app/b.php:5\n") {
+		!strings.Contains(string(out), "1  "+absPath(t, "/app/a.php")+":3\n") || !strings.Contains(string(out), "2  "+absPath(t, "/app/b.php")+":5\n") {
 		t.Errorf("session: %v\n%s", err, out)
 	}
 }
@@ -577,17 +571,18 @@ func TestMapAndMaps(t *testing.T) {
 	r.execLine("maps")
 
 	abs, _ := filepath.Abs("testdata/php")
-	want := []dbgp.PathMapping{{Local: abs, Remote: "/srv/php"}, {Local: "/home/me/app", Remote: "/app"}}
+	app := absPath(t, "/home/me/app")
+	want := []dbgp.PathMapping{{Local: abs, Remote: "/srv/php"}, {Local: app, Remote: "/app"}}
 	if got := srv.PathMap(); !reflect.DeepEqual(got, want) {
 		t.Errorf("PathMap() = %+v, want %+v", got, want)
 	}
 	out := output()
 	for _, line := range []string{
 		"No path mappings.\n",
-		"Mapped /home/me/app => /var/www/html\n",
+		"Mapped " + app + " => /var/www/html\n",
 		"Mapped " + abs + " => /srv/php\n",
 		"Error: usage: map LOCAL=REMOTE\n",
-		abs + " => /srv/php\n/home/me/app => /app\n",
+		abs + " => /srv/php\n" + app + " => /app\n",
 	} {
 		if !strings.Contains(out, line) {
 			t.Errorf("output lacks %q", line)

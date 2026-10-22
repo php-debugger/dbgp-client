@@ -1,8 +1,9 @@
 name: Vulnerabilities
 
 # Known vulnerabilities in the code dbgp calls, in its dependencies and in
-# the standard library of the newest Go, which release builds use. Weekly
-# too, since new ones are found in code that has not changed.
+# the standard library: of the oldest Go that go.mod allows, which go install
+# and local builds may use, and of the newest, which release builds use.
+# Weekly too, since new ones are found in code that has not changed.
 on:
   pull_request:
   push:
@@ -16,11 +17,21 @@ permissions:
 jobs:
   govulncheck:
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        go: [minimum, stable]
+    name: govulncheck (${{ matrix.go }} Go)
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+      - if: matrix.go == 'minimum'
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+      - if: matrix.go == 'stable'
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version: stable
           check-latest: true

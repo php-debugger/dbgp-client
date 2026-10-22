@@ -47,7 +47,7 @@ func TestMCPSource(t *testing.T) {
 	}{
 		{map[string]any{"around": 101}, "around must be between 1 and 100"},
 		{map[string]any{"around": -1}, "around must be between 1 and 100"},
-		{map[string]any{"file": "/no/such/file.php"}, "PHP cannot read /no/such/file.php"},
+		{map[string]any{"file": "/no/such/file.php"}, "PHP cannot read " + absPath(t, "/no/such/file.php")},
 		{map[string]any{"file": "../../testdata/php/basic.php"}, `file must be an absolute path, not "../../testdata/php/basic.php"`},
 	} {
 		if msg := callToolError(t, cs, "source", tc.args); !strings.Contains(msg, tc.want) {

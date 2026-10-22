@@ -1,13 +1,17 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"fmt"
 	"net"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"reflect"
+	"runtime"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -207,7 +211,7 @@ func TestMCPStatusShowsBreakpointsAndMappings(t *testing.T) {
 	if fmt.Sprint(status.Breakpoints) != fmt.Sprint(want) {
 		t.Errorf("breakpoints = %+v, want %+v", status.Breakpoints, want)
 	}
-	if len(status.PathMappings) != 1 || status.PathMappings[0] != (pathMapping{Local: "/home/me/app", Remote: "/var/www/html"}) {
+	if len(status.PathMappings) != 1 || status.PathMappings[0] != (pathMapping{Local: filepath.FromSlash("/home/me/app"), Remote: "/var/www/html"}) {
 		t.Errorf("pathMappings = %+v", status.PathMappings)
 	}
 }
@@ -246,6 +250,17 @@ func TestMCPStatusShowsSession(t *testing.T) {
 	}
 }
 
+// absPath returns the absolute path dbgp makes of p, a path from the root
+// such as /app/a.php: on Windows, it is on the current drive, D:\app\a.php.
+func absPath(t *testing.T, p string) string {
+	t.Helper()
+	abs, err := filepath.Abs(filepath.FromSlash(p))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return abs
+}
+
 // The built binary in MCP mode, driven over stdin and stdout.
 // buildBinary builds dbgp into a temporary directory and returns its path.
 func buildBinary(t *testing.T, args ...string) string {
@@ -254,6 +269,9 @@ func buildBinary(t *testing.T, args ...string) string {
 		t.Skip("builds the binary")
 	}
 	bin := filepath.Join(t.TempDir(), "dbgp")
+	if runtime.GOOS == "windows" {
+		bin += ".exe" // Windows runs only files with an executable extension
+	}
 	if out, err := exec.Command("go", append(append([]string{"build", "-o", bin}, args...), ".")...).CombinedOutput(); err != nil {
 		t.Fatalf("go build: %v\n%s", err, out)
 	}
@@ -382,9 +400,9 @@ func TestMCPAddBreakpoint(t *testing.T) {
 		args map[string]any
 		want breakpointInfo
 	}{
-		{map[string]any{"file": "/app/a.php", "line": 12}, breakpointInfo{ID: 1, Type: "line", File: "/app/a.php", Line: 12}},
-		{map[string]any{"type": "line", "file": "/app/../app/b.php", "line": 3}, breakpointInfo{ID: 2, Type: "line", File: "/app/b.php", Line: 3}},
-		{map[string]any{"file": "/app/a.php", "line": 5, "condition": "$i > 2"}, breakpointInfo{ID: 3, Type: "conditional", File: "/app/a.php", Line: 5, Condition: "$i > 2"}},
+		{map[string]any{"file": "/app/a.php", "line": 12}, breakpointInfo{ID: 1, Type: "line", File: absPath(t, "/app/a.php"), Line: 12}},
+		{map[string]any{"type": "line", "file": "/app/../app/b.php", "line": 3}, breakpointInfo{ID: 2, Type: "line", File: absPath(t, "/app/b.php"), Line: 3}},
+		{map[string]any{"file": "/app/a.php", "line": 5, "condition": "$i > 2"}, breakpointInfo{ID: 3, Type: "conditional", File: absPath(t, "/app/a.php"), Line: 5, Condition: "$i > 2"}},
 		{map[string]any{"type": "call", "function": "add"}, breakpointInfo{ID: 4, Type: "call", Function: "add"}},
 		{map[string]any{"type": "return", "function": "add"}, breakpointInfo{ID: 5, Type: "return", Function: "add"}},
 		{map[string]any{"type": "exception", "exception": "RuntimeException"}, breakpointInfo{ID: 6, Type: "exception", Exception: "RuntimeException"}},
@@ -454,7 +472,7 @@ func TestMCPPathMappings(t *testing.T) {
 	callTool(t, cs, "add_path_mapping", map[string]any{"local": "/home/me/app", "remote": "/var/www/html"}, &out)
 	callTool(t, cs, "add_path_mapping", map[string]any{"local": "/srv/../srv/php", "remote": "/srv/php"}, &out)
 	callTool(t, cs, "add_path_mapping", map[string]any{"local": "/home/me/app/", "remote": "/app"}, &out)
-	want := []pathMapping{{Local: "/srv/php", Remote: "/srv/php"}, {Local: "/home/me/app", Remote: "/app"}}
+	want := []pathMapping{{Local: absPath(t, "/srv/php"), Remote: "/srv/php"}, {Local: absPath(t, "/home/me/app"), Remote: "/app"}}
 	if fmt.Sprint(out.PathMappings) != fmt.Sprint(want) || out.Warning != "" {
 		t.Errorf("add_path_mapping = %+v, want %+v", out, want)
 	}
@@ -543,5 +561,58 @@ func TestMCPListenWarnings(t *testing.T) {
 	callTool(t, cs, "listen", nil, &out)
 	if !out.Listening || strconv.Itoa(out.Port) != port || len(out.Warnings) != 1 || !strings.Contains(out.Warnings[0], "[::1]:"+port) {
 		t.Errorf("listen = %+v, want port %s with a warning about [::1]", out, port)
+	}
+}
+
+// dbgp mcp -no-eval sends no eval of its own to the engine: the setup
+// probe for the engine's path mapping is skipped.
+func TestMCPNoEvalSendsNoEval(t *testing.T) {
+	bin := buildBinary(t)
+	daemonEnv(t)
+	init, err := os.ReadFile("../../testdata/dbgp/init.xml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, noEval := range []bool{false, true} {
+		args := []string{"mcp", "-php-port", "0"}
+		if noEval {
+			args = append(args, "-no-eval")
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		cs, err := mcp.NewClient(&mcp.Implementation{Name: "test", Version: "0"}, nil).
+			Connect(ctx, &mcp.CommandTransport{Command: exec.CommandContext(ctx, bin, args...)}, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer cs.Close()
+		var listening listenOutput
+		callTool(t, cs, "listen", nil, &listening)
+
+		// An engine that answers every setup command, until output capture,
+		// the last one.
+		conn, err := net.Dial("tcp", net.JoinHostPort("127.0.0.1", strconv.Itoa(listening.Port)))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer conn.Close()
+		_ = conn.SetDeadline(time.Now().Add(10 * time.Second))
+		fmt.Fprintf(conn, "%d\x00%s\x00", len(init), init)
+		reader := bufio.NewReader(conn)
+		var commands []string
+		for !slices.Contains(commands, "stdout") {
+			line, err := reader.ReadString(0)
+			if err != nil {
+				t.Fatalf("%v: reading commands %v: %v", args, commands, err)
+			}
+			fields := strings.Fields(strings.TrimSuffix(line, "\x00"))
+			id := fields[slices.Index(fields, "-i")+1]
+			commands = append(commands, fields[0])
+			resp := fmt.Sprintf(`<response xmlns="urn:debugger_protocol_v1" command=%q transaction_id=%q success="1"/>`, fields[0], id)
+			fmt.Fprintf(conn, "%d\x00%s\x00", len(resp), resp)
+		}
+		if sent := slices.Contains(commands, "eval"); sent == noEval {
+			t.Errorf("%v: setup commands %v, eval sent %v", args, commands, sent)
+		}
 	}
 }
