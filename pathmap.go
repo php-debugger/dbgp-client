@@ -63,7 +63,7 @@ func (m PathMap) ToRemote(local string) string {
 		}
 	}
 	if best < 0 {
-		return local
+		return filepath.ToSlash(local)
 	}
 	return joinPath(m[best].Remote, filepath.ToSlash(rest), "/")
 }

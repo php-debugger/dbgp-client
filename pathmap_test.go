@@ -50,7 +50,7 @@ func TestPathMapTranslation(t *testing.T) {
 	}
 
 	// Mappings match whole path components only.
-	if got := m.ToRemote(filepath.FromSlash("/home/me/project2/a.php")); got != filepath.FromSlash("/home/me/project2/a.php") {
+	if got := m.ToRemote(filepath.FromSlash("/home/me/project2/a.php")); got != "/home/me/project2/a.php" {
 		t.Errorf("ToRemote matched a partial component: %q", got)
 	}
 	if got := m.ToLocal("/var/www/html2/a.php"); got != filepath.FromSlash("/var/www/html2/a.php") {
@@ -282,7 +282,7 @@ func TestAddPathMapping(t *testing.T) {
 	if got := e.LastCommand("breakpoint_set").Args["f"]; got != "file:///home/me/app/basic.php" {
 		t.Fatalf("breakpoint before mapping sent for %q", got)
 	}
-	if sess.Script() != "/app/basic.php" {
+	if sess.Script() != filepath.FromSlash("/app/basic.php") {
 		t.Fatalf("Script() before mapping = %q", sess.Script())
 	}
 	e.ClearReceived()
@@ -427,7 +427,7 @@ func TestPathMapLocalCase(t *testing.T) {
 		m := mustPathMap(t, PathMapping{Local: "/Users/me/Project", Remote: "/var/www/html"})
 
 		local := filepath.FromSlash("/users/ME/project/src/A.php")
-		want := local // no mapping matches
+		want := filepath.ToSlash(local) // no mapping matches
 		if ignoreCase {
 			want = "/var/www/html/src/A.php" // the rest keeps its own case
 		}
@@ -436,7 +436,7 @@ func TestPathMapLocalCase(t *testing.T) {
 		}
 		// Whole components only.
 		other := filepath.FromSlash("/users/me/project2/a.php")
-		if got := m.ToRemote(other); got != other {
+		if got := m.ToRemote(other); got != filepath.ToSlash(other) {
 			t.Errorf("ignoreCase=%v: ToRemote(%q) = %q, want it unchanged", ignoreCase, other, got)
 		}
 		if got, want := m.ToLocal("/VAR/www/html/a.php"), filepath.FromSlash("/VAR/www/html/a.php"); got != want {

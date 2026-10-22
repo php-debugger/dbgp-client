@@ -34,12 +34,20 @@ jobs:
         run: go vet ./...
 
   test:
-    name: test (PHP ${{ matrix.php }})
-    runs-on: ubuntu-latest
+    # Linux with every PHP version, and Windows with the newest.
+    name: test (${{ matrix.os == 'windows-latest' && 'Windows, ' || '' }}PHP ${{ matrix.php }})
+    runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
+        os: [ubuntu-latest]
         php: ['8.2', '8.3', '8.4', '8.5']
+        include:
+          - os: windows-latest
+            php: '8.5'
+    defaults:
+      run:
+        shell: bash
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -47,18 +55,30 @@ jobs:
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: go.mod
-      # Self-contained PHP interpreter with PHP Debugger compiled in, from the
-      # latest php-debugger release.
+      # PHP Debugger, from its latest release: on Linux, a self-contained PHP
+      # interpreter with it compiled in; on Windows, where the release has only
+      # the extension, the official PHP build with the extension loaded.
       - name: Install PHP Debugger
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           dir="$RUNNER_TEMP/php-debugger/bin"
           mkdir -p "$dir"
-          gh release download --repo php-debugger/php-debugger \
-            --pattern "php-php${{ matrix.php }}-nts-linux-x86_64" \
-            --output "$dir/php"
-          chmod +x "$dir/php"
+          if [ "$RUNNER_OS" = Windows ]; then
+            curl -fsSL --retry 5 --retry-all-errors -o "$RUNNER_TEMP/php.zip" \
+              "https://downloads.php.net/~windows/releases/latest/php-${{ matrix.php }}-nts-Win32-vs17-x64-latest.zip"
+            unzip -q "$RUNNER_TEMP/php.zip" -d "$dir"
+            gh release download --repo php-debugger/php-debugger \
+              --pattern "php_php-debugger-php${{ matrix.php }}-nts-windows-x64.dll" \
+              --output "$dir/ext/php_php_debugger.dll"
+            # PHP reads the php.ini next to php.exe.
+            printf 'extension_dir="%s"\nzend_extension=php_debugger\n' "$(cygpath -w "$dir/ext")" > "$dir/php.ini"
+          else
+            gh release download --repo php-debugger/php-debugger \
+              --pattern "php-php${{ matrix.php }}-nts-linux-x86_64" \
+              --output "$dir/php"
+            chmod +x "$dir/php"
+          fi
           echo "$dir" >> "$GITHUB_PATH"
       - name: Show PHP and debugger versions
         run: |

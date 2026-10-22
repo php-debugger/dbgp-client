@@ -900,6 +900,7 @@ func (r *repl) sourceLines(s *dbgp.Session, file string, line, current int) (str
 	}
 	var b strings.Builder
 	for i, text := range strings.Split(strings.TrimRight(src, "\n"), "\n") {
+		text = strings.TrimSuffix(text, "\r") // Windows line endings
 		n := begin + i
 		mark := "  "
 		if n == current {

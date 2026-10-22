@@ -214,7 +214,7 @@ func (s *Server) StartListening() error {
 	var listeners []net.Listener
 	var failures []string
 	for _, h := range hosts {
-		listener, err := net.Listen("tcp", net.JoinHostPort(h, port))
+		listener, err := listenTCP(net.JoinHostPort(h, port))
 		if err != nil {
 			failures = append(failures, err.Error())
 			continue

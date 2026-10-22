@@ -10,6 +10,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"slices"
 	"strconv"
 	"strings"
@@ -210,7 +211,7 @@ func TestMCPStatusShowsBreakpointsAndMappings(t *testing.T) {
 	if fmt.Sprint(status.Breakpoints) != fmt.Sprint(want) {
 		t.Errorf("breakpoints = %+v, want %+v", status.Breakpoints, want)
 	}
-	if len(status.PathMappings) != 1 || status.PathMappings[0] != (pathMapping{Local: "/home/me/app", Remote: "/var/www/html"}) {
+	if len(status.PathMappings) != 1 || status.PathMappings[0] != (pathMapping{Local: filepath.FromSlash("/home/me/app"), Remote: "/var/www/html"}) {
 		t.Errorf("pathMappings = %+v", status.PathMappings)
 	}
 }
@@ -249,6 +250,17 @@ func TestMCPStatusShowsSession(t *testing.T) {
 	}
 }
 
+// absPath returns the absolute path dbgp makes of p, a path from the root
+// such as /app/a.php: on Windows, it is on the current drive, D:\app\a.php.
+func absPath(t *testing.T, p string) string {
+	t.Helper()
+	abs, err := filepath.Abs(filepath.FromSlash(p))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return abs
+}
+
 // The built binary in MCP mode, driven over stdin and stdout.
 // buildBinary builds dbgp into a temporary directory and returns its path.
 func buildBinary(t *testing.T, args ...string) string {
@@ -257,6 +269,9 @@ func buildBinary(t *testing.T, args ...string) string {
 		t.Skip("builds the binary")
 	}
 	bin := filepath.Join(t.TempDir(), "dbgp")
+	if runtime.GOOS == "windows" {
+		bin += ".exe" // Windows runs only files with an executable extension
+	}
 	if out, err := exec.Command("go", append(append([]string{"build", "-o", bin}, args...), ".")...).CombinedOutput(); err != nil {
 		t.Fatalf("go build: %v\n%s", err, out)
 	}
@@ -385,9 +400,9 @@ func TestMCPAddBreakpoint(t *testing.T) {
 		args map[string]any
 		want breakpointInfo
 	}{
-		{map[string]any{"file": "/app/a.php", "line": 12}, breakpointInfo{ID: 1, Type: "line", File: "/app/a.php", Line: 12}},
-		{map[string]any{"type": "line", "file": "/app/../app/b.php", "line": 3}, breakpointInfo{ID: 2, Type: "line", File: "/app/b.php", Line: 3}},
-		{map[string]any{"file": "/app/a.php", "line": 5, "condition": "$i > 2"}, breakpointInfo{ID: 3, Type: "conditional", File: "/app/a.php", Line: 5, Condition: "$i > 2"}},
+		{map[string]any{"file": "/app/a.php", "line": 12}, breakpointInfo{ID: 1, Type: "line", File: absPath(t, "/app/a.php"), Line: 12}},
+		{map[string]any{"type": "line", "file": "/app/../app/b.php", "line": 3}, breakpointInfo{ID: 2, Type: "line", File: absPath(t, "/app/b.php"), Line: 3}},
+		{map[string]any{"file": "/app/a.php", "line": 5, "condition": "$i > 2"}, breakpointInfo{ID: 3, Type: "conditional", File: absPath(t, "/app/a.php"), Line: 5, Condition: "$i > 2"}},
 		{map[string]any{"type": "call", "function": "add"}, breakpointInfo{ID: 4, Type: "call", Function: "add"}},
 		{map[string]any{"type": "return", "function": "add"}, breakpointInfo{ID: 5, Type: "return", Function: "add"}},
 		{map[string]any{"type": "exception", "exception": "RuntimeException"}, breakpointInfo{ID: 6, Type: "exception", Exception: "RuntimeException"}},
@@ -457,7 +472,7 @@ func TestMCPPathMappings(t *testing.T) {
 	callTool(t, cs, "add_path_mapping", map[string]any{"local": "/home/me/app", "remote": "/var/www/html"}, &out)
 	callTool(t, cs, "add_path_mapping", map[string]any{"local": "/srv/../srv/php", "remote": "/srv/php"}, &out)
 	callTool(t, cs, "add_path_mapping", map[string]any{"local": "/home/me/app/", "remote": "/app"}, &out)
-	want := []pathMapping{{Local: "/srv/php", Remote: "/srv/php"}, {Local: "/home/me/app", Remote: "/app"}}
+	want := []pathMapping{{Local: absPath(t, "/srv/php"), Remote: "/srv/php"}, {Local: absPath(t, "/home/me/app"), Remote: "/app"}}
 	if fmt.Sprint(out.PathMappings) != fmt.Sprint(want) || out.Warning != "" {
 		t.Errorf("add_path_mapping = %+v, want %+v", out, want)
 	}

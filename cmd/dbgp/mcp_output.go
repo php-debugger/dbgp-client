@@ -107,6 +107,7 @@ func (t *tools) source(_ context.Context, req *mcp.CallToolRequest, in sourceInp
 		return nil, out, nil
 	}
 	for i, code := range strings.Split(strings.TrimSuffix(text, "\n"), "\n") {
+		code = strings.TrimSuffix(code, "\r") // Windows line endings
 		n := begin + i
 		short := cutText(code, maxLineBytes)
 		out.Lines = append(out.Lines, sourceLine{

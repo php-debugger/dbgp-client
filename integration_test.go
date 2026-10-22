@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -375,6 +376,11 @@ func TestEnginePathMapping(t *testing.T) {
 // detects it and passes local paths through.
 func TestEngineOwnPathMapping(t *testing.T) {
 	requireDebugEngine(t)
+	if runtime.GOOS == "windows" {
+		// PHP Debugger reports path mapping as enabled there, but applies
+		// no map file.
+		t.Skip("PHP Debugger does not apply map files on Windows")
+	}
 	src, err := os.ReadFile(debuggeePath(t))
 	if err != nil {
 		t.Fatal(err)
@@ -386,7 +392,7 @@ func TestEngineOwnPathMapping(t *testing.T) {
 	}
 	remoteScript := filepath.Join(remoteDir, "basic.php")
 	localDir := "/home/agent/project"
-	script := localDir + "/basic.php"
+	script := filepath.FromSlash(localDir + "/basic.php")
 	files := map[string]string{
 		remoteScript: string(src),
 		filepath.Join(remoteDir, ".xdebug", "agent.map"): "remote_prefix: " + filepath.ToSlash(remoteDir) +

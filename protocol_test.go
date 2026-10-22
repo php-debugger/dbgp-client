@@ -133,7 +133,7 @@ func TestParseResponseFields(t *testing.T) {
 	}
 	for name, want := range map[string]int{"run_break": lineAddBody, "step_over": lineAddReturn, "run_break_conditional": lineLoopBody} {
 		file, line := parse(name).ParseMessage()
-		if file != "/app/basic.php" || line != want {
+		if file != filepath.FromSlash("/app/basic.php") || line != want {
 			t.Errorf("%s: ParseMessage = %s:%d, want /app/basic.php:%d", name, file, line, want)
 		}
 	}
@@ -205,7 +205,8 @@ func TestFormatStack(t *testing.T) {
 		{Level: 0, Where: "add", Filename: "file:///app/basic.php", Lineno: 24},
 		{Level: 1, Where: "{main}", Filename: "file:///app/basic.php", Lineno: 36},
 	}
-	want := []string{"#0 add() at /app/basic.php:24", "#1 {main}() at /app/basic.php:36"}
+	file := filepath.FromSlash("/app/basic.php")
+	want := []string{"#0 add() at " + file + ":24", "#1 {main}() at " + file + ":36"}
 	if got := FormatStack(frames); !reflect.DeepEqual(got, want) {
 		t.Errorf("FormatStack = %q, want %q", got, want)
 	}
@@ -213,7 +214,7 @@ func TestFormatStack(t *testing.T) {
 
 func TestFormatStackDecodesURI(t *testing.T) {
 	got := FormatStack([]StackFrame{{Where: "f", Filename: "file:///my%20app/a.php", Lineno: 1}})
-	if want := "#0 f() at /my app/a.php:1"; got[0] != want {
+	if want := "#0 f() at " + filepath.FromSlash("/my app/a.php") + ":1"; got[0] != want {
 		t.Errorf("FormatStack = %q, want %q", got[0], want)
 	}
 }

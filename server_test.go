@@ -934,6 +934,12 @@ func TestServerDropsSilentSetup(t *testing.T) {
 	if !silent.WaitClosed(3 * time.Second) {
 		t.Fatal("a connection that stopped answering during setup was kept")
 	}
+	// The slot is freed just after the connection is closed.
+	waitFor(t, func() bool {
+		srv.mu.Lock()
+		defer srv.mu.Unlock()
+		return len(srv.handshakes) == 0
+	})
 	dialFakeEngine(t, srv, fixture(t, "init"), standardHandlers())
 	sess := waitSession(t, srv)
 	if got := srv.Sessions(); len(got) != 1 || got[0] != sess {

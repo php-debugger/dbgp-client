@@ -7,7 +7,9 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"path/filepath"
 	"reflect"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -319,7 +321,7 @@ func TestResponseDecoding(t *testing.T) {
 		if want := []string{"line", "conditional", "call", "exception"}; !reflect.DeepEqual(types, want) {
 			t.Fatalf("types = %v, want %v", types, want)
 		}
-		if bps[0].ID != 42420001 || bps[0].Filename != "/app/basic.php" || bps[0].Lineno != 24 || bps[0].State != "enabled" {
+		if bps[0].ID != 42420001 || bps[0].Filename != filepath.FromSlash("/app/basic.php") || bps[0].Lineno != 24 || bps[0].State != "enabled" {
 			t.Errorf("line breakpoint = %+v", bps[0])
 		}
 		if bps[2].State != "disabled" {
@@ -332,8 +334,8 @@ func TestResponseDecoding(t *testing.T) {
 			t.Fatal(err)
 		}
 		want := []StackFrame{
-			{Level: 0, Type: "file", Filename: "/app/basic.php", Lineno: 24, Where: "add"},
-			{Level: 1, Type: "file", Filename: "/app/basic.php", Lineno: 36, Where: "{main}"},
+			{Level: 0, Type: "file", Filename: filepath.FromSlash("/app/basic.php"), Lineno: 24, Where: "add"},
+			{Level: 1, Type: "file", Filename: filepath.FromSlash("/app/basic.php"), Lineno: 36, Where: "{main}"},
 		}
 		if !reflect.DeepEqual(stack, want) {
 			t.Errorf("stack = %+v, want %+v", stack, want)
@@ -722,7 +724,7 @@ func TestContinueStopsAtBreak(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := State{Status: StatusBreak, Reason: "ok", File: "/app/basic.php", Line: lineAddBody}
+	want := State{Status: StatusBreak, Reason: "ok", File: filepath.FromSlash("/app/basic.php"), Line: lineAddBody}
 	if st != want {
 		t.Errorf("State = %+v, want %+v", st, want)
 	}
@@ -944,7 +946,7 @@ func TestNotificationsAreCollected(t *testing.T) {
 	if next != 2 || notes[0].Name != "error" || notes[1].Name != "breakpoint_resolved" {
 		t.Fatalf("Notifications = %+v, %d", notes, next)
 	}
-	want := Message{Filename: "/app/basic.php", Lineno: lineWarning, Type: "Warning", Text: "Undefined variable $undefinedVariable"}
+	want := Message{Filename: filepath.FromSlash("/app/basic.php"), Lineno: lineWarning, Type: "Warning", Text: "Undefined variable $undefinedVariable"}
 	if *notes[0].Message != want {
 		t.Errorf("error notification = %+v, want %+v", *notes[0].Message, want)
 	}
@@ -1193,6 +1195,11 @@ func TestCommandTimeout(t *testing.T) {
 // command timeout: the write fails, and the session ends, since the rest of
 // the command would garble what follows.
 func TestWriteDeadline(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		// Windows takes in a 40 MB command whole, even with a small receive
+		// buffer, so the write does not block; the command timeout applies.
+		t.Skip("writes to an engine that stopped reading do not block on Windows")
+	}
 	srv := newTestServer(t, Config{CommandTimeout: 200 * time.Millisecond})
 	conn := dialServer(t, srv)
 	init := fixture(t, "init")
